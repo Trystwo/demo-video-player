@@ -85,6 +85,13 @@ M2 现状：检测在 decoder 的 src pad 用 `buffer.extract_dup()` 复制 NV12
 （`extract_dup` ≈2.8 ms/次、NV12→BGR ≈3.1 ms/次），尚未使用 RGA；
 M3 再评估 RGA 直通，以减少 CPU 拷贝。
 
+显示方向：手机竖录或微信导出的 MP4 常带 180° Display Matrix。`qtdemux`
+用 `image-orientation` tag 暴露它，GTK sink 会按 tag 旋转显示，但解码缓冲
+仍是未旋转帧；检测若直接使用原始缓冲，人脸框会整体错位（表现为只框住半张
+脸）。检测线程在 NV12→BGR 后按 tag 旋转（90°/270° 时同步交换
+`video_info` 宽高），保证送检帧与屏幕显示一致（2026-11-17 用 1080p 手机
+素材复现并修复，提交 725a681）。
+
 优先级（M3 前在板上逐层验证，失败则降级）：
 
 1. VPU 输出 dmabuf → EGLImage → GL 纹理，美颜在 GPU 内完成，全程不经过 CPU。

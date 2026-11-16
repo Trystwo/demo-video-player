@@ -120,6 +120,7 @@ bash scripts/bench_board.sh
 | 2026-11-16 | M2 检测精度 | 与板端 cv2 YuNet 对比 IoU 0.74–0.89（OpenCV letterbox 与拉伸预处理差异） | obama / two_people |
 | 2026-11-16 | M2 播放叠加检测 | 720p 稳定 30 fps、1080p 双人脸 28.8 fps；信息行 `NPU: N face · 37.8 ms`；开检测进程 CPU ≈82%，关 ≈30% | `docs/evidence/m2-ui-*.png` |
 | 2026-11-16 | M2 检测吞吐 | headless `measure_tap.py`：30.0 fps、10 次检测/s、平均 35.6 ms | 单脸每帧 |
+| 2026-11-17 | M2 显示矩阵（rotate-180） | 手机竖录 MP4 的 Display Matrix 为 180°，`mppvideodec` 输出未旋转帧、GTK sink 按 tag 旋转显示，导致 pad probe 送检的是倒置帧、人脸框只框住上半脸；按 `image-orientation` tag 在检测线程旋转 BGR 后修复，整脸框与 5 点对齐，NPU 48.6 ms，28–30 fps | `qtdemux` tag `rotate-180`；用户素材实测 |
 | 待测 | M3 美颜帧率 | — | 回填 A2 实测 fps 与降级档位 |
 
 > 回填方式：`python3 scripts/probe_board.py --markdown` 的输出可直接贴入本文件
