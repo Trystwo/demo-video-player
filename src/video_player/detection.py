@@ -29,7 +29,7 @@ from gi.repository import GLib, Gst  # noqa: E402
 from .config import Config
 from .face import DetectionResult, RknnFaceDetector, resolve_model_path
 
-__all__ = ["FaceDetectionTap"]
+__all__ = ["FaceDetectionTap", "nv12_to_bgr", "rotate_bgr", "rotation_from_tag"]
 
 _QUEUE_WAIT_SECONDS = 0.5
 
@@ -87,6 +87,38 @@ def nv12_to_bgr(
     )
 
 
+def rotation_from_tag(value: str) -> int:
+    """Map a GStreamer ``image-orientation`` tag to clockwise degrees.
+
+    ``qtdemux`` reports the MP4 display matrix as a tag; the RK3576 decoder
+    ignores it, so decoded buffers arrive rotated while the sink rotates the
+    picture for display.  Our detector must see the same upright frame as the
+    viewer, otherwise boxes end up shifted (a 180 degree phone video used to
+    detect only the upper half of a face).
+    """
+    return {"rotate-90": 90, "rotate-180": 180, "rotate-270": 270}.get(value, 0)
+
+
+def rotate_bgr(frame, degrees: int):
+    """Rotate a BGR frame clockwise by 0/90/180/270 degrees.
+
+    ``degrees`` follows :func:`rotation_from_tag`; unknown angles are ignored.
+    """
+    degrees %= 360
+    if not degrees:
+        return frame
+    import cv2  # imported lazily: only needed when detection is enabled
+
+    method = {
+        90: cv2.ROTATE_90_CLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }.get(degrees)
+    if method is None:
+        return frame
+    return cv2.rotate(frame, method)
+
+
 class FaceDetectionTap:
     """Sample decoded NV12 frames and run the RKNN detector off-thread."""
 
@@ -96,10 +128,14 @@ class FaceDetectionTap:
         on_result: Callable[[DetectionResult], None],
         *,
         on_error: Callable[[str], None] | None = None,
+        rotation: Callable[[], int] | None = None,
     ) -> None:
         self._config = config
         self._on_result = on_result
         self._on_error = on_error
+        # Returns the stream rotation (degrees clockwise) needed to make the
+        # decoded frame upright; queried per sample because tags arrive late.
+        self._rotation = rotation or (lambda: 0)
         self._detector: RknnFaceDetector | None = None
         self._thread: threading.Thread | None = None
         self._samples: deque[tuple[bytes, int, int, int, int]] = deque(maxlen=1)
@@ -216,6 +252,9 @@ class FaceDetectionTap:
             started = time.perf_counter()
             try:
                 bgr = nv12_to_bgr(data, width, height, size)
+                degrees = int(self._rotation() or 0) % 360
+                if degrees:
+                    bgr = rotate_bgr(bgr, degrees)
                 assert self._detector is not None
                 faces = self._detector.detect(bgr)
             except Exception as exc:  # detector errors must not kill playback

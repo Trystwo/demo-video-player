@@ -29,7 +29,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 from .config import Config
-from .detection import FaceDetectionTap
+from .detection import FaceDetectionTap, rotation_from_tag
 from .face import DetectionResult
 from .pipeline import decoder_for, demux_for, is_stream_uri, parser_for
 
@@ -74,6 +74,8 @@ class PlaybackBackend:
         self._frame_times: deque[float] = deque(maxlen=240)
         self._tap: FaceDetectionTap | None = None
         self._detection_failed = False
+        self._rotation = 0
+        self._coded_size: tuple[int, int] = (0, 0)
         self.video_info: dict[str, object] = {}
         self.uri: str | None = None
 
@@ -158,6 +160,8 @@ class PlaybackBackend:
 
         self._rate = 1.0
         self._playing = False
+        self._rotation = 0
+        self._coded_size = (0, 0)
         self.video_info = {}
         target = Gst.State.PLAYING if autoplay else Gst.State.PAUSED
         self._pipeline.set_state(target)
@@ -258,6 +262,8 @@ class PlaybackBackend:
         self._playing = False
         self._last_fps = 0.0
         self._frame_times.clear()
+        self._rotation = 0
+        self._coded_size = (0, 0)
         self.video_info = {}
         self.uri = None
 
@@ -388,14 +394,25 @@ class PlaybackBackend:
             if fps_pad is not None:
                 fps_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_fps_buffer)
         self._start_detection(decoder)
+        coded_width = structure.get_value("width")
+        coded_height = structure.get_value("height")
+        if (
+            isinstance(coded_width, int)
+            and isinstance(coded_height, int)
+            and coded_width > 0
+            and coded_height > 0
+        ):
+            self._coded_size = (coded_width, coded_height)
         info: dict[str, object] = {
             "codec": caps_name.split("/")[-1].upper(),
             "decoder": decoder_factory,
+            "rotation": self._rotation,
         }
-        for key in ("width", "height"):
-            value = structure.get_value(key)
-            if isinstance(value, int) and value > 0:
-                info[key] = value
+        display_width, display_height = self._display_size()
+        if display_width > 0:
+            info["width"] = display_width
+        if display_height > 0:
+            info["height"] = display_height
         framerate_ok, numerator, denominator = structure.get_fraction("framerate")
         if framerate_ok and denominator:
             info["fps"] = round(numerator / denominator, 2)
@@ -411,6 +428,7 @@ class PlaybackBackend:
                 self._config,
                 self._on_detection_result,
                 on_error=self._on_detection_error,
+                rotation=self._rotation_degrees,
             )
         try:
             self._tap.prepare()
@@ -533,7 +551,9 @@ class PlaybackBackend:
 
     def _on_bus_message(self, _bus: Gst.Bus, message: Gst.Message) -> None:
         message_type = message.type
-        if message_type == Gst.MessageType.EOS:
+        if message_type == Gst.MessageType.TAG:
+            self._on_tag_message(message)
+        elif message_type == Gst.MessageType.EOS:
             self._playing = False
             self._dispatch(self.on_eos)
         elif message_type == Gst.MessageType.ERROR:
@@ -550,6 +570,40 @@ class PlaybackBackend:
             elif new == Gst.State.PAUSED:
                 self._playing = False
                 self._dispatch(self.on_state, "paused")
+
+    def _on_tag_message(self, message: Gst.Message) -> None:
+        """Track the container's display matrix (MP4 ``rotate-*`` tag)."""
+        tags = message.parse_tag()
+        try:
+            ok, value = tags.get_string_index("image-orientation", 0)
+        except (TypeError, KeyError, ValueError):
+            return
+        if not ok:
+            return
+        rotation = rotation_from_tag(str(value))
+        if rotation == self._rotation:
+            return
+        self._rotation = rotation
+        width, height = self._display_size()
+        if self.video_info and width > 0 and height > 0:
+            info = dict(self.video_info)
+            info["width"] = width
+            info["height"] = height
+            info["rotation"] = rotation
+            self.video_info = info
+            self._dispatch(self.on_video_info, dict(info))
+
+    def _rotation_degrees(self) -> int:
+        return self._rotation
+
+    def _display_size(self) -> tuple[int, int]:
+        """Frame size as displayed: 90/270 degree display matrices swap axes."""
+        width, height = self._coded_size
+        if not width or not height:
+            return width, height
+        if self._rotation in (90, 270):
+            return height, width
+        return width, height
 
     def _on_fps_measurements(
         self, _sink: Gst.Element, _fps: float, _droprate: float, average_fps: float
