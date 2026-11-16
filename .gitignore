@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local runtime output
+*.log
+*.tmp
+saved/
+recordings/
+
+# Models and test media are not committed (size / license)
+models/*.rknn
+models/*.onnx
+assets/videos/
+*.mp4
+*.mkv
+*.mov
+*.ts
+
+# Local board evidence and captures
+docs/images/board/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

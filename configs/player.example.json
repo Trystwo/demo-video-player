@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "player": {
+    "hw_decode": true,
+    "render_sink": "gtk4paintablesink",
+    "video_convert": "auto",
+    "volume": 80,
+    "speed": 1.0,
+    "resume": true
+  },
+  "beauty": {
+    "enabled": true,
+    "smoothing": 60,
+    "whitening": 40,
+    "compare_mode": false,
+    "feather_px": 24
+  },
+  "detection": {
+    "model_path": "models/retinaface.rknn",
+    "interval_frames": 3,
+    "max_faces": 3,
+    "min_score": 0.5,
+    "track_fill": true
+  },
+  "debug": {
+    "show_info_panel": true,
+    "fps_window": 60,
+    "log_level": "info"
+  }
+}

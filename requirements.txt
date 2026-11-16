@@ -1,0 +1,10 @@
+# Board runtime dependencies.
+#
+# Most of the stack is installed with the Debian 13 image / apt packages, not pip:
+#   python3-gi, gir1.2-gtk-4.0, gstreamer1.0-tools, gstreamer1.0-plugins-*,
+#   librknnrt + librga (Quectel board packages), plus an RKNN face-detection model
+#   under models/ (not committed).
+#
+# Do not pip-install PyGObject or the GStreamer bindings on the board; use the
+# apt packages so that GI typelibs match the system GStreamer.
+numpy==2.2.4

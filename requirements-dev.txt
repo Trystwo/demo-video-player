@@ -1,0 +1,6 @@
+# Development-host dependencies (not needed on the board).
+#
+# The test suite skips the tests that need NumPy when it is not installed, so a
+# fresh development host only needs pytest to exercise the pure-Python modules.
+pytest>=8
+numpy==2.2.4

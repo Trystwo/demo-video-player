@@ -1,0 +1,18 @@
+{
+  "name": "LICENSE",
+  "path": "LICENSE",
+  "sha": "89fd15c4761b3d6dec3a777603c4085a23aecc70",
+  "size": 576,
+  "url": "https://api.github.com/repos/Quectel-Pi/demo-gesture-remote-control/contents/LICENSE?ref=main",
+  "html_url": "https://github.com/Quectel-Pi/demo-gesture-remote-control/blob/main/LICENSE",
+  "git_url": "https://api.github.com/repos/Quectel-Pi/demo-gesture-remote-control/git/blobs/89fd15c4761b3d6dec3a777603c4085a23aecc70",
+  "download_url": "https://raw.githubusercontent.com/Quectel-Pi/demo-gesture-remote-control/main/LICENSE",
+  "type": "file",
+  "content": "Q29weXJpZ2h0IDIwMjYgUXVlY3RlbCBXaXJlbGVzcyBTb2x1dGlvbnMgQ28u\nLCBMdGQuCgpMaWNlbnNlZCB1bmRlciB0aGUgQXBhY2hlIExpY2Vuc2UsIFZl\ncnNpb24gMi4wICh0aGUgIkxpY2Vuc2UiKTsKeW91IG1heSBub3QgdXNlIHRo\naXMgZmlsZSBleGNlcHQgaW4gY29tcGxpYW5jZSB3aXRoIHRoZSBMaWNlbnNl\nLgpZb3UgbWF5IG9idGFpbiBhIGNvcHkgb2YgdGhlIExpY2Vuc2UgYXQKCiAg\nICBodHRwOi8vd3d3LmFwYWNoZS5vcmcvbGljZW5zZXMvTElDRU5TRS0yLjAK\nClVubGVzcyByZXF1aXJlZCBieSBhcHBsaWNhYmxlIGxhdyBvciBhZ3JlZWQg\ndG8gaW4gd3JpdGluZywgc29mdHdhcmUKZGlzdHJpYnV0ZWQgdW5kZXIgdGhl\nIExpY2Vuc2UgaXMgZGlzdHJpYnV0ZWQgb24gYW4gIkFTIElTIiBCQVNJUywK\nV0lUSE9VVCBXQVJSQU5USUVTIE9SIENPTkRJVElPTlMgT0YgQU5ZIEtJTkQs\nIGVpdGhlciBleHByZXNzIG9yIGltcGxpZWQuClNlZSB0aGUgTGljZW5zZSBm\nb3IgdGhlIHNwZWNpZmljIGxhbmd1YWdlIGdvdmVybmluZyBwZXJtaXNzaW9u\ncyBhbmQKbGltaXRhdGlvbnMgdW5kZXIgdGhlIExpY2Vuc2Uu\n",
+  "encoding": "base64",
+  "_links": {
+    "self": "https://api.github.com/repos/Quectel-Pi/demo-gesture-remote-control/contents/LICENSE?ref=main",
+    "git": "https://api.github.com/repos/Quectel-Pi/demo-gesture-remote-control/git/blobs/89fd15c4761b3d6dec3a777603c4085a23aecc70",
+    "html": "https://github.com/Quectel-Pi/demo-gesture-remote-control/blob/main/LICENSE"
+  }
+}
