@@ -18,7 +18,9 @@ All callbacks are dispatched through the GTK main loop.
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
+import time
 from typing import Callable
 
 import gi
@@ -27,6 +29,8 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 from .config import Config
+from .detection import FaceDetectionTap
+from .face import DetectionResult
 from .pipeline import decoder_for, demux_for, is_stream_uri, parser_for
 
 __all__ = ["PlaybackBackend", "PlaybackError"]
@@ -67,6 +71,9 @@ class PlaybackBackend:
         self._rate = 1.0
         self._playing = False
         self._last_fps = 0.0
+        self._frame_times: deque[float] = deque(maxlen=240)
+        self._tap: FaceDetectionTap | None = None
+        self._detection_failed = False
         self.video_info: dict[str, object] = {}
         self.uri: str | None = None
 
@@ -80,6 +87,10 @@ class PlaybackBackend:
         self.on_video_info: Callable[[dict[str, object]], None] | None = None
         #: Called with the average fps (rounded to one decimal) about once a second.
         self.on_fps: Callable[[float], None] | None = None
+        #: Called with a fresh :class:`DetectionResult` when the NPU finishes a frame.
+        self.on_detection: Callable[[DetectionResult], None] | None = None
+        #: Called with a human-readable message when face detection cannot run.
+        self.on_detection_error: Callable[[str], None] | None = None
 
     # -- properties --------------------------------------------------------
 
@@ -120,6 +131,9 @@ class PlaybackBackend:
         path = Path(text).expanduser()
         if not path.is_file():
             raise PlaybackError(f"media file not found: {path}")
+        # Relative CLI arguments must still become a valid file:// URI for logs
+        # and for the playlist label; Gst itself receives the resolved path.
+        path = path.resolve()
 
         self.close()
         demux_factory = demux_for(path)
@@ -136,6 +150,7 @@ class PlaybackBackend:
         self._pipeline = pipeline
         self.uri = path.as_uri()
         self._build_video_output()
+        self._prepare_detection()
 
         self._bus = pipeline.get_bus()
         self._bus.add_signal_watch()
@@ -224,6 +239,7 @@ class PlaybackBackend:
 
     def close(self) -> None:
         """Stop playback and release all GStreamer resources."""
+        self._stop_detection()
         pipeline, self._pipeline = self._pipeline, None
         if self._bus is not None:
             if self._bus_handler is not None:
@@ -241,6 +257,7 @@ class PlaybackBackend:
         self._converter_name = None
         self._playing = False
         self._last_fps = 0.0
+        self._frame_times.clear()
         self.video_info = {}
         self.uri = None
 
@@ -366,6 +383,11 @@ class PlaybackBackend:
 
         self._decoder_name = decoder_factory
         self._converter_name = converters[-1].get_name() if converters else None
+        if self._fps_sink is not None:
+            fps_pad = self._fps_sink.get_static_pad("sink")
+            if fps_pad is not None:
+                fps_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_fps_buffer)
+        self._start_detection(decoder)
         info: dict[str, object] = {
             "codec": caps_name.split("/")[-1].upper(),
             "decoder": decoder_factory,
@@ -379,6 +401,73 @@ class PlaybackBackend:
             info["fps"] = round(numerator / denominator, 2)
         self.video_info = info
         self._dispatch(self.on_video_info, dict(info))
+
+    def _prepare_detection(self) -> None:
+        """Load the detector before playback so the first frame is not delayed."""
+        if not self._config.detection.enabled or self._detection_failed:
+            return
+        if self._tap is None:
+            self._tap = FaceDetectionTap(
+                self._config,
+                self._on_detection_result,
+                on_error=self._on_detection_error,
+            )
+        try:
+            self._tap.prepare()
+        except Exception as exc:  # a missing model must not stop playback
+            self._detection_failed = True
+            self._dispatch(self.on_detection_error, f"face detection unavailable: {exc}")
+
+    def _start_detection(self, decoder: Gst.Element) -> None:
+        """Attach the sampled NPU detector to the decoder output (M2)."""
+        if not self._config.detection.enabled or self._detection_failed:
+            return
+        pad = decoder.get_static_pad("src")
+        if pad is None:
+            return
+        if self._tap is None:
+            self._prepare_detection()
+        if self._tap is None or self._detection_failed:
+            return
+        try:
+            self._tap.start(pad)
+        except Exception as exc:  # pragma: no cover - model load errors handled above
+            self._dispatch(self.on_detection_error, f"face detection unavailable: {exc}")
+
+    def _stop_detection(self) -> None:
+        tap, self._tap = self._tap, None
+        if tap is not None:
+            tap.stop()
+
+    def _on_fps_buffer(
+        self, _pad: Gst.Pad, info: Gst.PadProbeInfo
+    ) -> Gst.PadProbeReturn:
+        buffer = info.get_buffer()
+        if buffer is not None:
+            pts = buffer.pts
+            if pts is not None and pts >= 0 and pts != Gst.CLOCK_TIME_NONE:
+                self._frame_times.append(pts / Gst.SECOND)
+            else:
+                self._frame_times.append(time.monotonic())
+        return Gst.PadProbeReturn.OK
+
+    def measured_fps(self, window_seconds: float = 1.5) -> float:
+        """Delivered frame rate over the trailing window (instantaneous fps)."""
+        if len(self._frame_times) < 2:
+            return 0.0
+        last = self._frame_times[-1]
+        start = last - window_seconds
+        recent = [t for t in self._frame_times if t >= start]
+        if len(recent) < 2:
+            return 0.0
+        span = recent[-1] - recent[0]
+        return round((len(recent) - 1) / span, 1) if span > 0 else 0.0
+
+    def _on_detection_result(self, result: DetectionResult) -> None:
+        self._dispatch(self.on_detection, result)
+
+    def _on_detection_error(self, message: str) -> None:
+        self._dispatch(self.on_detection_error, message)
 
     def _build_audio_branch(self, pad: Gst.Pad) -> None:
         pipeline = self._pipeline

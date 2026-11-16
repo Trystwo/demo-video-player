@@ -76,11 +76,15 @@ def test_face_rectangle_is_clamped_to_frame() -> None:
     assert face.clamped(10, 10) == Face(0.0, 0.0, 10.0, 10.0)
 
 
-def test_rknn_detector_is_a_placeholder_for_m2() -> None:
-    detector = RknnFaceDetector("models/retinaface.rknn")
-    with pytest.raises(NotImplementedError, match="M2"):
+def test_rknn_detector_requires_an_existing_model() -> None:
+    detector = RknnFaceDetector("models/missing.rknn")
+    with pytest.raises(FileNotFoundError, match="face model not found"):
         detector.load()
-    with pytest.raises(NotImplementedError, match="M2"):
+
+
+def test_rknn_detector_requires_load_before_detect() -> None:
+    detector = RknnFaceDetector("models/missing.rknn")
+    with pytest.raises(RuntimeError, match="load"):
         detector.detect(None)
 
 

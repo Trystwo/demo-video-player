@@ -29,3 +29,10 @@ docs/images/board/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Feishu app credentials (never commit)
+.feishu*
+.cache/
+
+# local test media (Pexels/Mixkit clips, not for the public repository)
+test-media/

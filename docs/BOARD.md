@@ -6,7 +6,8 @@
 
 ## 1. 目标板基线
 
-来自项目主仓库的板卡实测记录（2026-10-16，板端内网）：
+来自 [../../../docs/README.md](../../../docs/README.md) 的板卡实测记录
+（2026-10-16，板端 SSH，IP 略）：
 
 | 项目 | 实测值 |
 |------|--------|
@@ -53,8 +54,8 @@
 
 | 类别 | 文件 | 来源/许可 | 状态 |
 |------|------|----------|------|
-| 人脸检测模型 | `models/retinaface.rknn`（首选） | 公开 ONNX 快照自行转换，注意模型许可 | 待转换 |
-| 人脸检测模型 | `models/scrfd_500m.rknn`（备选） | 同上，速度优先 | 待转换 |
+| 人脸检测模型 | `models/yunet_rk3576.rknn`（已用） | YuNet（OpenCV Zoo，MIT）经 `scripts/convert_yunet.py` 转换 | ✅ 2026-11-16（1,084,515B，30ms/次） |
+| 人脸检测模型 | `models/scrfd_500m.rknn`（备选） | 同上，速度优先 | 未使用 |
 | 测试视频（正脸） | 1080p30 H.264 人像，≥1 人 | 用户自备（公司自有版权） | 待提供 |
 | 测试视频（多人/侧脸） | 1080p30，≥3 人，含 ≤45° 侧脸 | 用户自备（公司自有版权） | 待提供 |
 | 测试视频（4K） | 4K30 H.265，可选 | 用户自备（公司自有版权） | 选配；4K 不作硬指标 |
@@ -104,7 +105,7 @@ bash scripts/bench_board.sh
 - 预期缺失（板端才有）：`mppvideodec`、`mpph264enc`、`waylandsink`、
   `gtk4paintablesink`、`librknnrt.so`、`librga.so`、RKNN 模型
 
-### 5.2 目标板实测（待 M1 起逐条回填）
+### 5.2 目标板实测（M1–M2 已回填）
 
 | 日期 | 项目 | 结果 | 备注 |
 |------|------|------|------|
@@ -114,7 +115,11 @@ bash scripts/bench_board.sh
 | 2026-11-14 | M1 播放窗口实测 | 1080p30 稳定 30fps，进程 CPU 16–17%，信息面板 fps 28.7–28.9；快照 `docs/evidence/m1-ui-gl.png` | A1 达标 |
 | 2026-11-14 | M1 软件降级 | `video_convert=sw`：15–18 buffers/s、窗口约 3.7fps；快照 `docs/evidence/m1-ui-sw.png` | 仅作兜底 |
 | 2026-11-14 | M1 退出崩溃修复 | 快照退出频繁 SIGSEGV（Gst/GL 终结顺序）；改为先销毁窗口/管线，GTK run 结束后 `os._exit`；5/5 稳定 rc=0 | 见 ARCHITECTURE 第 8 节 |
-| 待测 | M2 检测耗时 | — | 回填模型、输入尺寸、N、单次耗时 |
+| 2026-11-16 | M2 模型转换 | YuNet ONNX 232,589B → RKNN 1,084,515B（fp16，target rk3576，mean 0/std 1） | x86 rknn-toolkit2 2.5.0 |
+| 2026-11-16 | M2 RKNN 推理 | 首次 35.4 ms，10 次中位 30.1 ms（640×640 输入，单核 mask 0/1/2 同速） | `scripts/check_yunet_board.py` |
+| 2026-11-16 | M2 检测精度 | 与板端 cv2 YuNet 对比 IoU 0.74–0.89（OpenCV letterbox 与拉伸预处理差异） | obama / two_people |
+| 2026-11-16 | M2 播放叠加检测 | 720p 稳定 30 fps、1080p 双人脸 28.8 fps；信息行 `NPU: N face · 37.8 ms`；开检测进程 CPU ≈82%，关 ≈30% | `docs/evidence/m2-ui-*.png` |
+| 2026-11-16 | M2 检测吞吐 | headless `measure_tap.py`：30.0 fps、10 次检测/s、平均 35.6 ms | 单脸每帧 |
 | 待测 | M3 美颜帧率 | — | 回填 A2 实测 fps 与降级档位 |
 
 > 回填方式：`python3 scripts/probe_board.py --markdown` 的输出可直接贴入本文件

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import time
 import sys
 from typing import Sequence
 
@@ -22,6 +23,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 from ..backend import PlaybackBackend, PlaybackError  # noqa: E402
 from ..beauty import BeautyParams  # noqa: E402
 from ..config import Config  # noqa: E402
+from ..face import DetectionResult, Face  # noqa: E402
 from ..pipeline import VIDEO_SUFFIXES  # noqa: E402
 from ..playlist import Playlist  # noqa: E402
 
@@ -39,6 +41,59 @@ CSS = b"""
 .error-hint { color: #e01b24; }
 .info-line { font-family: monospace; }
 """
+
+
+class _FaceOverlay(Gtk.DrawingArea):
+    """Transparent canvas that draws detected faces on top of the video.
+
+    ``Gtk.Picture`` uses :attr:`Gtk.ContentFit.CONTAIN`, so the video is scaled
+    down and centred inside the widget allocation; the same transform is
+    applied here to map frame coordinates to widget coordinates.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_can_target(False)
+        self.set_draw_func(self._draw)
+        self._faces: tuple[Face, ...] = ()
+        self._frame_width = 0.0
+        self._frame_height = 0.0
+
+    def set_faces(
+        self, faces: tuple[Face, ...], frame_width: float, frame_height: float
+    ) -> None:
+        self._faces = faces
+        self._frame_width = frame_width
+        self._frame_height = frame_height
+        self.queue_draw()
+
+    def _draw(
+        self, _area: Gtk.DrawingArea, cr: object, width: int, height: int
+    ) -> None:
+        if not self._faces or self._frame_width <= 0 or self._frame_height <= 0:
+            return
+        scale = min(width / self._frame_width, height / self._frame_height)
+        offset_x = (width - self._frame_width * scale) / 2.0
+        offset_y = (height - self._frame_height * scale) / 2.0
+        cr.set_line_width(2.0)  # type: ignore[attr-defined]
+        cr.set_source_rgba(0.18, 0.86, 0.42, 0.95)  # type: ignore[attr-defined]
+        for face in self._faces:
+            cr.rectangle(  # type: ignore[attr-defined]
+                offset_x + face.x * scale,
+                offset_y + face.y * scale,
+                face.width * scale,
+                face.height * scale,
+            )
+            cr.stroke()  # type: ignore[attr-defined]
+            for landmark_x, landmark_y in face.landmarks:
+                cr.arc(  # type: ignore[attr-defined]
+                    offset_x + landmark_x * scale,
+                    offset_y + landmark_y * scale,
+                    2.0,
+                    0.0,
+                    6.283185307179586,
+                )
+                cr.fill()  # type: ignore[attr-defined]
 
 
 def _format_time(nanoseconds: int) -> str:
@@ -94,12 +149,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._duration_ns = 0
         self._updating_seek = False
         self._timer_id = 0
+        self._faces: tuple[Face, ...] = ()
+        self._detection_ms = 0.0
+        self._detection_error: str | None = None
+        self._show_faces = True
+        self._last_detection_label_at = 0.0
 
         self.backend.on_eos = self._on_eos
         self.backend.on_error = self._show_error
         self.backend.on_state = self._on_state_changed
         self.backend.on_video_info = self._on_video_info
         self.backend.on_fps = self._on_fps
+        self.backend.on_detection = self._on_detection
+        self.backend.on_detection_error = self._on_detection_error
 
         self.set_title("Video Player · Quectel Pi M2")
         self.set_default_size(1280, 800)
@@ -162,6 +224,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._picture.set_can_shrink(True)
         self._picture.set_content_fit(Gtk.ContentFit.CONTAIN)
         overlay.set_child(self._picture)
+
+        self._face_overlay = _FaceOverlay()
+        self._face_overlay.set_hexpand(True)
+        self._face_overlay.set_vexpand(True)
+        overlay.add_overlay(self._face_overlay)
 
         self._placeholder = Gtk.Label(
             label="Open a video file to start playback\n\n"
@@ -289,6 +356,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._compare_switch.connect("notify::active", self._on_compare_switch_toggled)
         panel.append(_labelled_row("Original / beautified", self._compare_switch))
 
+        self._faces_switch = Gtk.Switch()
+        self._faces_switch.set_active(self._show_faces)
+        self._faces_switch.connect("notify::active", self._on_show_faces_toggled)
+        panel.append(_labelled_row("Show face boxes", self._faces_switch))
+
         self._params_label = Gtk.Label()
         self._params_label.set_xalign(0.0)
         self._params_label.set_wrap(True)
@@ -314,6 +386,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._info_label.set_visible(True)
         self._compare_switch.set_active(True)
         self._compare_button.set_active(True)
+        self._faces_switch.set_active(True)
 
     def _start_index(self, index: int) -> bool:
         try:
@@ -335,6 +408,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._show_error(str(exc))
             return
         self._fps = 0.0
+        self._faces = ()
+        self._detection_ms = 0.0
+        self._detection_error = None
+        self._face_overlay.set_faces((), 0.0, 0.0)
         paintable = self.backend.paintable
         if paintable is not None:
             self._picture.set_paintable(paintable)
@@ -442,6 +519,38 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._fps = fps
         self._update_info_label()
 
+    def _on_detection(self, result: DetectionResult) -> None:
+        if not self._show_faces:
+            return
+        faces = tuple(result.faces)
+        changed = faces != self._faces
+        self._faces = faces
+        self._detection_ms = result.inference_ms
+        if changed:
+            width = float(self.backend.video_info.get("width") or 0)
+            height = float(self.backend.video_info.get("height") or 0)
+            self._face_overlay.set_faces(self._faces, width, height)
+        # Repainting the label on every detection (10 Hz) competes with the
+        # video sink's frame clock; the NPU timing only needs ~1 Hz updates.
+        now = time.monotonic()
+        if changed or now - self._last_detection_label_at >= 1.0:
+            self._last_detection_label_at = now
+            self._update_info_label()
+
+    def _on_detection_error(self, message: str) -> None:
+        self._detection_error = message
+        self._hint(f"Face detection disabled: {message}")
+        self._update_info_label()
+
+    def _on_show_faces_toggled(self, switch: Gtk.Switch, _param: object) -> None:
+        self._show_faces = switch.get_active()
+        if not self._show_faces:
+            self._face_overlay.set_faces((), 0.0, 0.0)
+        elif self._faces:
+            width = float(self.backend.video_info.get("width") or 0)
+            height = float(self.backend.video_info.get("height") or 0)
+            self._face_overlay.set_faces(self._faces, width, height)
+
     def _on_eos(self) -> None:
         self._update_play_icon(False)
         if self.playlist.has_next():
@@ -473,7 +582,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         codec = info.get("codec", "—")
         decoder = info.get("decoder", "—")
         fps = self._fps or info.get("fps") or "—"
-        npu = "—"
+        if self._detection_error:
+            npu = "off"
+        elif self._faces:
+            npu = f"{len(self._faces)} face · {self._detection_ms:.1f} ms"
+        else:
+            npu = "—"
         self._info_label.set_text(
             f"{width}×{height}   {codec}   decode: {decoder}   "
             f"fps: {fps}   NPU: {npu}"
@@ -497,6 +611,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _tick(self) -> bool:
         if self.backend.has_media:
+            measured = self.backend.measured_fps()
+            if measured and abs(measured - self._fps) >= 0.5:
+                self._fps = measured
+                self._update_info_label()
             duration = self.backend.duration_ns()
             position = self.backend.position_ns()
             if duration > 0:
@@ -686,6 +804,10 @@ def run_window(
     snapshot_delay: float = 3.0,
 ) -> int:  # pragma: no cover - needs a display
     """Open the GTK window and block until it closes; returns the exit code."""
+    # The detection worker runs numpy/OpenCV decoding in a Python thread; a
+    # short switch interval keeps the GTK main loop rendering at 30 fps instead
+    # of waiting for the worker's GIL slices.
+    sys.setswitchinterval(0.001)
     application = PlayerApplication(
         config,
         media,

@@ -22,6 +22,9 @@ def test_defaults_are_valid_and_match_example_file() -> None:
     assert config.player.video_convert == "auto"
     assert config.player.volume == 80
     assert config.beauty.enabled is True
+    assert config.detection.enabled is True
+    assert config.detection.core_mask == 0
+    assert config.detection.model_path == "models/yunet_rk3576.rknn"
     assert config.detection.interval_frames == 3
 
     # The shipped example file is the documented defaults.

@@ -16,11 +16,13 @@
     "feather_px": 24
   },
   "detection": {
-    "model_path": "models/retinaface.rknn",
+    "enabled": true,
+    "model_path": "models/yunet_rk3576.rknn",
     "interval_frames": 3,
     "max_faces": 3,
     "min_score": 0.5,
-    "track_fill": true
+    "track_fill": true,
+    "core_mask": 0
   },
   "debug": {
     "show_info_panel": true,

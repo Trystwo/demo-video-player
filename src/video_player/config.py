@@ -131,13 +131,16 @@ class BeautyConfig:
 class DetectionConfig:
     """NPU face-detection settings."""
 
-    model_path: str = "models/retinaface.rknn"
+    enabled: bool = True
+    model_path: str = "models/yunet_rk3576.rknn"
     interval_frames: int = 3
     max_faces: int = 3
     min_score: float = 0.5
     track_fill: bool = True
+    core_mask: int = 0
 
     def validate(self) -> None:
+        self.enabled = _as_bool(self.enabled, name="detection.enabled")
         self.model_path = _as_str(self.model_path, name="detection.model_path")
         self.interval_frames = int(
             _clamp(_as_int(self.interval_frames, name="detection.interval_frames"), 1, 10)
@@ -149,6 +152,9 @@ class DetectionConfig:
             _clamp(_as_float(self.min_score, name="detection.min_score"), 0.0, 1.0), 2
         )
         self.track_fill = _as_bool(self.track_fill, name="detection.track_fill")
+        self.core_mask = int(
+            _clamp(_as_int(self.core_mask, name="detection.core_mask"), 0, 3)
+        )
 
 
 @dataclass

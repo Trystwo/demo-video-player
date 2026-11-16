@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -61,11 +62,11 @@ class FaceDetector(Protocol):
 
 
 class RknnFaceDetector:
-    """RetinaFace/SCRFD detector running through ``librknnrt`` (M2 placeholder).
+    """YuNet face detector running on the RK3576 NPU through ``librknnrt``.
 
-    The conversion + post-processing steps are deliberately not implemented in
-    the scaffold; see ``docs/BOARD.md`` for the model pipeline that M2 must
-    verify (letterbox to 640x640, NPU inference, anchor decode, NMS).
+    The model is the OpenCV Zoo YuNet detector converted with
+    ``scripts/convert_yunet.py`` (see ``docs/BOARD.md``): fp16, 640x640 BGR
+    input, 12 raw output tensors decoded by :mod:`video_player.face_yunet`.
     """
 
     def __init__(
@@ -74,21 +75,67 @@ class RknnFaceDetector:
         input_size: tuple[int, int] = (640, 640),
         score_threshold: float = 0.5,
         max_faces: int = 3,
+        core_mask: int = 0,
     ) -> None:
-        self.model_path = model_path
+        self.model_path = str(model_path)
         self.input_size = input_size
         self.score_threshold = score_threshold
         self.max_faces = max_faces
+        self.core_mask = core_mask
+        self._runtime = None
 
     def load(self) -> None:
-        raise NotImplementedError(
-            "M2: load and convert RetinaFace/SCRFD to RKNN; see docs/BOARD.md"
+        """Load the RKNN model and warm the NPU up with one dummy inference."""
+        if not __import__("pathlib").Path(self.model_path).is_file():
+            raise FileNotFoundError(f"face model not found: {self.model_path}")
+        from .rknn_runtime import RknnRuntime
+
+        self._runtime = RknnRuntime(self.model_path, core_mask=self.core_mask)
+        import numpy as np
+
+        warmup = np.zeros(
+            (self.input_size[1], self.input_size[0], 3), dtype=np.uint8
         )
+        self._runtime.infer(warmup)
+
+    @property
+    def loaded(self) -> bool:
+        return self._runtime is not None
 
     def detect(self, frame: "np.ndarray") -> Sequence[Face]:
-        raise NotImplementedError(
-            "M2: run librknnrt inference, decode anchors and apply NMS"
+        """Detect faces in a BGR frame; boxes are in frame pixel coordinates."""
+        if self._runtime is None:
+            raise RuntimeError("RknnFaceDetector.load() must be called first")
+        from .face_yunet import decode_yunet_outputs, map_faces_to_frame, preprocess_frame
+
+        model_input = preprocess_frame(frame)
+        raw = self._runtime.infer(model_input)
+        faces = decode_yunet_outputs(
+            raw,
+            score_threshold=self.score_threshold,
+            max_faces=self.max_faces,
         )
+        height, width = frame.shape[:2]
+        return map_faces_to_frame(faces, width, height)
+
+    def close(self) -> None:
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
+
+
+def resolve_model_path(path: str) -> Path:
+    """Resolve a config model path against the CWD and then the demo root."""
+
+    candidate = Path(path).expanduser()
+    if candidate.is_file():
+        return candidate
+    if not candidate.is_absolute():
+        project_root = Path(__file__).resolve().parents[2]
+        rooted = project_root / candidate
+        if rooted.is_file():
+            return rooted
+    return candidate
 
 
 class DetectionScheduler:

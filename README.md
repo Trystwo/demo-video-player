@@ -6,16 +6,21 @@ A local video player demo for the [Quectel Pi M2](https://developer.quectel.com/
 
 ![](docs/images/main-window.png)
 
+*The same player with M2 NPU face detection: boxes and five landmarks overlaid, info line shows `NPU: 2 face · 36.8 ms`.*
+
+![](docs/images/face-detection.png)
+
 *The player on the board's DSI display (1280×800): 1080p30 decoded by `mppvideodec`, colour-converted on the GPU and rendered through an embedded `gtk4paintablesink`.*
 
-> **Scope:** M1 playback is implemented and verified on the board: hardware-decoded 1080p30 into an embedded GTK4 sink at a steady 30 fps (process CPU ≈16–17%). NPU face detection (M2) and GPU beauty (M3) are next. See [docs/PRD.md](docs/PRD.md) for the milestone plan.
+> **Scope:** M1 playback and M2 NPU face detection are implemented and verified on the board: hardware-decoded 1080p30 into an embedded GTK4 sink at a steady 30 fps, with YuNet face detection on the NPU (10 Hz, ≈30 ms per inference, playback ≈29–30 fps) and boxes/landmarks overlaid in GTK. GPU beauty (M3) is next. See [docs/PRD.md](docs/PRD.md) for the milestone plan.
 
 ## Features
 
 Planned scope for the demo (P0 of the design note):
 
 - **Hardware-decoded local playback** — MP4/MKV/MOV/TS files with H.264/H.265 decoded on the RK3576 VPU through GStreamer `mppvideodec`; AAC/MP3/Opus audio.
-- **Automatic face beauty** — the NPU runs RetinaFace/SCRFD on every Nth frame, then the GPU smooths and whitens only inside feathered face masks; nothing is processed when no face is present.
+- **NPU face detection (implemented)** — a converted YuNet RKNN model runs on the NPU every Nth frame (10 Hz by default); boxes and five landmarks are drawn in GTK, and the info panel shows the face count and inference time. Nothing is processed when no face is present.
+- **Automatic face beauty (M3)** — the GPU smooths and whitens only inside feathered face masks derived from the detected landmarks.
 - **One-key before/after compare** — toggle the effect, or switch to a split-screen original/beautified view on the same frame.
 - **Player controls** — play/pause, seek, volume, fullscreen, 0.5×–2.0× speed, folder playlist and resume.
 - **Info panel** — resolution, codec, hardware vs software decode, fps and NPU inference time.
@@ -93,7 +98,7 @@ demo-video-player/
 ├── configs/                    # tunable config: decode, beauty strengths, detection interval
 ├── docs/                       # PRD, architecture, board checklist, demo guide
 │   └── images/                 # README screenshots
-├── models/                     # RKNN face-detection models (downloaded, not committed)
+├── models/                     # RKNN face-detection models (see models/README.md; not committed)
 ├── scripts/                    # probe_board.py, launch_player.py
 ├── src/video_player/           # package: config, pipeline plan, beauty, face, envcheck
 │   └── ui/                     # GTK4 window
@@ -125,7 +130,7 @@ The window opens on the board's display and plays local H.264/H.265/AAC media wi
 |-----------|-------|-------|
 | M0 | Project skeleton: config contract, pipeline plan, environment check, UI shell | ✅ 2026-11-14 |
 | M1 | GStreamer hardware-decoded playback, GTK4 embedded sink, controls, playlist | ✅ 2026-11-14 (30 fps, CPU ≈16%) |
-| M2 | RKNN face detection, RGA scaling and detection scheduler | ⏳ planned |
+| M2 | RKNN YuNet face detection (10 Hz), GTK boxes/landmarks, NPU timing in the info panel | ✅ 2026-11-16 |
 | M3 | GPU smoothing/whitening with face masks and compare mode | ⏳ planned |
 | M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ planned |
 
@@ -144,7 +149,7 @@ More board demos are available in the [Quectel-Pi](https://github.com/Quectel-Pi
 - [Architecture](docs/ARCHITECTURE.md): pipeline, zero-copy strategy, threading model and performance budget.
 - [Board environment](docs/BOARD.md): board baseline, pending measurements, model and media checklist.
 - [Demo guide](docs/DEMO_GUIDE.md): demo flow, talking points and fallback plans.
-- Design note (Chinese, internal): original requirement, hardware analysis and open questions.
+- [Design note](../../docs/43-视频播放器.md) (Chinese): original requirement, hardware analysis and open questions.
 - [Chinese README](README_zh.md)
 
 ## Security and limitations
@@ -152,7 +157,7 @@ More board demos are available in the [Quectel-Pi](https://github.com/Quectel-Pi
 - Demo-level implementation, not a hardened distribution: there is no authentication, sandboxing or DRM.
 - Video and image assets are not bundled. Provide your own, and only company-owned or licensed footage may be used in demos.
 - RKNN model weights are not committed; follow [docs/BOARD.md](docs/BOARD.md) to convert and place them.
-- M1 playback works; NPU detection (M2) and GPU beauty (M3) are not implemented yet, so beauty/compare figures are still unverified. A1 is measured for H.264 1080p30; H.265 is pending a sample clip.
+- M1 playback and M2 NPU detection work on the board (30 fps with detection on, ≈30 ms per inference at 10 Hz). GPU beauty (M3) is not implemented yet, so beauty/compare figures are still unverified. A1 is measured for H.264 1080p30; H.265 is pending a sample clip.
 - Network streams are out of this phase; when re-enabled, they will be opened without validating remote content, so only connect to trusted sources.
 
 ## Reporting Issues
