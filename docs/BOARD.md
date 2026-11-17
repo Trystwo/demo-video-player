@@ -128,7 +128,7 @@ bash scripts/bench_board.sh
 | 2026-11-17 | M3 应用 A2（美颜开 + 检测关） | 1080p30 近景、1280×768 窗口：30.0–30.4fps、CPU 30–33%、`beauty: on 0.68–1.36 ms`；同场景美颜关 30.1–30.2fps/30–32% | 修复前同一配置 78–80% CPU |
 | 2026-11-17 | M3 应用（美颜开 + 检测开，真实人脸） | 1080p30 近景：稳定 30.0fps、CPU 110–119%、beauty 1.06–1.56 ms、NPU 37.5–44.0 ms、faces 1 | 检测是 CPU 主要来源；美颜仍 <1.6ms |
 | 2026-11-17 | M3 demo 全开（美颜+检测+强制分屏） | 全屏 1280×800：30.0fps、CPU 117–131%、NPU 37.8–41.2 ms、beauty 1.1–1.5 ms；关美颜 112–121% | 增量主要来自 M2 检测（约 85pp） |
-| 2026-11-17 | M3 掉速窗口归因 | 60s 长片（`/tmp/face_long.mp4`，4×concat）跑 40s：稳定段 30.0fps、掉速段 22–25fps 后恢复；全程 beauty 1.03–1.51 ms、NPU 37.7–43.9 ms、CPU 112–125% 不变；load average 4.24→5.89 | 掉速来自板端背景负载/调度，非美颜或检测变慢；A2 取稳定段 |
+| 2026-11-17 | M3 掉速窗口归因（检测路径） | 开检测时周期性掉速：15s 素材 t≈9–14s、60s 长片 t≈11–16s/27–33s，fps 21–25 后自行恢复 30.0；同期 beauty 1.0–1.5 ms、NPU 37–44 ms、CPU 112–125% 全平稳；低负载（load 1.32）复现；检测降到 1Hz（CPU 59–62%）仍复现；不带检测的 `perf_probe` 15s 内 buffers/s 稳定 30.0 | 诱因在「检测开启」而非美颜/推理频率；怀疑 `extract_dup` NV12 DMABuf 映射 + `GLib.idle_add` 回主线程周期性阻塞 sink，M2 遗留，交 M4 |
 | 2026-11-17 | M3 检测线程 CPU 归因 | `/proc/PID/task` 采样（总 CPU 115.2%）：主线程 27.3%、demux:sink 27.6%、video-decoder 15.0%、gstglcontext 11.3%；headless `measure_tap.py` 30.0fps、10 次/s、37.5 ms | M2 遗留成本，M3 未改动 |
 | 2026-11-17 | M3 旋转（90/270/180） | `ffmpeg -display_rotation` 素材 + 四色标记图：tag `rotate-270/rotate-90/rotate-180` 与显示方向自洽；180° 自拍素材人脸框与遮罩对齐 | `face_rect_to_texture()` 反向映射正确（单测覆盖 0/90/180/270） |
 | 2026-11-17 | M3 一键开关（F9 路径） | 运行时 `refresh_beauty()`：`beauty_active False→True`，beauty_ms 稳定 0.9–1.1 ms，无异常 | UI 开关走同一路径 |
