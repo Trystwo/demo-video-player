@@ -39,7 +39,7 @@ python3 -m video_player --check
 2. **硬解播放**：播放 1080p30 H.264 人像视频；指出信息面板的
    `decode: mppvideodec`、分辨率 `1920×1080`、`fps: 30.0`，说明色彩转换与预缩放
    都在 GPU 上完成。
-3. **NPU 检测**：信息行显示 `NPU: 1 face · 38.9 ms`，画面叠加绿色人脸框与 5 点关键点；
+3. **NPU 检测**：信息行显示 `NPU: 1 face · 38.5–40.9 ms`，画面叠加绿色人脸框与 5 点关键点；
    侧栏 `Show face boxes` 可关。说明检测以 10Hz 采样、单次约 30–40ms，播放仍为 30fps。
 4. **自动美颜**：默认开启（`Automatic face beauty`），画面右侧人物脸部平滑/提亮；
    遮住脸部或移到无人脸片段，指出“无人脸时不处理”，背景与头发保持原样（A3）。
@@ -47,7 +47,7 @@ python3 -m video_player --check
    说明只处理人脸区域、羽化蒙版过渡无接缝（可把 Smoothing 拉到 100 展示上限）。
 6. **一键对比**：`Compare` 按钮或 `C` 键切换分屏/整帧；`Split position` 拖动分割线；
    `B` 键直接开关美颜。三者都在同一帧内完成（F9）。
-7. **信息面板**：读数 `fps 30.0`、`NPU 38.9 ms`、`beauty: on 1.2 ms`，
+7. **信息面板**：读数 `fps 30.0`、`NPU 38–41 ms`、`beauty: on 1.1–1.5 ms`，
    给出 A2（≥25fps）与美颜开销（<2ms/帧）结论。
 8. **遮罩演示（可选）**：`M` 键或 `beauty.debug_mask=true` 显示白/黑遮罩预览，
    说明“白色=处理、黑色=不处理”，眼睛眉毛因肤色门限被压暗。
@@ -80,7 +80,7 @@ python3 -m video_player --check
 ## 6. 拍摄/证据清单（M4 补齐）
 
 - [x] 主窗口截图 → `docs/images/main-window.png`（2026-11-14，取自 `docs/evidence/m1-ui-gl.png`）
-- [x] 美颜前后对比截图 → `docs/images/beauty-compare.png`（近景放大，取自 `docs/evidence/m3-split-closeup.png`）；主窗口分屏 → `docs/images/beauty-split.png`（`m3-split-demo.png`）
+- [x] 美颜前后对比截图 → `docs/images/beauty-compare.png`（A/B 近景对比，取自 `docs/evidence/m3-beauty-ab.png`）；主窗口分屏 → `docs/images/beauty-split.png`（`m3-split-demo.png`）；同帧近景 → `docs/evidence/m3-split-closeup.png`
 - [ ] 板端环境自检输出（`--markdown`）→ 回填 [BOARD.md](BOARD.md)（部分已回填）
 - [ ] 演示视频（约 90 秒、1080p30、中英双语硬字幕）→ 按 [DELIVERY.md](DELIVERY.md) 拍摄方案执行，成片链接记录到本文件
 - [ ] 验收 A1–A6 的逐条证据（fps/CPU/检出率/1h 稳定性）

@@ -16,6 +16,10 @@ A local video player demo for the [Quectel Pi M2](https://developer.quectel.com/
 
 *M3 split view (demo mode): the same frame with the original on the left and GPU smoothing + whitening on the right; the face mask comes from the NPU detection boxes.*
 
+![](docs/images/beauty-compare.png)
+
+*M3 A/B close-up (detection on): left is the untouched frame, right has the GPU pass applied — wrinkles and redness are softened, the eyes stay sharp and hair/background outside the mask is untouched.*
+
 > **Scope:** M1 playback, M2 NPU face detection and M3 GPU beauty/compare are implemented and verified on the board: hardware-decoded 1080p30 into an embedded GTK4 sink at a steady 30 fps, YuNet detection on the NPU (10 Hz, ≈30–40 ms per inference), and edge-preserving smoothing + whitening inside feathered face masks on the GPU (≈1 ms per frame). See [docs/PRD.md](docs/PRD.md) for the milestone plan.
 
 ## Features
@@ -162,7 +166,7 @@ More board demos are available in the [Quectel-Pi](https://github.com/Quectel-Pi
 - Demo-level implementation, not a hardened distribution: there is no authentication, sandboxing or DRM.
 - Video and image assets are not bundled. Provide your own, and only company-owned or licensed footage may be used in demos.
 - RKNN model weights are not committed; follow [docs/BOARD.md](docs/BOARD.md) to convert and place them.
-- M1 playback, M2 NPU detection and M3 GPU beauty work on the board: 30 fps with the shader on (detection off, CPU 30–32%), beauty ≈0.8–1.6 ms per frame. The full demo mode (detection + beauty + split view) also holds 30 fps but runs at 115–123% CPU, mostly the 10 Hz YuNet inference inherited from M2. A1 is measured for H.264 1080p30; H.265 is pending a sample clip, and the 1 h soak test is still outstanding.
+- M1 playback, M2 NPU detection and M3 GPU beauty work on the board: 30 fps with the shader on (detection off, CPU 30–32%), beauty ≈0.8–1.6 ms per frame. The full demo mode (detection + beauty + split view) also holds 30 fps but runs at 117–131% CPU, mostly the 10 Hz YuNet inference inherited from M2. A1 is measured for H.264 1080p30; H.265 is pending a sample clip, and the 1 h soak test is still outstanding.
 - Network streams are out of this phase; when re-enabled, they will be opened without validating remote content, so only connect to trusted sources.
 
 ## Reporting Issues

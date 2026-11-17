@@ -701,6 +701,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
                     f"{_format_time(position)} / {_format_time(duration)}"
                 )
             self._update_info_label()
+            if self.backend.beauty_available and self.config.beauty.enabled:
+                # Keep the panel's ms/frame in sync with the live GPU timing;
+                # otherwise it stays at the value captured before playback.
+                self._refresh_params_label()
         return True
 
     def _maybe_log_perf(self) -> None:

@@ -25,31 +25,50 @@
 `/tmp/face_1080p30.mp4`），DSI 1280×800；`VIDEO_PLAYER_PERF_LOG=1` 时应用每秒
 打印 `PERF t=..s fps=.. beauty=..ms faces=.. npu=..ms cpu=..%`。
 
+> 注意：美颜只在**检测到人脸**时生效（无脸 → `u_active=0` 整链透传）。因此下面
+> 的开/关 A/B 与分屏证据都在**检测开启**下抓取；检测关闭时 `beauty: on` 只是
+> 开关状态，画面不会有可见变化。
+
 | 文件 | 内容 | 关键读数 |
 |------|------|----------|
-| `m3-beauty-on.png` | 美颜开、检测关（cfg_B），窗口 1280×768 | `fps: 30.1`、`beauty: on 1.0 ms`、`NPU: –`；面部平滑提亮、五官保留 |
-| `m3-beauty-off.png` | 同素材美颜关（cfg_C），同窗口 | `fps: 30.2`、`beauty: off`；与上图对比可见磨皮/美白效果 |
-| `m3-split-demo.png` | demo 模式（`--demo`）：强制分屏 + 检测开，全屏 1280×800 | 左半原图 / 右半美颜、白色分割线在 0.50；`fps: 30.0`、`NPU: 1 face · 38.9 ms`、`beauty: on 1.2 ms`（A3 主证据，同一帧对比） |
-| `m3-split-closeup.png` | 上一图裁切放大（1.5×，带 ORIGINAL/BEAUTY 标注） | 左：额头/眼角皱纹与色斑清晰；右：明显平滑、肤色提亮不发灰；眼睛眉毛保持锐利、遮罩外头发背景不变（A3 近景） |
+| `m3-beauty-on.png` | 检测开 + 美颜开（cfg_faceon），窗口 1280×768 | `fps: 30.0`、`NPU: 1 face · 38.5 ms`、`beauty: on 1.1 ms`；面部平滑提亮、五官保留 |
+| `m3-beauty-off.png` | 同素材、同帧附近，检测开 + 美颜关（cfg_A） | `fps: 30.0`、`NPU: 1 face · 40.9 ms`、`beauty: off`；与上图构成同一场景 A/B |
+| `m3-beauty-ab.png` | 上图各裁人脸区并排（A 原始 / B 美颜） | A3 主证据：皱纹、毛孔与泛红明显平滑，肤色提亮不发灰；虹膜/睫毛仍锐利，遮罩外头发与背景不变 |
+| `m3-split-demo.png` | demo 模式（`--demo`，1280×800 全屏）：强制分屏 + 检测开 | 左半原图 / 右半美颜、白色分割线 0.50；`fps: 30.0`、`NPU: 1 face · 40.9 ms`、`beauty: on 1.3 ms`、侧栏参数行与信息行一致（A3 同帧对比） |
+| `m3-split-closeup.png` | 上一图裁切放大 1.5×（带 ORIGINAL/BEAUTY 标注） | 分割线两侧皮肤纹理差异清晰；羽化过渡无硬接缝 |
 | `m3-mask.png` | `beauty.debug_mask=true` 遮罩预览（检测开） | 白色=羽化圆角矩形人脸处理区；眼睛/眉毛被肤色门限压暗；框外全黑（背景/头发不处理）；绿框与遮罩对齐 |
 | `m3-rot180-beauty.png` | rotate-180 自拍片源 + 美颜（检测开） | 画面正立、人脸框与磨皮区域均落在脸部（方向处理正确） |
 | `m3-rot180-mask.png` | 同上素材的遮罩预览 | 遮罩随检测框反向旋转回纹理坐标，无镜像/错位 |
 
-复现命令（板端，项目目录；`/tmp/cfg_B.json` = 美颜开+检测关，`/tmp/cfg_C.json` = 都关）：
+性能读数（同一批抓取的 `PERF` 行，取稳定段；详见 [../BOARD.md](../BOARD.md) §5.2）：
+
+| 场景 | fps | CPU | beauty | NPU |
+|------|-----|-----|--------|-----|
+| 检测关 + 美颜关（cfg_C） | 30.1–30.2 | 30–32% | 透传 ≈0.8 ms | — |
+| 检测关 + 美颜开（cfg_B） | 30.0–30.4 | 30–33% | 0.68–1.36 ms | — |
+| 检测开 + 美颜开（cfg_faceon） | 30.0 | 110–119% | 1.06–1.56 ms | 37.5–44.0 ms |
+| demo 分屏全开（`--demo`） | 30.0 | 117–131% | 1.1–1.5 ms | 37.8–41.2 ms |
+
+板端背景负载升高时会周期性出现 20–25 fps 的波动窗口（60 s 长片实测；
+波动期间 beauty/NPU 耗时与 CPU 均平稳，load average 4.2→5.9），属调度抖动而非
+美颜成本；上表取稳定段。
+
+复现命令（板端，项目目录；`/tmp/cfg_A.json` = 检测开+美颜关，`/tmp/cfg_B.json`
+= 检测关+美颜开，`/tmp/cfg_C.json` = 都关，`/tmp/cfg_faceon.json` = 检测开+美颜开）：
 
 ```bash
 export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 GST_GL_PLATFORM=egl
 export VIDEO_PLAYER_PERF_LOG=1
 
-# A2：美颜开 / 关（信息行 + PERF 行给出 fps、beauty ms、CPU）
+# A2：美颜开/关与真实人脸场景（信息行 + PERF 行给出 fps、beauty ms、CPU）
 python3 scripts/launch_player.py --config /tmp/cfg_B.json /tmp/face_1080p30.mp4
-python3 scripts/launch_player.py --config /tmp/cfg_C.json /tmp/face_1080p30.mp4
+python3 scripts/launch_player.py --config /tmp/cfg_faceon.json /tmp/face_1080p30.mp4
 
 # A3：demo 分屏（强制）与遮罩预览
 python3 scripts/launch_player.py --demo /tmp/face_1080p30.mp4 \
-  --snapshot /tmp/m3shots/demo_default.png --snapshot-delay 12
+  --snapshot /tmp/m3shots/final_demo.png --snapshot-delay 8
 python3 scripts/launch_player.py --config /tmp/cfg_mask.json /tmp/face_1080p30.mp4 \
-  --snapshot /tmp/m3shots/demo_mask.png --snapshot-delay 12
+  --snapshot /tmp/m3shots/final_mask.png --snapshot-delay 8
 ```
 
 性能数据与结论见 [../BOARD.md](../BOARD.md) §5.2 与

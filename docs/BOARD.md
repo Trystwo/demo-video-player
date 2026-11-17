@@ -125,8 +125,10 @@ bash scripts/bench_board.sh
 | 2026-11-17 | M3 美颜 GPU 成本（探针） | `perf_probe.py CONV=gl SIZE=1080`：`BEAUTY=0` 30.0fps/CPU 14–15%；`BEAUTY=1`（完整美颜）30.0fps/16–17%、0.93–1.0 ms/帧；`BEAUTY=2`（u_active=0 透传）与 `BEAUTY=3`（copy shader）同量级 | 美颜在 1080p30 上几乎免费 |
 | 2026-11-17 | M3 GTK4 缩放慢路径 | 1080p 纹理、视频区宽 900/940/950/955 px 时 CPU 70–73%；960 px 起 15%，1280 px 17%；`GSK_RENDERER=cairo` 126% | 断点=缩放比 0.5（1920/960），即 A2 CPU 异常根因 |
 | 2026-11-17 | M3 `glcolorscale` 预缩修复 | 940×700 窗口：无缩放 CPU 62–64%、GTK 只画 26.2 帧/s → `SCALE=1280x720` 后 CPU 18–20%、30.0 帧/s、beauty 0.76–1.38 ms | 新增 `player.texture_max_dimension=1280` |
-| 2026-11-17 | M3 应用 A2（美颜开 + 检测关） | 1080p30 近景、1280×768 窗口：30.2fps、CPU 30–32%、信息行 `beauty: on 0.78–0.94 ms`；同场景美颜关 30.2fps/30–32% | 修复前同一配置 78–80% CPU |
-| 2026-11-17 | M3 demo 全开（美颜+检测+强制分屏） | 全屏 1280×800：30.0fps、CPU 115–123%、NPU 38–40 ms、beauty 1.2–1.6 ms；关美颜 112–121% | 增量主要来自 M2 检测（约 85pp） |
+| 2026-11-17 | M3 应用 A2（美颜开 + 检测关） | 1080p30 近景、1280×768 窗口：30.0–30.4fps、CPU 30–33%、`beauty: on 0.68–1.36 ms`；同场景美颜关 30.1–30.2fps/30–32% | 修复前同一配置 78–80% CPU |
+| 2026-11-17 | M3 应用（美颜开 + 检测开，真实人脸） | 1080p30 近景：稳定 30.0fps、CPU 110–119%、beauty 1.06–1.56 ms、NPU 37.5–44.0 ms、faces 1 | 检测是 CPU 主要来源；美颜仍 <1.6ms |
+| 2026-11-17 | M3 demo 全开（美颜+检测+强制分屏） | 全屏 1280×800：30.0fps、CPU 117–131%、NPU 37.8–41.2 ms、beauty 1.1–1.5 ms；关美颜 112–121% | 增量主要来自 M2 检测（约 85pp） |
+| 2026-11-17 | M3 掉速窗口归因 | 60s 长片（`/tmp/face_long.mp4`，4×concat）跑 40s：稳定段 30.0fps、掉速段 22–25fps 后恢复；全程 beauty 1.03–1.51 ms、NPU 37.7–43.9 ms、CPU 112–125% 不变；load average 4.24→5.89 | 掉速来自板端背景负载/调度，非美颜或检测变慢；A2 取稳定段 |
 | 2026-11-17 | M3 检测线程 CPU 归因 | `/proc/PID/task` 采样（总 CPU 115.2%）：主线程 27.3%、demux:sink 27.6%、video-decoder 15.0%、gstglcontext 11.3%；headless `measure_tap.py` 30.0fps、10 次/s、37.5 ms | M2 遗留成本，M3 未改动 |
 | 2026-11-17 | M3 旋转（90/270/180） | `ffmpeg -display_rotation` 素材 + 四色标记图：tag `rotate-270/rotate-90/rotate-180` 与显示方向自洽；180° 自拍素材人脸框与遮罩对齐 | `face_rect_to_texture()` 反向映射正确（单测覆盖 0/90/180/270） |
 | 2026-11-17 | M3 一键开关（F9 路径） | 运行时 `refresh_beauty()`：`beauty_active False→True`，beauty_ms 稳定 0.9–1.1 ms，无异常 | UI 开关走同一路径 |

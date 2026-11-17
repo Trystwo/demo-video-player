@@ -210,14 +210,22 @@ M3 实测（板端 2026-11-17，pexels 1080p30 H.264 近景素材，1280×800 �
 |------|------|-----|-----|---------|
 | 纯管线 + 预缩放 + 美颜 shader（全屏 1280×800） | `perf_probe.py CONV=gl BEAUTY=1 SCALE=1280x720` | 30.0 | 18–20% | 0.76–1.38 ms |
 | 同一探针但不预缩放（940×700 窗口） | `perf_probe.py` 无 SCALE | 30.0（GTK 只画 26.2 帧/s） | 62–64% | 1.9–2.8 ms |
-| 应用，美颜关 + 检测关 | `launch_player.py --config cfg_C.json` | 30.2 | 30–32% | —（透传） |
-| 应用，美颜开 + 检测关 | `launch_player.py --config cfg_B.json` | 30.2 | 30–32% | 0.78–0.94 ms |
-| 应用，demo（美颜 + 检测 + 强制分屏，全屏） | `launch_player.py --demo` | 30.0 | 115–123% | 1.2–1.6 ms |
+| 应用，美颜关 + 检测关 | `launch_player.py --config cfg_C.json` | 30.1–30.2 | 30–32% | —（透传仍有约 0.8 ms/帧的元素开销） |
+| 应用，美颜开 + 检测关 | `launch_player.py --config cfg_B.json` | 30.0–30.4 | 30–33% | 0.68–1.36 ms |
+| 应用，美颜开 + 检测开（真实人脸，无分屏） | `launch_player.py --config cfg_faceon.json` | 30.0 | 110–119% | 1.06–1.56 ms |
+| 应用，demo（美颜 + 检测 + 强制分屏，全屏） | `launch_player.py --demo` | 30.0 | 117–131% | 1.1–1.5 ms |
 
 结论：**美颜本身几乎免费**（同场景 CPU 增量约 +1–2 个百分点、单帧 <1.6 ms，
 A2 的 fps 与 CPU 目标按「美颜+显示链路」计为达标）；demo 全开时 CPU 偏高是
 M2 的 10 Hz YuNet + RKNN 线程池成本（headless `measure_tap.py`：30 fps、
 10 次检测/s、37.5 ms/次；线程采样显示 NPU 侧约占 85 个百分点），列入后续优化。
+
+测量方法：表中数字取播放稳定段（前 2–3 s 有 RKNN/UI 预热，fps 从 0 爬到 30）。
+板端同时存在其它负载（`gnome-shell`、桌面服务、反复启停的测试进程）时，
+会周期性出现 20–25 fps 的波动窗口（60 s 长片实测：稳定 30.0 fps ↔ 掉到 22–25 fps
+后恢复；波动期间 `beauty` 1.0–1.5 ms、`NPU` 37–44 ms、进程 CPU 保持 112–125%
+不变，load average 由 4.2 升到 5.9），因此这是板端调度/背景负载抖动，不是
+美颜或检测变慢；A2 结论按稳定段判定。
 
 M3 排查中确认的 GTK4 慢路径：`Gtk.Picture` 显示纹理时若缩放比 < 0.5 会走
 CPU 每帧缩放（1080p 纹理、视频区 940 px 宽时进程 CPU 62–78%；把视频区放到
