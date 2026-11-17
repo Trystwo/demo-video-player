@@ -26,11 +26,12 @@ from typing import Callable
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib, Gst  # noqa: E402
+from gi.repository import GLib, GObject, Gst  # noqa: E402
 
+from .beauty import BEAUTY_FRAGMENT_SHADER, BeautyParams
 from .config import Config
 from .detection import FaceDetectionTap, rotation_from_tag
-from .face import DetectionResult
+from .face import DetectionResult, Face
 from .pipeline import decoder_for, demux_for, is_stream_uri, parser_for
 
 __all__ = ["PlaybackBackend", "PlaybackError"]
@@ -51,6 +52,64 @@ def _make(factory: str, name: str) -> Gst.Element:
             "install the board packages from docs/BOARD.md and retry"
         )
     return element
+
+
+def _uniform_structure(values: dict[str, float]) -> Gst.Structure:
+    """Pack shader uniforms into a ``GstStructure`` that ``glshader`` accepts.
+
+    ``glshader`` only understands ``gfloat`` values: a Python ``float`` becomes a
+    ``gdouble`` and is silently ignored (no error, the uniform stays 0.0), so
+    every field is wrapped in an explicit ``G_TYPE_FLOAT`` value.
+    """
+    structure = Gst.Structure.new_empty("uniforms")
+    for name, value in values.items():
+        value_obj = GObject.Value()
+        value_obj.init(GObject.TYPE_FLOAT)
+        value_obj.set_float(float(value))
+        structure.set_value(name, value_obj)
+    return structure
+
+
+def scaled_texture_size(
+    width: int, height: int, max_dimension: int
+) -> tuple[int, int]:
+    """Shrink a decoded frame so the GL texture matches the on-screen size.
+
+    Measured on the RK3576 (GTK 4.18.6, Mesa GL): when GTK paints a texture at
+    a scale below 0.5 -- i.e. more than 2x downscale -- the frame takes a CPU
+    painting path that costs ~55 % extra CPU at 1080p30 and drops the sink to
+    ~26 fps.  Handing the paint stack a texture whose long side is at most
+    ``max_dimension`` keeps the paint scale >= 0.5 (the video area is ~940 px
+    wide in the window and ~1264 px in fullscreen) and also cuts the shader's
+    sampling cost.
+
+    The long side is capped so portrait clips are covered too.  Dimensions stay
+    even because most video formats require it.  ``max_dimension`` of 0
+    disables the pre-scale.
+    """
+    if width <= 0 or height <= 0 or max_dimension <= 0:
+        return (width, height)
+    longest = max(width, height)
+    if longest <= max_dimension:
+        return (width, height)
+    scale = max_dimension / float(longest)
+    scaled_width = max(2, int(round(width * scale / 2.0)) * 2)
+    scaled_height = max(2, int(round(height * scale / 2.0)) * 2)
+    return (scaled_width, scaled_height)
+
+
+def _structure_frame_size(structure: Gst.Structure) -> tuple[int, int]:
+    """Read ``width``/``height`` from a video caps structure (0, 0 if absent)."""
+    width = structure.get_value("width")
+    height = structure.get_value("height")
+    if (
+        isinstance(width, int)
+        and isinstance(height, int)
+        and width > 0
+        and height > 0
+    ):
+        return (width, height)
+    return (0, 0)
 
 
 class PlaybackBackend:
@@ -76,6 +135,14 @@ class PlaybackBackend:
         self._detection_failed = False
         self._rotation = 0
         self._coded_size: tuple[int, int] = (0, 0)
+        self._texture_size: tuple[int, int] = (0, 0)
+        self._faces: tuple[Face, ...] = ()
+        self._beauty: Gst.Element | None = None
+        self._beauty_available = False
+        self._beauty_error_reported = False
+        self._beauty_ms = 0.0
+        self._beauty_started = 0.0
+        self._beauty_times: deque[float] = deque(maxlen=60)
         self.video_info: dict[str, object] = {}
         self.uri: str | None = None
 
@@ -93,6 +160,8 @@ class PlaybackBackend:
         self.on_detection: Callable[[DetectionResult], None] | None = None
         #: Called with a human-readable message when face detection cannot run.
         self.on_detection_error: Callable[[str], None] | None = None
+        #: Called when the GPU beauty pass cannot run (missing element / converter).
+        self.on_beauty_error: Callable[[str], None] | None = None
 
     # -- properties --------------------------------------------------------
 
@@ -116,6 +185,34 @@ class PlaybackBackend:
     @property
     def has_media(self) -> bool:
         return self._pipeline is not None
+
+    @property
+    def beauty_available(self) -> bool:
+        """True when the GPU beauty pass is part of the current pipeline."""
+        return self._beauty is not None
+
+    @property
+    def beauty_ms(self) -> float:
+        """Mean per-frame time spent inside the beauty element (milliseconds).
+
+        This is the cost of submitting the shading work on the streaming thread,
+        i.e. what the video pipeline "loses" per frame; the actual GPU busy time
+        is lower and is measured separately in ``docs/BOARD.md``.
+        """
+        return round(self._beauty_ms, 2)
+
+    @property
+    def beauty_active(self) -> bool:
+        return bool(self._beauty is not None and self._config.beauty.enabled)
+
+    def refresh_beauty(self) -> None:
+        """Push the current beauty configuration to the running shader.
+
+        Slider/switch changes call this; the uniforms are swapped atomically on
+        the element, so no pipeline reconfiguration (and no dropped frame) is
+        needed to change strength or toggle the effect.
+        """
+        self._push_beauty_uniforms()
 
     # -- playback control --------------------------------------------------
 
@@ -162,6 +259,8 @@ class PlaybackBackend:
         self._playing = False
         self._rotation = 0
         self._coded_size = (0, 0)
+        self._texture_size = (0, 0)
+        self._faces = ()
         self.video_info = {}
         target = Gst.State.PLAYING if autoplay else Gst.State.PAUSED
         self._pipeline.set_state(target)
@@ -188,10 +287,12 @@ class PlaybackBackend:
             return
         if position_ns < 0:
             position_ns = 0
+        # PyGObject exposes Gst.Element.seek as (rate, format, flags, ...);
+        # the C argument order (rate, flags, format, ...) raises a TypeError.
         self._pipeline.seek(
             self._rate,
-            SEEK_FLAGS,
             Gst.Format.TIME,
+            SEEK_FLAGS,
             Gst.SeekType.SET,
             position_ns,
             Gst.SeekType.NONE,
@@ -215,8 +316,8 @@ class PlaybackBackend:
         if self._pipeline is not None and position > 0:
             self._pipeline.seek(
                 rate,
-                SEEK_FLAGS,
                 Gst.Format.TIME,
+                SEEK_FLAGS,
                 Gst.SeekType.SET,
                 position,
                 Gst.SeekType.NONE,
@@ -256,6 +357,12 @@ class PlaybackBackend:
         self._video_sink = None
         self._fps_sink = None
         self._volume_element = None
+        self._beauty = None
+        self._beauty_available = False
+        self._beauty_ms = 0.0
+        self._beauty_started = 0.0
+        self._beauty_times.clear()
+        self._faces = ()
         self._paintable = None
         self._decoder_name = None
         self._converter_name = None
@@ -264,6 +371,7 @@ class PlaybackBackend:
         self._frame_times.clear()
         self._rotation = 0
         self._coded_size = (0, 0)
+        self._texture_size = (0, 0)
         self.video_info = {}
         self.uri = None
 
@@ -305,13 +413,17 @@ class PlaybackBackend:
         self._fps_sink = fps
         self._paintable = embed.get_property("paintable")
 
-    def _video_converters(self) -> list[Gst.Element]:
+    def _video_converters(self, source_size: tuple[int, int] = (0, 0)) -> list[Gst.Element]:
         """Return the colour-conversion elements for the video branch.
 
         GPU conversion is required on the RK3576 board: CPU ``videoconvert``
         only reaches ~15 fps at 1080p because the decoded NV12 DMABuf has to be
         mapped and converted on the CPU.  ``glupload`` imports the DMABuf and
         ``glcolorconvert`` converts to RGBA on the GPU, which sustains 30 fps.
+
+        When ``source_size`` exceeds ``player.texture_max_dimension`` a
+        ``glcolorscale`` shrinks the GPU texture to the on-screen size; see
+        :func:`scaled_texture_size` for the measurements behind that.
         """
         mode = self._config.player.video_convert
         if mode in ("auto", "gl"):
@@ -323,13 +435,122 @@ class PlaybackBackend:
                     "caps",
                     Gst.Caps.from_string("video/x-raw(memory:GLMemory),format=RGBA"),
                 )
-                return [upload, convert, caps]
+                texture_size = scaled_texture_size(
+                    source_size[0],
+                    source_size[1],
+                    self._config.player.texture_max_dimension,
+                )
+                self._texture_size = texture_size
+                elements = [upload, convert, caps]
+                elements.extend(self._build_gl_scaler(texture_size))
+                return elements
             if mode == "gl":
                 raise PlaybackError(
                     "player.video_convert=gl but glupload/glcolorconvert "
                     "are not installed (install gstreamer1.0-plugins-base)"
                 )
         return [_make("videoconvert", "video-convert")]
+
+    def _build_gl_scaler(self, texture_size: tuple[int, int]) -> list[Gst.Element]:
+        """Create the GPU downscale pair that keeps the paint scale >= 0.5."""
+        width, height = texture_size
+        if width <= 0 or height <= 0:
+            return []
+        scale = Gst.ElementFactory.make("glcolorscale", "video-glscale")
+        caps = Gst.ElementFactory.make("capsfilter", "video-glscalecaps")
+        if scale is None or caps is None:
+            # Without glcolorscale the frame still plays, it just keeps the
+            # full texture size (GTK then paints it in the slow path).
+            return []
+        caps.set_property(
+            "caps",
+            Gst.Caps.from_string(
+                "video/x-raw(memory:GLMemory),format=RGBA,"
+                f"width={width},height={height},texture-target=2D"
+            ),
+        )
+        return [scale, caps]
+
+    def _build_beauty_element(self) -> Gst.Element | None:
+        """Create the ``glshader`` element that runs the beauty fragment shader.
+
+        The element is always added when the GL converter is in use: toggling
+        beauty then only rewrites uniforms instead of relinking the pipeline, so
+        the F9 on/off switch and the compare split cost nothing.  ``u_active``
+        keeps the shader a pass-through while beauty is off.
+        """
+        shader = Gst.ElementFactory.make("glshader", "video-beauty")
+        if shader is None:
+            self._report_beauty_error(
+                "glshader is not installed (gtk4/GL plugins); beauty disabled"
+            )
+            return None
+        shader.set_property("fragment", BEAUTY_FRAGMENT_SHADER)
+        shader.set_property("uniforms", _uniform_structure(self._beauty_values()))
+        self._beauty = shader
+        self._beauty_available = True
+        return shader
+
+    def _beauty_values(self) -> dict[str, float]:
+        """Uniform values for the current config, frame geometry and faces."""
+        display_width, display_height = self._display_size()
+        texture = self._texture_size or self._coded_size
+        if not texture[0] or not texture[1]:
+            texture = (display_width, display_height)
+        beauty = self._config.beauty
+        return BeautyParams.from_config(beauty).uniforms(
+            frame_size=(display_width, display_height),
+            texture_size=texture,
+            faces=self._faces,
+            rotation=self._rotation,
+            compare_mode=beauty.compare_mode,
+            split=beauty.split,
+            feather_px=beauty.feather_px,
+            expand=beauty.expand,
+            skin_guard=beauty.skin_guard,
+            active=beauty.enabled,
+            debug=beauty.debug_mask,
+        )
+
+    def _push_beauty_uniforms(self) -> None:
+        if self._beauty is None:
+            return
+        self._beauty.set_property("uniforms", _uniform_structure(self._beauty_values()))
+
+    def _report_beauty_error(self, message: str) -> None:
+        self._beauty_available = False
+        if self._beauty_error_reported:
+            return
+        self._beauty_error_reported = True
+        self._dispatch(self.on_beauty_error, message)
+
+    def _attach_beauty_probes(self, element: Gst.Element) -> None:
+        """Time the shader element's per-frame work for the info panel (F10)."""
+        sink_pad = element.get_static_pad("sink")
+        src_pad = element.get_static_pad("src")
+        if sink_pad is not None:
+            sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_beauty_sink_buffer)
+        if src_pad is not None:
+            src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_beauty_src_buffer)
+
+    def _on_beauty_sink_buffer(
+        self, _pad: Gst.Pad, _info: Gst.PadProbeInfo
+    ) -> Gst.PadProbeReturn:
+        self._beauty_started = time.perf_counter()
+        return Gst.PadProbeReturn.OK
+
+    def _on_beauty_src_buffer(
+        self, _pad: Gst.Pad, _info: Gst.PadProbeInfo
+    ) -> Gst.PadProbeReturn:
+        if self._beauty_started:
+            elapsed = (time.perf_counter() - self._beauty_started) * 1000.0
+            self._beauty_started = 0.0
+            if 0.0 <= elapsed < 100.0:
+                self._beauty_times.append(elapsed)
+                # Mean over the last ~60 frames (2 s at 30 fps) rather than an
+                # EMA, so parameter changes show up immediately in the panel.
+                self._beauty_ms = sum(self._beauty_times) / len(self._beauty_times)
+        return Gst.PadProbeReturn.OK
 
     def _on_demux_pad_added(self, _demux, pad: Gst.Pad) -> None:
         caps = pad.get_current_caps() or pad.query_caps(None)
@@ -345,10 +566,11 @@ class PlaybackBackend:
     def _build_video_branch(
         self, pad: Gst.Pad, caps_name: str, structure: Gst.Structure
     ) -> None:
+        source_size = _structure_frame_size(structure)
         try:
             parser_factory = parser_for(caps_name)
             decoder_factory = decoder_for(caps_name, self._config.player.hw_decode)
-            converters = self._video_converters()
+            converters = self._video_converters(source_size)
         except ValueError as exc:
             self._fail(str(exc))
             return
@@ -365,10 +587,22 @@ class PlaybackBackend:
         pipeline = self._pipeline
         if pipeline is None:
             return
-        elements = (queue, parser, decoder, *converters)
+        # Remember the converter for the info panel before the beauty pass is
+        # appended: ``glupload`` means the GPU path, which is what the shader needs.
+        gl_path = bool(converters) and converters[0].get_name() == "video-upload"
+        beauty: Gst.Element | None = None
+        if gl_path:
+            beauty = self._build_beauty_element()
+        elif self._config.beauty.enabled:
+            self._report_beauty_error(
+                "GPU beauty needs player.video_convert=gl (glupload/glcolorconvert); "
+                "the CPU converter path plays without beauty"
+            )
+        filters = [*converters, beauty] if beauty is not None else list(converters)
+        elements = (queue, parser, decoder, *filters)
         for element in elements:
             pipeline.add(element)
-        chain = [queue, parser, decoder, *converters]
+        chain = [queue, parser, decoder, *filters]
         if self._fps_sink is not None:
             chain.append(self._fps_sink)
         for upstream, downstream in zip(chain, chain[1:]):
@@ -389,20 +623,15 @@ class PlaybackBackend:
 
         self._decoder_name = decoder_factory
         self._converter_name = converters[-1].get_name() if converters else None
+        if beauty is not None:
+            self._attach_beauty_probes(beauty)
         if self._fps_sink is not None:
             fps_pad = self._fps_sink.get_static_pad("sink")
             if fps_pad is not None:
                 fps_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_fps_buffer)
         self._start_detection(decoder)
-        coded_width = structure.get_value("width")
-        coded_height = structure.get_value("height")
-        if (
-            isinstance(coded_width, int)
-            and isinstance(coded_height, int)
-            and coded_width > 0
-            and coded_height > 0
-        ):
-            self._coded_size = (coded_width, coded_height)
+        if source_size[0]:
+            self._coded_size = source_size
         info: dict[str, object] = {
             "codec": caps_name.split("/")[-1].upper(),
             "decoder": decoder_factory,
@@ -417,6 +646,7 @@ class PlaybackBackend:
         if framerate_ok and denominator:
             info["fps"] = round(numerator / denominator, 2)
         self.video_info = info
+        self._push_beauty_uniforms()
         self._dispatch(self.on_video_info, dict(info))
 
     def _prepare_detection(self) -> None:
@@ -482,6 +712,10 @@ class PlaybackBackend:
         return round((len(recent) - 1) / span, 1) if span > 0 else 0.0
 
     def _on_detection_result(self, result: DetectionResult) -> None:
+        # The shader mask follows the newest detection; no faces means the
+        # beauty pass leaves the frame untouched (F6/F7 contract).
+        self._faces = tuple(result.faces)
+        self._push_beauty_uniforms()
         self._dispatch(self.on_detection, result)
 
     def _on_detection_error(self, message: str) -> None:
@@ -591,6 +825,7 @@ class PlaybackBackend:
             info["height"] = height
             info["rotation"] = rotation
             self.video_info = info
+            self._push_beauty_uniforms()
             self._dispatch(self.on_video_info, dict(info))
 
     def _rotation_degrees(self) -> int:

@@ -20,6 +20,7 @@ def test_defaults_are_valid_and_match_example_file() -> None:
     config.validate()
     assert config.player.render_sink == "gtk4paintablesink"
     assert config.player.video_convert == "auto"
+    assert config.player.texture_max_dimension == 1280
     assert config.player.volume == 80
     assert config.beauty.enabled is True
     assert config.detection.enabled is True
@@ -43,7 +44,7 @@ def test_partial_section_keeps_other_defaults() -> None:
 def test_values_are_clamped_to_safe_ranges() -> None:
     config = Config.from_dict(
         {
-            "player": {"volume": 250, "speed": 3.5},
+            "player": {"volume": 250, "speed": 3.5, "texture_max_dimension": 99999},
             "beauty": {"smoothing": -20, "whitening": 180, "feather_px": 500},
             "detection": {"interval_frames": 0, "max_faces": 99, "min_score": 1.5},
             "debug": {"fps_window": 10000},
@@ -51,6 +52,7 @@ def test_values_are_clamped_to_safe_ranges() -> None:
     )
     assert config.player.volume == 100
     assert config.player.speed == 2.0
+    assert config.player.texture_max_dimension == 8192
     assert config.beauty.smoothing == 0
     assert config.beauty.whitening == 100
     assert config.beauty.feather_px == 64

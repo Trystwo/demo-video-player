@@ -86,6 +86,12 @@ class PlayerConfig:
     hw_decode: bool = True
     render_sink: str = "gtk4paintablesink"
     video_convert: str = "auto"
+    #: Upper bound for the long side of the GL texture handed to GTK.  GTK4/GSK
+    #: paints a texture through a CPU fallback when it is displayed at less
+    #: than half of its pixel size; pre-scaling on the GPU keeps the paint
+    #: scale >= 0.5 and keeps the on-screen cost proportional to the panel.
+    #: 0 disables the pre-scale (full source resolution in GL memory).
+    texture_max_dimension: int = 1280
     volume: int = 80
     speed: float = 1.0
     resume: bool = True
@@ -105,6 +111,13 @@ class PlayerConfig:
                 f"got {self.render_sink!r}"
             )
         self.volume = int(_clamp(_as_int(self.volume, name="player.volume"), 0, 100))
+        self.texture_max_dimension = int(
+            _clamp(
+                _as_int(self.texture_max_dimension, name="player.texture_max_dimension"),
+                0,
+                8192,
+            )
+        )
         self.speed = round(_clamp(_as_float(self.speed, name="player.speed"), 0.5, 2.0), 2)
         self.resume = _as_bool(self.resume, name="player.resume")
 
@@ -118,6 +131,10 @@ class BeautyConfig:
     whitening: int = 40
     compare_mode: bool = False
     feather_px: int = 24
+    expand: float = 0.12
+    skin_guard: bool = True
+    split: float = 0.5
+    debug_mask: bool = False
 
     def validate(self) -> None:
         self.enabled = _as_bool(self.enabled, name="beauty.enabled")
@@ -125,6 +142,12 @@ class BeautyConfig:
         self.whitening = int(_clamp(_as_int(self.whitening, name="beauty.whitening"), 0, 100))
         self.compare_mode = _as_bool(self.compare_mode, name="beauty.compare_mode")
         self.feather_px = int(_clamp(_as_int(self.feather_px, name="beauty.feather_px"), 0, 64))
+        self.expand = round(
+            _clamp(_as_float(self.expand, name="beauty.expand"), 0.0, 1.0), 3
+        )
+        self.skin_guard = _as_bool(self.skin_guard, name="beauty.skin_guard")
+        self.split = round(_clamp(_as_float(self.split, name="beauty.split"), 0.05, 0.95), 3)
+        self.debug_mask = _as_bool(self.debug_mask, name="beauty.debug_mask")
 
 
 @dataclass

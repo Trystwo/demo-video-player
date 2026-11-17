@@ -4,6 +4,7 @@
     "hw_decode": true,
     "render_sink": "gtk4paintablesink",
     "video_convert": "auto",
+    "texture_max_dimension": 1280,
     "volume": 80,
     "speed": 1.0,
     "resume": true
@@ -13,7 +14,11 @@
     "smoothing": 60,
     "whitening": 40,
     "compare_mode": false,
-    "feather_px": 24
+    "feather_px": 24,
+    "expand": 0.12,
+    "skin_guard": true,
+    "split": 0.5,
+    "debug_mask": false
   },
   "detection": {
     "enabled": true,

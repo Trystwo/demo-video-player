@@ -12,7 +12,11 @@ A local video player demo for the [Quectel Pi M2](https://developer.quectel.com/
 
 *The player on the board's DSI display (1280×800): 1080p30 decoded by `mppvideodec`, colour-converted on the GPU and rendered through an embedded `gtk4paintablesink`.*
 
-> **Scope:** M1 playback and M2 NPU face detection are implemented and verified on the board: hardware-decoded 1080p30 into an embedded GTK4 sink at a steady 30 fps, with YuNet face detection on the NPU (10 Hz, ≈30 ms per inference, playback ≈29–30 fps) and boxes/landmarks overlaid in GTK. GPU beauty (M3) is next. See [docs/PRD.md](docs/PRD.md) for the milestone plan.
+![](docs/images/beauty-split.png)
+
+*M3 split view (demo mode): the same frame with the original on the left and GPU smoothing + whitening on the right; the face mask comes from the NPU detection boxes.*
+
+> **Scope:** M1 playback, M2 NPU face detection and M3 GPU beauty/compare are implemented and verified on the board: hardware-decoded 1080p30 into an embedded GTK4 sink at a steady 30 fps, YuNet detection on the NPU (10 Hz, ≈30–40 ms per inference), and edge-preserving smoothing + whitening inside feathered face masks on the GPU (≈1 ms per frame). See [docs/PRD.md](docs/PRD.md) for the milestone plan.
 
 ## Features
 
@@ -20,8 +24,8 @@ Planned scope for the demo (P0 of the design note):
 
 - **Hardware-decoded local playback** — MP4/MKV/MOV/TS files with H.264/H.265 decoded on the RK3576 VPU through GStreamer `mppvideodec`; AAC/MP3/Opus audio.
 - **NPU face detection (implemented)** — a converted YuNet RKNN model runs on the NPU every Nth frame (10 Hz by default); boxes and five landmarks are drawn in GTK, and the info panel shows the face count and inference time. Nothing is processed when no face is present.
-- **Automatic face beauty (M3)** — the GPU smooths and whitens only inside feathered face masks derived from the detected landmarks.
-- **One-key before/after compare** — toggle the effect, or switch to a split-screen original/beautified view on the same frame.
+- **Automatic face beauty (implemented)** — one `glshader` pass smooths (edge-preserving 8-neighbour bilateral approximation) and whitens (with saturation compensation) only inside feathered, skin-gated face masks grown from the NPU boxes; nothing is processed when no face is present.
+- **One-key before/after compare (implemented)** — the `B` key toggles the effect, `C` switches to a split-screen original/beautified view rendered in the same frame (adjustable split position); `--demo` forces the split view.
 - **Player controls** — play/pause, seek, volume, fullscreen, 0.5×–2.0× speed, folder playlist and resume.
 - **Info panel** — resolution, codec, hardware vs software decode, fps and NPU inference time.
 
@@ -97,6 +101,7 @@ The check ends with a summary such as `ok=9 warn=7 fail=0`; board-only items are
 demo-video-player/
 ├── configs/                    # tunable config: decode, beauty strengths, detection interval
 ├── docs/                       # PRD, architecture, board checklist, demo guide
+│   ├── evidence/               # board screenshots used as acceptance evidence
 │   └── images/                 # README screenshots
 ├── models/                     # RKNN face-detection models (see models/README.md; not committed)
 ├── scripts/                    # probe_board.py, launch_player.py
@@ -122,7 +127,7 @@ python3 -m video_player --check    # environment report only
 python3 -m video_player --version
 ```
 
-The window opens on the board's display and plays local H.264/H.265/AAC media with hardware decoding, transport controls and a folder playlist. The beauty panel is a placeholder until M3: its controls only update the in-memory config.
+The window opens on the board's display and plays local H.264/H.265/AAC media with hardware decoding, transport controls and a folder playlist. The beauty panel controls the GPU pass; the smoothing/whitening sliders apply to the running video as you drag them. Keys: `Space` play/pause, `B` beauty, `C` compare, `M` mask preview, `F` fullscreen.
 
 ## Status
 
@@ -131,7 +136,7 @@ The window opens on the board's display and plays local H.264/H.265/AAC media wi
 | M0 | Project skeleton: config contract, pipeline plan, environment check, UI shell | ✅ 2026-11-14 |
 | M1 | GStreamer hardware-decoded playback, GTK4 embedded sink, controls, playlist | ✅ 2026-11-14 (30 fps, CPU ≈16%) |
 | M2 | RKNN YuNet face detection (10 Hz), GTK boxes/landmarks, NPU timing in the info panel | ✅ 2026-11-16 |
-| M3 | GPU smoothing/whitening with face masks and compare mode | ⏳ planned |
+| M3 | GPU smoothing/whitening with face masks and compare mode | ✅ 2026-11-17 (30 fps, beauty ≈1 ms/frame, CPU 30–32% with detection off) |
 | M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ planned |
 
 ## Related Projects
@@ -157,7 +162,7 @@ More board demos are available in the [Quectel-Pi](https://github.com/Quectel-Pi
 - Demo-level implementation, not a hardened distribution: there is no authentication, sandboxing or DRM.
 - Video and image assets are not bundled. Provide your own, and only company-owned or licensed footage may be used in demos.
 - RKNN model weights are not committed; follow [docs/BOARD.md](docs/BOARD.md) to convert and place them.
-- M1 playback and M2 NPU detection work on the board (30 fps with detection on, ≈30 ms per inference at 10 Hz). GPU beauty (M3) is not implemented yet, so beauty/compare figures are still unverified. A1 is measured for H.264 1080p30; H.265 is pending a sample clip.
+- M1 playback, M2 NPU detection and M3 GPU beauty work on the board: 30 fps with the shader on (detection off, CPU 30–32%), beauty ≈0.8–1.6 ms per frame. The full demo mode (detection + beauty + split view) also holds 30 fps but runs at 115–123% CPU, mostly the 10 Hz YuNet inference inherited from M2. A1 is measured for H.264 1080p30; H.265 is pending a sample clip, and the 1 h soak test is still outstanding.
 - Network streams are out of this phase; when re-enabled, they will be opened without validating remote content, so only connect to trusted sources.
 
 ## Reporting Issues

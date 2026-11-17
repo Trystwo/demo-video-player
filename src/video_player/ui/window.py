@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import time
+import resource
 import sys
 from typing import Sequence
 
@@ -152,8 +153,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._faces: tuple[Face, ...] = ()
         self._detection_ms = 0.0
         self._detection_error: str | None = None
+        self._beauty_error: str | None = None
         self._show_faces = True
         self._last_detection_label_at = 0.0
+        self._perf_log = os.environ.get("VIDEO_PLAYER_PERF_LOG") == "1"
+        self._perf_last = 0.0
+        self._perf_cpu = 0.0
+        self._perf_seconds = 0
+        if self._perf_log:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            self._perf_cpu = usage.ru_utime + usage.ru_stime
 
         self.backend.on_eos = self._on_eos
         self.backend.on_error = self._show_error
@@ -162,6 +171,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.backend.on_fps = self._on_fps
         self.backend.on_detection = self._on_detection
         self.backend.on_detection_error = self._on_detection_error
+        self.backend.on_beauty_error = self._on_beauty_error
 
         self.set_title("Video Player · Quectel Pi M2")
         self.set_default_size(1280, 800)
@@ -175,7 +185,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         self._compare_button = Gtk.ToggleButton(label="Compare")
         self._compare_button.set_tooltip_text(
-            "Original / beautified comparison (beauty pipeline lands in M3)"
+            "Split view: original on the left, beautified on the right (C)"
         )
         self._compare_button.set_active(config.beauty.compare_mode)
         self._compare_button.connect("toggled", self._on_compare_toggled)
@@ -356,6 +366,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._compare_switch.connect("notify::active", self._on_compare_switch_toggled)
         panel.append(_labelled_row("Original / beautified", self._compare_switch))
 
+        self._split = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 0.9, 0.05)
+        self._split.set_value(self.config.beauty.split)
+        self._split.set_draw_value(True)
+        self._split.set_digits(2)
+        self._split.set_hexpand(True)
+        self._split.connect("value-changed", self._on_split_changed)
+        panel.append(_labelled_scale("Split position", self._split))
+
         self._faces_switch = Gtk.Switch()
         self._faces_switch.set_active(self._show_faces)
         self._faces_switch.connect("notify::active", self._on_show_faces_toggled)
@@ -369,8 +387,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._refresh_params_label()
 
         note = Gtk.Label(
-            label="The GPU beauty pipeline lands in M3; these controls already "
-            "update the configuration."
+            label="Smoothing and whitening run in the GPU shader, limited to the "
+            "feathered face mask from the NPU detector. Keys: B beauty, C compare, "
+            "M mask preview."
         )
         note.set_xalign(0.0)
         note.set_wrap(True)
@@ -384,9 +403,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if not self.demo:
             return
         self._info_label.set_visible(True)
+        # F9: the demo mode always shows the original/beautified split.
+        self.config.beauty.compare_mode = True
         self._compare_switch.set_active(True)
         self._compare_button.set_active(True)
         self._faces_switch.set_active(True)
+        self.backend.refresh_beauty()
+        self._refresh_params_label()
 
     def _start_index(self, index: int) -> bool:
         try:
@@ -475,37 +498,76 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _on_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         self._start_index(row.get_index())
 
-    # -- beauty placeholders (wired in M3) ------------------------------
+    # -- beauty panel (M3: live shader uniforms) ------------------------
 
     def _on_smoothing_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.smoothing = int(round(scale.get_value()))
-        self._refresh_params_label()
+        self._refresh_beauty()
 
     def _on_whitening_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.whitening = int(round(scale.get_value()))
-        self._refresh_params_label()
+        self._refresh_beauty()
+
+    def _on_split_changed(self, scale: Gtk.Scale) -> None:
+        self.config.beauty.split = round(scale.get_value(), 3)
+        self._refresh_beauty()
 
     def _on_beauty_toggled(self, switch: Gtk.Switch, _param: object) -> None:
         self.config.beauty.enabled = switch.get_active()
-        self._refresh_params_label()
+        self._refresh_beauty()
 
     def _on_compare_toggled(self, button: Gtk.ToggleButton) -> None:
         self.config.beauty.compare_mode = button.get_active()
         self._compare_switch.set_active(button.get_active())
-        self._refresh_params_label()
+        self._refresh_beauty()
 
     def _on_compare_switch_toggled(self, switch: Gtk.Switch, _param: object) -> None:
         self.config.beauty.compare_mode = switch.get_active()
         self._compare_button.set_active(switch.get_active())
+        self._refresh_beauty()
+
+    def _toggle_beauty(self) -> None:
+        self._beauty_switch.set_active(not self._beauty_switch.get_active())
+
+    def _toggle_compare(self) -> None:
+        self._compare_switch.set_active(not self._compare_switch.get_active())
+
+    def _toggle_debug_mask(self) -> None:
+        self.config.beauty.debug_mask = not self.config.beauty.debug_mask
+        self._refresh_beauty()
+
+    def _refresh_beauty(self) -> None:
+        """Apply the current beauty config to the running shader immediately."""
+        self.backend.refresh_beauty()
         self._refresh_params_label()
+        self._update_info_label()
 
     def _refresh_params_label(self) -> None:
-        params = BeautyParams.from_config(self.config.beauty)
-        state = "enabled" if self.config.beauty.enabled else "disabled"
+        beauty = self.config.beauty
+        params = BeautyParams.from_config(beauty)
+        state = "on" if beauty.enabled else "off"
+        if beauty.compare_mode:
+            state += f", split {beauty.split:.0%}"
+        extra = ""
+        if self.backend.beauty_available:
+            extra = f", {self.backend.beauty_ms:.1f} ms/frame"
+        elif not beauty.enabled:
+            extra = ""
+        else:
+            extra = ", GPU pass unavailable"
         self._params_label.set_text(
-            f"beauty {state}; shader uniforms: "
-            f"smoothing={params.smoothing:.2f}, whitening={params.whitening:.2f}"
+            f"beauty {state} (smoothing {params.smoothing:.2f}, "
+            f"whitening {params.whitening:.2f}){extra}"
         )
+
+    def _on_beauty_error(self, message: str) -> None:
+        self._beauty_error = message
+        self._beauty_switch.set_sensitive(False)
+        self._beauty_switch.set_active(False)
+        self.config.beauty.enabled = False
+        self._hint(message)
+        self._refresh_params_label()
+        self._update_info_label()
 
     # -- backend callbacks ----------------------------------------------
 
@@ -513,6 +575,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._update_play_icon(state == "playing")
 
     def _on_video_info(self, info: dict[str, object]) -> None:
+        # The beauty element exists only once the video branch is built, so the
+        # panel is refreshed here to replace the "unavailable" placeholder.
+        self._refresh_params_label()
         self._update_info_label()
 
     def _on_fps(self, fps: float) -> None:
@@ -588,9 +653,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
             npu = f"{len(self._faces)} face · {self._detection_ms:.1f} ms"
         else:
             npu = "—"
+        if self._beauty_error or not self.backend.beauty_available:
+            beauty = "unavailable" if self._beauty_error else "off"
+            if not self._beauty_error and self.config.beauty.enabled:
+                beauty = "off"
+        elif not self.config.beauty.enabled:
+            beauty = "off"
+        else:
+            beauty = f"on {self.backend.beauty_ms:.1f} ms"
         self._info_label.set_text(
             f"{width}×{height}   {codec}   decode: {decoder}   "
-            f"fps: {fps}   NPU: {npu}"
+            f"fps: {fps}   NPU: {npu}   beauty: {beauty}"
         )
 
     def _sync_playlist(self) -> None:
@@ -610,6 +683,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 self._playlist_list.select_row(row)
 
     def _tick(self) -> bool:
+        self._maybe_log_perf()
         if self.backend.has_media:
             measured = self.backend.measured_fps()
             if measured and abs(measured - self._fps) >= 0.5:
@@ -628,6 +702,34 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 )
             self._update_info_label()
         return True
+
+    def _maybe_log_perf(self) -> None:
+        """Print a one-line performance sample once per second (evidence runs).
+
+        Enabled with ``VIDEO_PLAYER_PERF_LOG=1``; the line is plain text so it can
+        be pasted into ``docs/evidence/`` and ``docs/BOARD.md``.
+        """
+        if not self._perf_log:
+            return
+        now = time.monotonic()
+        if self._perf_last and now - self._perf_last < 1.0:
+            return
+        wall = now - self._perf_last if self._perf_last else 0.0
+        cpu = 0.0
+        if wall > 0:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            total = usage.ru_utime + usage.ru_stime
+            cpu = (total - self._perf_cpu) / wall * 100.0
+            self._perf_cpu = total
+        self._perf_last = now
+        self._perf_seconds += 1
+        print(
+            f"PERF t={self._perf_seconds:3d}s fps={self._fps:5.1f} "
+            f"beauty={self.backend.beauty_ms:5.2f}ms "
+            f"faces={len(self._faces)} npu={self._detection_ms:5.1f}ms "
+            f"cpu={cpu:5.0f}%",
+            flush=True,
+        )
 
     def _on_open_clicked(self, _button: Gtk.Button) -> None:
         dialog = Gtk.FileDialog(title="Open video")
@@ -680,6 +782,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return True
         if name in ("p", "P"):
             self._on_previous_clicked(None)
+            return True
+        if name in ("b", "B"):
+            self._toggle_beauty()
+            return True
+        if name in ("c", "C"):
+            self._toggle_compare()
+            return True
+        if name in ("m", "M"):
+            self._toggle_debug_mask()
             return True
         if name in ("o", "O"):
             self._on_open_clicked(self._open_button)

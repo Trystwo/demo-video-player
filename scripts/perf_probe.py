@@ -14,6 +14,19 @@ Env knobs:
     SYNC=1|0          sink sync property
     WRAP=1|0          wrap sink in fpsdisplaysink (with sync propagated)
     DURATION=8        measurement seconds
+    SAMPLE=path       override the sample clip
+    BEAUTY=0|1|2|3    GPU beauty cost breakdown (CONV=gl only), see below
+    SCALE=WxH         insert glcolorscale before the sink (CONV=gl only),
+                      e.g. SCALE=1280x720 to pre-shrink the texture
+    CPUONLY=1         skip the window/presenter (pipeline-only throughput)
+
+``BEAUTY`` inserts a ``glshader`` after the GL converter to separate the cost of
+the element from the cost of the effect:
+
+    0  no shader (baseline chain)
+    1  full beauty fragment shader (two synthetic faces, strengths 60/40)
+    2  beauty shader with ``u_active = 0`` (compiled, but early pass-through)
+    3  trivial copy shader (element overhead only)
 
 Prints, once per second: buffers entering the sink, sink fps, GTK snapshot
 count, frame-clock tick count, pipeline position, wall clock, CPU seconds.
@@ -40,8 +53,22 @@ SYNC = os.environ.get("SYNC", "1") == "1"
 WRAP = os.environ.get("WRAP", "0") == "1"
 DURATION = float(os.environ.get("DURATION", "8"))
 CONV = os.environ.get("CONV", "sw")
+BEAUTY = os.environ.get("BEAUTY", "0")
+CPUONLY = os.environ.get("CPUONLY", "0") == "1"
+SCALE = os.environ.get("SCALE", "")
 
-SAMPLE = "/tmp/m1_sample.mp4" if SIZE == "1080" else "/tmp/m1_sample_720.mp4"
+COPY_SHADER = """
+precision highp float;
+varying vec2 v_texcoord;
+uniform sampler2D tex;
+void main() {
+    gl_FragColor = texture2D(tex, v_texcoord);
+}
+"""
+
+SAMPLE = os.environ.get("SAMPLE") or (
+    "/tmp/m1_sample.mp4" if SIZE == "1080" else "/tmp/m1_sample_720.mp4"
+)
 
 state = {
     "buffers": 0,
@@ -66,6 +93,50 @@ class CountingPicture(Gtk.Picture):
         Gtk.Picture.do_snapshot(self, snapshot)
 
 
+def _build_beauty_element():
+    """glshader element with the real beauty shader (or copy/disabled variants)."""
+    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+    from video_player.backend import _uniform_structure  # noqa: PLC0415
+    from video_player.beauty import BEAUTY_FRAGMENT_SHADER, BeautyParams  # noqa: PLC0415
+    from video_player.config import BeautyConfig  # noqa: PLC0415
+
+    shader = Gst.ElementFactory.make("glshader", "beauty")
+    if shader is None:
+        print("glshader missing", flush=True)
+        return None
+    shader.set_property("fragment", COPY_SHADER if BEAUTY == "3" else BEAUTY_FRAGMENT_SHADER)
+    frame = (1280, 720) if SIZE == "720" else (1920, 1080)
+    values = BeautyParams.from_config(BeautyConfig()).uniforms(
+        frame_size=frame,
+        texture_size=frame,
+        faces=[(0.22, 0.12, 0.30, 0.48), (0.58, 0.18, 0.22, 0.34)],
+        active=BEAUTY != "2",
+    )
+    shader.set_property("uniforms", _uniform_structure(values))
+
+    def on_sink(_pad, _info):
+        state["beauty_start"] = time.perf_counter()
+        return Gst.PadProbeReturn.OK
+
+    def on_src(_pad, _info):
+        started = state.get("beauty_start", 0.0)
+        if started:
+            elapsed = (time.perf_counter() - started) * 1000.0
+            state.setdefault("beauty_ms", []).append(elapsed)
+            del state["beauty_ms"][:-120]
+        return Gst.PadProbeReturn.OK
+
+    sink_pad = shader.get_static_pad("sink")
+    src_pad = shader.get_static_pad("src")
+    if sink_pad is not None:
+        sink_pad.add_probe(Gst.PadProbeType.BUFFER, on_sink)
+    if src_pad is not None:
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, on_src)
+    return shader
+
+
 def build_pipeline():
     pipeline = Gst.Pipeline.new("perf")
     src = Gst.ElementFactory.make("filesrc", "src")
@@ -87,6 +158,25 @@ def build_pipeline():
             Gst.Caps.from_string("video/x-raw(memory:GLMemory),format=RGBA"),
         )
         convs = [glupload, glcolorconvert, glcaps]
+        if SCALE:
+            sw, sh = SCALE.lower().split("x")
+            glscale = Gst.ElementFactory.make("glcolorscale", "glscale")
+            glscalecaps = Gst.ElementFactory.make("capsfilter", "glscalecaps")
+            glscalecaps.set_property(
+                "caps",
+                Gst.Caps.from_string(
+                    "video/x-raw(memory:GLMemory),format=RGBA,"
+                    f"width={sw},height={sh},texture-target=2D"
+                ),
+            )
+            convs.extend([glscale, glscalecaps])
+    if BEAUTY != "0":
+        if CONV != "gl":
+            print("BEAUTY needs CONV=gl", flush=True)
+        else:
+            shader = _build_beauty_element()
+            if shader is not None:
+                convs.append(shader)
     sink = Gst.ElementFactory.make("gtk4paintablesink", "sink")
     sink.set_property("sync", SYNC)
 
@@ -149,11 +239,15 @@ def tick():
     cpu_delta = cpu_seconds() - last_c
     pos = query_position(state["pipeline"])
     ticks = state["ticks"]
+    samples = state.get("beauty_ms") or []
+    beauty = (
+        f" beauty_ms={sum(samples) / len(samples):5.2f}" if samples else ""
+    )
     print(
         f"t={now - state['start']:5.1f}s buffers/s={(b - last_b) / max(wall_delta, 1e-6):5.1f} "
         f"frames_total={b:4d} gtksnap/s={(s - last_s) / max(wall_delta, 1e-6):5.1f} "
         f"clock_ticks/s={ticks:3d} pos={pos:5.2f}s wall={now - state['start']:5.2f}s "
-        f"cpu={(cpu_delta / max(wall_delta, 1e-6)) * 100:5.0f}%",
+        f"cpu={(cpu_delta / max(wall_delta, 1e-6)) * 100:5.0f}%{beauty}",
         flush=True,
     )
     state["last"] = (b, s, now, cpu_seconds())
@@ -206,6 +300,7 @@ def on_activate(app):
     def finish():
         print(
             f"FINAL size={SIZE}p full={FULL} show={SHOW} sync={SYNC} wrap={WRAP} conv={CONV} "
+            f"beauty={BEAUTY} "
             f"buffers={state['buffers']} gtksnap={state['snapshots']} "
             f"wall={time.monotonic() - state['start']:.2f}s",
             flush=True,
