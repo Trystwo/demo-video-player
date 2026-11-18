@@ -267,3 +267,29 @@ class TestRecorderTiming:
     def test_rejects_unsupported_rotation(self):
         with pytest.raises(RecordingError):
             Recorder(None, None, "/tmp/x.mp4", canvas_size=(640, 480), rotation=45)
+
+
+class TestVideoOnlyMode:
+    """The pure-video recorder writes the decoded picture without a compositor."""
+
+    def test_video_size_becomes_the_canvas(self):
+        recorder = Recorder(
+            None, None, "/tmp/x.mp4", video_only=True, video_size=(1921, 1081)
+        )
+        assert recorder.video_only
+        assert recorder.canvas_size == (1920, 1080)
+
+    def test_missing_video_size_is_clamped_like_any_canvas(self):
+        recorder = Recorder(None, None, "/tmp/x.mp4", video_only=True)
+        assert recorder.canvas_size == (2, 2)
+
+    def test_overlay_mode_requires_a_canvas(self):
+        recorder = Recorder(None, None, "/tmp/x.mp4", video_only=False, video_size=(1920, 1080))
+        # the video size doubles as the canvas when no canvas is given
+        assert recorder.canvas_size == (1920, 1080)
+
+    def test_rotation_is_kept_for_logging_but_not_required(self):
+        recorder = Recorder(
+            None, None, "/tmp/x.mp4", video_only=True, video_size=(640, 480), rotation=180
+        )
+        assert recorder.rotation == 180

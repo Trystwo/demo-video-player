@@ -163,6 +163,25 @@ glvideomixer ── capsfilter(GL RGBA) ── gldownload ── mpph264enc(bps)
 GTK4 **不发射** `GtkWidget::destroy`，窗口清理必须挂 `close-request`（M3 顺带
 修正了主窗口退出路径）。
 
+### 2.4 纯视频录制（演示素材采集，M4 收尾）
+
+带 UI 的片内合成在板端只能跑到 ~21 fps（见上表），录出来的画面本身会出现冻结帧
+（M3 诚片 42.6% near-dup）。为了让演示视频里"播放画面"绝对顺滑，素材改用**纯视频
+录制**：`Recorder(..., video_only=True)` 跳过 `glvideomixer`，直接从渲染链的
+`tee` 接出 `queue → capsfilter(GL RGBA) → gldownload → mpph264enc → h264parse →
+mp4mux → filesink`，队列 `leaky=0` / `max-size-buffers=8`（宁可阻塞也不丢帧补
+重复）。驱动脚本 `docs/demo-video/record_video.py`（headless：
+`PlaybackBackend(config, display_bypass=True)`，支持 `--seconds/--start-at/
+--beauty/--ramp-smoothing` 等）；UI、标签、字幕全部后期叠加。
+
+实测（板端 `/tmp/43-m2`，`rec3/` 六段素材）：1920×1080@30 采集吞吐 ≈29 fps
+（H.265 自拍与 H.264 近景相近），成片 1456 帧中相邻重复帧 **1.79%**（对比 M3
+成片 42.6% near-dup）；成片播放无冻结帧。
+
+旋转踩坑：源文件的 display matrix 会以 `image-orientation` tag 一路传到 `mp4mux`
+并被写进录制文件（`ffprobe` 可见 `rotation=-180`），所以纯视频录制**不能再对像素
+做翻转**——否则播放器会把矩阵和像素各转一次，录制文件看起来上下颠倒。
+
 ## 3. 模块划分
 
 | 文件 | 职责 | 状态 |
@@ -180,14 +199,14 @@ GTK4 **不发射** `GtkWidget::destroy`，窗口清理必须挂 `close-request`�
 | `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖） |
 | `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志 | M1–M3 已接线（板端验证） |
 | `src/video_player/ui/capture.py` | 逐 widget 快照（`Gtk.WidgetPaintable`→`render_texture`→pixbuf）与 `CanvasBuilder` 画布合成（缓存 base、分层刷新、人脸框） | M3 收尾新增（录制用） |
-| `src/video_player/recording.py` | 录制分支：`glvideomixer` 合成视频 + UI 画布，`mpph264enc`/`mp4mux` 输出，EOS 收尾与统计 | M3 收尾新增（板端 30 fps 验证） |
+| `src/video_player/recording.py` | 录制分支：`glvideomixer` 合成视频 + UI 画布（`--record`），以及演示素材用的纯视频模式（`video_only=True`，无合成器）；`mpph264enc`/`mp4mux` 输出，EOS 收尾与统计 | M3 收尾新增，M4 收尾加纯视频模式（板端 30 fps 验证） |
 | `scripts/launch_player.py` | 桌面入口包装脚本（原样透传参数） | 可用（M3 修复 `--snapshot` 被吞） |
 | `scripts/perf_probe.py` | 板端帧率探针：pad probe 计帧 + GTK snapshot 计数 + CPU | 可用（M1–M3 实测工具，含 `BEAUTY`/`SCALE` 旋钮） |
 | `scripts/bench_board.sh` | 色彩转换路径 wall-time 基准矩阵 | 可用（M1 实测工具） |
 | `scripts/convert_yunet.py` | x86 侧 ONNX→RKNN 转换（rk3576，fp16，mean 0/std 1） | 可用（1,084,515B 模型） |
 | `scripts/measure_tap.py` | 板端 headless 检测吞吐测量（`fakesink sync=true`） | 可用（M2 实测工具） |
 | `scripts/probe_board.py` | 环境报告导出（文本/JSON/Markdown） | 可用 |
-| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制 单测 | 107 passed, 12 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 40 passed） |
+| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制 单测 | 108 passed, 12 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 44 passed） |
 
 ## 4. 线程模型
 

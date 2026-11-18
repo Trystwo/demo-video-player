@@ -211,6 +211,11 @@ class PlaybackBackend:
         return round(self._beauty_ms, 2)
 
     @property
+    def rotation(self) -> int:
+        """Display rotation (0/90/180/270) parsed from the container tag."""
+        return self._rotation
+
+    @property
     def beauty_active(self) -> bool:
         return bool(self._beauty is not None and self._config.beauty.enabled)
 
@@ -237,18 +242,23 @@ class PlaybackBackend:
     def start_recording(
         self,
         path: str | Path,
-        canvas_size: tuple[int, int],
+        canvas_size: tuple[int, int] | None = None,
         video_size: tuple[int, int] | None = None,
+        *,
+        video_only: bool = False,
     ):
-        """Tee the GPU video branch into a 30 fps MP4 with a UI overlay.
+        """Tee the GPU video branch into a 30 fps MP4.
 
-        The recorder composites the already-GPU-resident video with a UI canvas
-        (chrome snapshots + face boxes) inside ``glvideomixer``; see
-        :mod:`video_player.recording` for why whole-window capture is too slow.
+        In the default overlay mode the recorder composites the already-GPU-
+        resident video with a UI canvas (chrome snapshots + face boxes) inside
+        ``glvideomixer``; see :mod:`video_player.recording` for why whole-window
+        capture is too slow.  ``video_only=True`` skips the compositor and
+        records the beautified video texture at source resolution, which keeps
+        every frame (the mixer path repeats frames when it cannot keep up).
 
         Raises:
-            PlaybackError: when there is no GL video branch or the recorder
-                elements are unavailable.
+            PlaybackError: when there is no GL video branch, the frame size is
+                still unknown, or the recorder elements are unavailable.
         """
         if self._recorder is not None:
             raise PlaybackError("recording is already running")
@@ -260,7 +270,19 @@ class PlaybackBackend:
             )
         # numpy is only needed by the recorder (canvas + geometry); importing it
         # lazily keeps the player importable on hosts without numpy.
-        from .recording import Recorder, RecordingError
+        from .recording import Recorder, RecordingError, even_size
+
+        if video_only:
+            texture = self._texture_size or self._coded_size
+            if not texture[0] or not texture[1]:
+                raise PlaybackError(
+                    "cannot record the video yet: the decoded frame size is unknown"
+                )
+            target = even_size(*texture)
+            canvas_size = target
+            video_size = target
+        elif canvas_size is None:
+            raise PlaybackError("recording needs a canvas size")
 
         # The display sink applies the MP4 display matrix on its own; the
         # recorded branch taps the decoder before it, so it has to replay the
@@ -272,6 +294,7 @@ class PlaybackBackend:
             canvas_size=canvas_size,
             video_size=video_size,
             rotation=self._rotation,
+            video_only=video_only,
         )
         recorder.on_error = self._on_recording_error
         try:
@@ -545,7 +568,8 @@ class PlaybackBackend:
                 )
                 self._texture_size = texture_size
                 elements = [upload, convert, caps]
-                elements.extend(self._build_gl_scaler(texture_size))
+                if texture_size[0] and texture_size != source_size:
+                    elements.extend(self._build_gl_scaler(texture_size))
                 return elements
             if mode == "gl":
                 raise PlaybackError(

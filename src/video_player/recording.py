@@ -27,6 +27,7 @@ elements and is created/stopped by :class:`video_player.backend.PlaybackBackend`
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
@@ -252,6 +253,15 @@ class Recorder:
     canvas is pushed from the video streaming thread with the *same* PTS every
     ``CANVAS_FPS / UI_FPS`` frames, so the two inputs of the mixer stay locked
     together even when the main loop is busy.
+
+    Two modes are available:
+
+    * overlay mode (default): ``glvideomixer`` composites the video with the UI
+      canvas and face boxes, then the result is downloaded and encoded;
+    * ``video_only`` mode: the beautified video texture is downloaded and
+      encoded directly, at source resolution.  Use it when the file has to stay
+      perfectly smooth: the compositor only reaches ~21 fps on the board while
+      the plain path reaches ~90 fps (see ``_start_video_only``).
     """
 
     def __init__(
@@ -260,23 +270,29 @@ class Recorder:
         tee: Gst.Element,
         path: str | Path,
         *,
-        canvas_size: tuple[int, int],
+        canvas_size: tuple[int, int] | None = None,
         video_size: tuple[int, int] | None = None,
         rotation: int = 0,
         fps: int = CANVAS_FPS,
         bitrate: int = DEFAULT_BITRATE,
+        video_only: bool = False,
     ) -> None:
         self._pipeline = pipeline
         self._tee = tee
         self._path = Path(path)
         self._fps = max(1, int(fps))
         self._bitrate = max(0, int(bitrate))
-        self._width, self._height = even_size(*canvas_size)
-        if self._width <= 0 or self._height <= 0:
-            raise RecordingError("the recording canvas has no size")
-        self._video_size = even_size(*(video_size or canvas_size))
+        self._video_only = bool(video_only)
+        self._video_size = even_size(*(video_size or canvas_size or (0, 0)))
         if self._video_size[0] <= 0 or self._video_size[1] <= 0:
             raise RecordingError("the recorded video area has no size")
+        if self._video_only:
+            # No compositor: the canvas *is* the video frame.
+            self._width, self._height = self._video_size
+        else:
+            self._width, self._height = even_size(*(canvas_size or self._video_size))
+            if self._width <= 0 or self._height <= 0:
+                raise RecordingError("the recording canvas has no size")
         self._rotation = int(rotation) % 360
         if self._rotation not in (0, 90, 180, 270):
             raise RecordingError(f"unsupported rotation {rotation!r}")
@@ -291,6 +307,7 @@ class Recorder:
         self._encode_probe_id: int = 0
         self._eos_probe_id: int = 0
         self._mux_pad: Gst.Pad | None = None
+        self._sink: Gst.Element | None = None
         self._encoded_frames: int = 0
         self._ui_pushes: int = 0
         self._video_buffers: int = 0
@@ -316,6 +333,11 @@ class Recorder:
     def rotation(self) -> int:
         """Display rotation applied to the tapped frames, in degrees."""
         return self._rotation
+
+    @property
+    def video_only(self) -> bool:
+        """True when the recorder writes the video alone (no UI compositor)."""
+        return self._video_only
 
     @property
     def stats(self) -> tuple[int, int, int]:
@@ -368,6 +390,9 @@ class Recorder:
     def start(self) -> None:
         """Build the recording branch and attach it to the running pipeline."""
         if self._running:
+            return
+        if self._video_only:
+            self._start_video_only()
             return
         pipeline = self._pipeline
         name = _PREFIX.rstrip("-")
@@ -543,6 +568,140 @@ class Recorder:
         self._eos_reached = False
         self._running = True
 
+    def _start_video_only(self) -> None:
+        """Record the GPU video branch alone, without the UI compositor.
+
+        The overlay path (video + canvas -> ``glvideomixer`` -> download) only
+        reached ~21 fps on the board once the 1080p beauty shader was running,
+        so the mixer repeated frames: 12-41 % of the recorded frames ended up as
+        frozen duplicates.  This mode skips the compositor and writes the
+        beautified video texture as-is, which the board sustains at ~90 fps
+        (GL download + H.264 encode measured).
+        """
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        caps_value = Gst.Caps.from_string(
+            "video/x-raw(memory:GLMemory),format=RGBA,"
+            f"width={self._video_size[0]},height={self._video_size[1]},"
+            "texture-target=2D"
+        )
+        try:
+            video_caps = _element("capsfilter", _VIDEO_CAPS)
+            video_queue = _element("queue", _VIDEO_QUEUE)
+            download = _element("gldownload", _DOWNLOAD)
+            encoder = _element("mpph264enc", _ENCODER)
+            parser = _element("h264parse", _PARSE)
+            mux = _element("mp4mux", _MUX)
+            sink = _element("filesink", _SINK)
+        except RecordingError:
+            raise
+        # No pixel rotation here on purpose: the decoder-side display matrix
+        # travels down as an image-orientation tag and mp4mux writes it into the
+        # MP4, so the recorded file already displays upright.  Rotating the
+        # pixels on top double-applies the matrix (the first recordings came out
+        # rotated twice, verified against the source frames).
+        video_caps.set_property("caps", caps_value)
+        # Every frame has to reach the file, so this queue does not leak: the
+        # plain download+encode path has enough headroom, and blocking the tee is
+        # better than silently dropping frames into a repeat.
+        video_queue.set_property("leaky", 0)
+        video_queue.set_property("max-size-buffers", 8)
+        video_queue.set_property("max-size-bytes", 0)
+        video_queue.set_property("max-size-time", 0)
+        self._configure_output(encoder, sink)
+        elements = [video_caps, video_queue, download, encoder, parser, mux, sink]
+        chain: list[tuple[Gst.Element, Gst.Element]] = [
+            (video_caps, video_queue),
+            (video_queue, download),
+        ]
+        chain.extend(
+            [
+                (download, encoder),
+                (encoder, parser),
+                (parser, mux),
+                (mux, sink),
+            ]
+        )
+        self._mount_branch(elements, chain)
+        self._video_queue = video_queue
+        self._elements = elements
+        for element in reversed(elements):
+            element.sync_state_with_parent()
+        self._install_probes(video_queue, download, parser)
+        if _debug():
+            print(
+                f"[rec] video-only branch attached id={id(self):#x} "
+                f"rotation={self._rotation} elements={[e.get_name() for e in elements]}",
+                flush=True,
+            )
+        self._video_buffers = 0
+        self._encoded_frames = 0
+        self._frame_index = 0
+        self._stopping = False
+        self._eos_reached = False
+        self._running = True
+
+    def _configure_output(self, encoder: Gst.Element, sink: Gst.Element) -> None:
+        """Apply the bitrate and file sink settings shared by both modes."""
+        try:
+            encoder.set_property("bps", self._bitrate)
+        except TypeError:  # pragma: no cover - older encoder builds
+            pass
+        sink.set_property("location", str(self._path))
+        sink.set_property("sync", False)
+        sink.set_property("async", False)
+        self._sink = sink
+
+    def _mount_branch(
+        self,
+        elements: Sequence[Gst.Element],
+        chain: Sequence[tuple[Gst.Element, Gst.Element]],
+    ) -> None:
+        """Add and link a recording branch, then attach it to the tee."""
+        pipeline = self._pipeline
+        for element in elements:
+            pipeline.add(element)
+        for upstream, downstream in chain:
+            if not upstream.link(downstream):
+                self._detach(elements)
+                raise RecordingError(
+                    f"cannot link {upstream.get_name()} to {downstream.get_name()}"
+                )
+        tee_pad = self._tee.request_pad_simple("src_%u")
+        if tee_pad is None:
+            self._detach(elements)
+            raise RecordingError("cannot request a pad from the video tee")
+        self._ee_pad = tee_pad
+        if tee_pad.link(elements[0].get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            self._detach(elements)
+            raise RecordingError("cannot link the video tee to the recorder")
+
+    def _install_probes(
+        self, video_queue: Gst.Element, tail: Gst.Element, eos_element: Gst.Element
+    ) -> None:
+        """Watch the branch: frame counts, the EOS that reached the muxer, errors."""
+        probe = video_queue.get_static_pad("sink")
+        if probe is not None:
+            self._probe_id = probe.add_probe(
+                Gst.PadProbeType.BUFFER, self._on_video_buffer
+            )
+        encode_pad = tail.get_static_pad("sink")
+        if encode_pad is not None:
+            self._encode_probe_id = encode_pad.add_probe(
+                Gst.PadProbeType.BUFFER, self._on_encoded_buffer
+            )
+        # mp4mux only has request pads, so watch the parser's static src pad for
+        # the EOS that comes out of the encoder once the branch drained.
+        eos_pad = eos_element.get_static_pad("src")
+        if eos_pad is not None:
+            self._mux_pad = eos_pad
+            self._eos_probe_id = eos_pad.add_probe(
+                Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_mux_event
+            )
+        # The backend already installed a signal watch on this bus, so plain
+        # signal connections see the messages without a second watch.
+        bus = self._pipeline.get_bus()
+        self._bus_handlers = [bus.connect("message", self._on_bus)]
+
     def stop(self, *, timeout_ms: int = 1500) -> None:
         """Finish the file: EOS the branch, wait for the muxer, tear down."""
         if not self._running or self._stopping:
@@ -576,6 +735,8 @@ class Recorder:
             self._stop_loop = None
         if timer:
             GLib.source_remove(timer)
+        if self._eos_reached and self._sink is not None:
+            self._drain_output()
         if self._mux_pad is not None and self._eos_probe_id:
             self._mux_pad.remove_probe(self._eos_probe_id)
             self._eos_probe_id = 0
@@ -591,6 +752,35 @@ class Recorder:
         self._stopping = False
 
     # -- internals ----------------------------------------------------------
+
+    def _drain_output(self, timeout_s: float = 2.0) -> None:
+        """Give the muxer time to write the file index after EOS.
+
+        The EOS probe sits on the parser's *source* pad, i.e. just upstream of
+        ``mp4mux``.  When it fires the muxer still has to receive the event,
+        flush the remaining frames and write the ``moov`` atom; tearing the
+        branch down right there raced with that flush and left files without a
+        moov atom (unplayable).  Waiting until the file stops growing keeps the
+        teardown after the flush without a fixed sleep.
+        """
+        sink = self._sink
+        if sink is None:  # pragma: no cover - defensive
+            return
+        try:
+            path = Path(str(sink.get_property("location")))
+        except Exception:  # pragma: no cover - defensive
+            return
+        deadline = time.monotonic() + timeout_s
+        previous = -1
+        while time.monotonic() < deadline:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = -1
+            if size == previous and size > 0:
+                return
+            previous = size
+            time.sleep(0.05)
 
     def _on_stop_timeout(self, loop: GLib.MainLoop) -> bool:
         loop.quit()
@@ -671,6 +861,7 @@ class Recorder:
             self._pipeline.remove(element)
         self._video_queue = None
         self._mixer = None
+        self._sink = None
         self._ui_src = None
         self._video_pad = None
         self._ui_pad = None
