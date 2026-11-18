@@ -1,4 +1,4 @@
-# 实测证据（M1–M3 + M4 录制）
+# 实测证据（M1–M4）
 
 这些图片由板端真实应用抓取，不是开发主机截图。抓屏方式：应用内
 `Gtk.WidgetPaintable` + `Gsk.Renderer.render_texture()` 快照
@@ -94,3 +94,18 @@ python3 scripts/launch_player.py --config /tmp/cfg_mask.json /tmp/face_1080p30.m
 
 性能数据与结论见 [../BOARD.md](../BOARD.md) §5.2 与
 [../ARCHITECTURE.md](../ARCHITECTURE.md) 第 2、7 节。
+
+## A4 / A5 验收证据（2026-11-18）
+
+| 文件 | 内容 | 关键读数 |
+|------|------|----------|
+| `a4-three-faces.png` | 固定三人素材（Pexels 帧合成的 1080p30 8 s 片段：青年正脸 + 银发女士近景 + 访谈男子微侧）× demo 检测 + 分屏 | 3 个人脸框 + 5 点全部命中、`NPU: 3 face · 39.8 ms`、`fps: 30.0`、`beauty: on 2.5 ms`；A4「≥3 张脸、含微侧脸」 |
+| `a4-three-masks.png` | 同一素材的 `beauty.debug_mask=true` 遮罩预览 | 三块羽化遮罩各自落在对应人脸上、眼睛/眉毛被肤色门限压暗、框外全黑；证明三脸遮罩与检测框对齐 |
+
+A4 的 1 脸 / 2 脸证据沿用 `m2-ui-detect.png`、`m2-ui-two-faces.png`；`06_three_faces.mp4` 是内部测试素材，不入公开仓库。
+
+A5（1 h 长跑，检测+美颜开）指标：`/home/tris/soak2.log`（PERF 每秒）与
+`/home/tris/soak2_rss.log`（每分钟 RSS/线程/fd，内部日志）。3549 个样本：t≥300 s
+均值 30.06 fps、最后 600 s 全部 ≥30.0 fps；RSS +4.8 MB/h、threads 29–32、fds 74–79
+无增长，播放结束自动退出。唯一 <29.5 fps 的 7 个样本来自并行部署/构建的外部负载窗口。
+

@@ -22,6 +22,15 @@ A local video player demo for the [Quectel Pi M2](https://developer.quectel.com/
 
 > **Scope:** M1 playback, M2 NPU face detection and M3 GPU beauty/compare are implemented and verified on the board: hardware-decoded 1080p30 into an embedded GTK4 sink at a steady 30 fps, YuNet detection on the NPU (10 Hz, ≈30–40 ms per inference), and edge-preserving smoothing + whitening inside feathered face masks on the GPU (≈1 ms per frame). See [docs/PRD.md](docs/PRD.md) for the milestone plan.
 
+## Demo video
+
+A 61.8 s walk-through (1080p30, bilingual subtitles) was recorded on the board itself with the in-app recorder — no capture card:
+
+- Feishu page (video embedded): [Video Player](https://quectel.feishu.cn/wiki/DarawV37OiDQBQkPHAgct74KnGc)
+- GitHub release asset: [video-player-m3-demo.mp4](https://github.com/Trystwo/demo-video-player/releases/download/v1.0.0/video-player-m3-demo.mp4)
+
+It shows hardware-decoded 1080p30 playback, NPU detection, the one-key beauty toggle, the same-frame split view, the mask preview, a three-face clip and an H.265 portrait clip.
+
 ## Features
 
 Planned scope for the demo (P0 of the design note):
@@ -158,7 +167,7 @@ The window opens on the board's display and plays local H.264/H.265/AAC media wi
 | M1 | GStreamer hardware-decoded playback, GTK4 embedded sink, controls, playlist | ✅ 2026-11-14 (30 fps, CPU ≈16%) |
 | M2 | RKNN YuNet face detection (10 Hz), GTK boxes/landmarks, NPU timing in the info panel | ✅ 2026-11-16 |
 | M3 | GPU smoothing/whitening with face masks and compare mode | ✅ 2026-11-17 (30 fps, beauty ≈1 ms/frame, CPU 30–32% with detection off) |
-| M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ in progress (recording, demo video and `install.sh` deployment done; A4/A5 evidence pending) |
+| M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ✅ done (2026-11-18): in-app recording, 61.8 s demo video, `install.sh` launcher/desktop deployment, Feishu CN/EN pages, 1 h soak and three-face evidence; A1–A5 all met |
 
 ## Related Projects
 

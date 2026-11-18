@@ -17,7 +17,7 @@
 |------|------|------|
 | 硬件 | M2 开发板 + DSI 屏（1280×800）+ 电源、键鼠或触屏 | 就绪 |
 | 系统 | Debian 13 出厂镜像，GNOME/Wayland 会话 | 就绪 |
-| 板端依赖 | `./install.sh --require-board` 全部通过 | `mppvideodec`/`gtk4paintablesink`/`glshader`/`glcolorscale`/`librknnrt` 均已验证 |
+| 板端依赖 | `./install.sh --require-board` 全部通过并输出 `Deployment complete.` | `mppvideodec`/`gtk4paintablesink`/`glshader`/`glcolorscale`/`librknnrt` 均已验证；启动器与桌面入口已部署 |
 | 模型 | `models/yunet_rk3576.rknn` 已放置（`scripts/convert_yunet.py` 生成） | 已就绪（M2） |
 | 素材 | 正脸 1080p30、多人侧脸素材；本机 `test-media/pexels/` 已有 5 个候选（见 [TEST_MEDIA.md](TEST_MEDIA.md)），公司自有素材可替换；4K 为可选加分项 | 已就绪（M3 用 5534415 近景与 5252440 双人验证） |
 | 音频 | 板载扬声器或耳机 | 就绪 |
@@ -27,15 +27,19 @@
 
 ```bash
 cd demo-video-player
-./install.sh --require-board
+./install.sh --require-board     # 环境校验 + 部署启动器/桌面入口，成功输出 Deployment complete.
 python3 -m video_player --check
 ```
 
+部署完成后可从桌面菜单「视频播放器 / Video Player」启动，或直接用
+`~/.local/bin/video-player-demo`；演示时建议仍用 `--demo` 参数启动（全屏 + 强制分屏）。
+
 ## 3. 演示步骤（M3 实测版）
 
-1. **启动**：执行
-   `python3 scripts/launch_player.py --demo <媒体路径>`，窗口全屏出现在 DSI 屏上，
-   自动打开对比分屏与检测（demo 模式强制，桌面启动器在 M4 提供）。
+1. **启动**：从桌面菜单「视频播放器」启动，或执行
+   `python3 scripts/launch_player.py --demo <媒体路径>`（安装后也可用
+   `video-player-demo --demo <媒体路径>`），窗口全屏出现在 DSI 屏上，
+   自动打开对比分屏与检测（demo 模式强制）。
 2. **硬解播放**：播放 1080p30 H.264 人像视频；指出信息面板的
    `decode: mppvideodec`、分辨率 `1920×1080`、`fps: 30.0`，说明色彩转换与预缩放
    都在 GPU 上完成。
@@ -98,10 +102,14 @@ python3 -m video_player --demo --record /tmp/demo.mp4 --record-duration 12 --con
 
 - [x] 主窗口截图 → `docs/images/main-window.png`（2026-11-14，取自 `docs/evidence/m1-ui-gl.png`）
 - [x] 美颜前后对比截图 → `docs/images/beauty-compare.png`（A/B 近景对比，取自 `docs/evidence/m3-beauty-ab.png`）；主窗口分屏 → `docs/images/beauty-split.png`（`m3-split-demo.png`）；同帧近景 → `docs/evidence/m3-split-closeup.png`
-- [ ] 板端环境自检输出（`--markdown`）→ 回填 [BOARD.md](BOARD.md)（部分已回填）
+- [x] 板端环境自检输出（`--markdown`）→ 回填 [BOARD.md](BOARD.md)（2026-11-14 已回填；2026-11-18 补 `install.sh` 部署项）
 - [x] 演示视频（61.8s、1920×1080@30、中英双语硬字幕）→ `docs/demo-video/out/video-player-m3-demo.mp4`（内部，不导出；制作流程见 `docs/demo-video/README.md`、[DELIVERY.md](DELIVERY.md) §6）
 - [x] 录制模式证据 → `docs/evidence/m4-record-split.png`（分屏+面板+信息行）、`docs/evidence/m4-record-selfie-rot180.png`（rotate-180 自拍素材正立录制）
-- [ ] 验收 A1–A6 的逐条证据（fps/CPU/检出率/1h 稳定性）
+- [x] 验收 A1–A5 的逐条证据（A6 延期）：
+  A1 `docs/evidence/m3-h265-selfie-demo.png`、A2 `m3-beauty-on/off.png` + `m3-beauty-ab.png`、
+  A3 `m3-split-demo.png` + `m3-split-closeup.png` + `m3-mask.png`、
+  A4 `a4-three-faces.png` + `a4-three-masks.png`（1/2 脸沿用 M2）、
+  A5 1 h 长跑 3549 个 PERF 样本（t≥300 s 均值 30.06 fps、RSS/线程/fd 无增长，见 [BOARD.md](BOARD.md) §5.2）
 
 归档约定：图片放 `docs/images/`，过程证据与历史评审放 `docs/history/`
 （M1 起创建），文件名使用英文短横线命名，避免空格与中文文件名。

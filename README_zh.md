@@ -22,6 +22,15 @@
 
 > **范围说明：** M1 播放、M2 NPU 人脸检测与 M3 GPU 美颜/对比均已在板端验证：1080p30 硬解 + GTK4 内嵌稳定 30fps；YuNet 模型在 NPU 上以 10Hz 采样（单次约 30–40ms）；磨皮与美白在 GPU 的单个 `glshader` 里完成，只在由检测框生成的羽化人脸遮罩内生效（单帧约 1ms）。里程碑见 [docs/PRD.md](docs/PRD.md)。
 
+## 演示视频
+
+61.8 秒的演示视频（1080p30、中英双语硬字幕）直接由板端应用内录制模式生成，不需要采集卡：
+
+- 飞书页面（内嵌视频）：[视频播放器](https://quectel.feishu.cn/wiki/Y8fBwBgD8ieBZnknQjqcGotZnvb)
+- GitHub Release 资产：[video-player-m3-demo.mp4](https://github.com/Trystwo/demo-video-player/releases/download/v1.0.0/video-player-m3-demo.mp4)
+
+内容依次为：1080p30 硬解播放、NPU 人脸检测、一键美颜开关、同帧分屏对比、蒙版预览、三脸多人片段与 H.265 竖拍片源。
+
 ## 功能特性
 
 Demo 规划范围（设计文档的 P0）：
@@ -157,7 +166,7 @@ python3 -m video_player --record /tmp/demo.mp4 --record-duration 10 video.mp4   
 | M1 | GStreamer 硬解播放、GTK4 内嵌、控制、播放列表 | ✅ 2026-11-14（30fps，CPU ≈16%） |
 | M2 | RKNN YuNet 人脸检测（10Hz）、GTK 人脸框/关键点、信息行 NPU 耗时 | ✅ 2026-11-16 |
 | M3 | GPU 磨皮/美白、人脸遮罩与对比模式 | ✅ 2026-11-17（30fps，美颜约 1ms/帧，检测关闭时 CPU 30–32%） |
-| M4 | 验收 A1–A5（A6 延期）、板端截图、演示视频、完整部署脚本 | ⏳ 进行中（录制、演示视频与 `install.sh` 部署已完成；待补 A4/A5 证据） |
+| M4 | 验收 A1–A5（A6 延期）、板端截图、演示视频、完整部署脚本 | ✅ 已完成（2026-11-18）：应用内录制、61.8 s 演示视频、`install.sh` 启动器/桌面入口部署、飞书中英文页、1 h 长跑与三脸证据；A1–A5 全部达成 |
 
 ## 相关项目
 

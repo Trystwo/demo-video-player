@@ -51,7 +51,8 @@
 | 15 | GTK4 整窗逐帧捕获（录制候选方案 A） | `Gtk.WidgetPaintable` → `render_texture` → `Gdk.pixbuf_get_from_texture` | 未知 | ❌ 2026-11-18：render 15.6 ms + 读回 22.5 ms = **38.7 ms/帧**（≈26 fps 上限），真实 app 内 snapshot 35–70 ms 且 `to_node()` 时有时无 → 不适合 30 fps 录制 |
 | 16 | `glvideomixer` 合成录制（采用方案） | 视频 GL 分支（tee）+ UI RGBA appsrc → mixer → `gldownload` → `mpph264enc` | 1080p 级 30 fps | ✅ 2026-11-18：1280×800@30 录制稳定 30 fps（`enc 30–32/s`），gst-launch 基准 CPU ≈0.8–1.0 核；细节与踩坑见 ARCHITECTURE §2.3 |
 | 17 | `mpph264enc` 编码器输入/参数 | `gst-inspect-1.0 mpph264enc` + RGBA/NV12 路径基准 | 码率参数可用、可吃 RGBA | ✅ 2026-11-18：**没有 `bitrate` 属性**，码率写 `bps`；sink caps 接受 RGBA/NV12 等；`GL RGBA→gldownload→编码` 90 fps vs `GL NV12→gldownload→编码` 20 fps（NV12 转换慢 4 倍） |
-| 15 | 网络流 | HLS 样本 + 局域网 RTSP 摄像头 | 可播放（A6） | 移出本期（2026-11-14），不验收 |
+| 18 | 用户级部署契约（install.sh） | `./install.sh --require-board` 部署启动器 + 桌面入口 | 输出 `Deployment complete.`，`desktop-file-validate` 通过 | ✅ 2026-11-18：板端实测 16 ok / 1 warn / 0 fail；`~/.local/bin/video-player-demo` + `~/.local/share/applications/video-player-demo.desktop`；启动器 `--version` 输出 `video_player 0.1.0` |
+| 19 | 网络流 | HLS 样本 + 局域网 RTSP 摄像头 | 可播放（A6） | 移出本期（2026-11-14），不验收 |
 
 ## 3. 模型与素材清单
 
@@ -92,9 +93,12 @@ python3 scripts/perf_probe.py
 bash scripts/bench_board.sh
 ```
 
-`install.sh --require-board` 会把板级项（`mppvideodec`、`waylandsink`、
-`gtk4paintablesink`、`librknnrt`、`librga`、RKNN 模型）的缺失视为失败；
-普通 `--check` 在开发主机上只把它们标成 `warn`。
+`install.sh --require-board` 会把板级项（`mppvideodec`、`mpph264enc`、`waylandsink`、
+`gtk4paintablesink`、`librknnrt`、`librga`）的缺失视为失败；`models/*.rknn` 缺失只警告
+（人脸检测是可选功能，缺模型时美颜自动透传）。普通 `--check` 在开发主机上只把这些项
+标成 `warn`。M4 起 `install.sh` 还会为当前用户部署启动器 `~/.local/bin/video-player-demo`
+与桌面入口 `~/.local/share/applications/video-player-demo.desktop`，最后输出
+`Deployment complete.`；`desktop-file-validate` 校验通过（板端实测）。
 
 ## 5. 实测记录
 
@@ -141,7 +145,8 @@ bash scripts/bench_board.sh
 | 2026-11-18 | 录制链路原型（gst-launch） | 先验 `glvideomixer` 合成：video GL 940×528@30 + UI 1280×800@10fps + mixer 后 capsfilter 1280×800@30 → NV12 → `mpph264enc bps=8M`；输出 `h264 1280×800 30/1`、10.2s/306 帧，CPU ≈0.82–1.02 核 | 仅此一路；混流器要求每个 pad 都推进，UI pad 不能"复用旧帧" |
 | 2026-11-18 | `--record` 应用内录制（成品） | `--demo --record /tmp/x.mp4 --record-duration N`：画布 = 背景 + 视频区（alpha 洞）+ sidebar/info/控制条快照 + 人脸框；`display_bypass=1` 让显示分支让出 GPU | ✅ 稳定 30.0 fps、`enc 30–32/s`、CPU 184–205%、compose 3–6 ms/tick；产物 `h264 1280×800 30/1`、10.8s/325 帧/5.2MB；录制时屏幕视频区为黑（旁路显示） | 抽帧 `.cache/m3shots/rec3_frame7.png`；架构与踩坑见 ARCHITECTURE §2.3 |
 | 2026-11-18 | 录制模式拍摄演示素材 | `docs/demo-video/shoot.sh`（7 段：分屏/强度/关美颜/双人/遮罩/无人脸/自拍 H.265），每段 `--record-duration` 定时自动收尾 | 每段可播放、`nb_frames≈30×时长` | 7/7 成功（13.07/8.47/9.73/8.00/12.33/8.27/10.83s）；首轮 4 段缺 moov 用重试兜住；自拍 180° 录制需在录制链加 `glvideoflip`（已实现） |
-| 待测 | M3 长跑 / 1h 稳定性（A5） | 连续播放 + `free`/句柄检查 | 本轮未做（板端图形会话意外中断，见 §6） |
+| 2026-11-18 | M4 A5 1 h 长跑 | 板端 pid 42428：`--config /tmp/cfg_faceon.json /home/tris/soak_1h.mp4`（1080p30 循环播放 60 min，检测+美颜开），PERF 每秒 + 每分钟 RSS/线程/fd 采样；脚本 `.cache/a5/analyze.py` | ✅ 3549 个样本：t≥300 s 共 3250 个，均值 **30.06 fps**（min 24.5 / max 30.7），仅 7 个 <29.5、2 个 <25，且全部落在 t=1165–1170 s —— 当时我在板端并行部署/构建成片（NPU 同步飙到 117 ms）的外部负载窗口；最后 600 s 全部 ≥30.0 fps（均值 30.07）。RSS 330,664→335,548 kB（+4.8 MB/h）、threads 29–32、fds 74–79 无增长，播放结束自动退出（`app exited at t=3600s`） | A5 通过：无帧率衰减、无内存/句柄泄漏 |
+| 2026-11-18 | M4 A4 正脸/侧脸/多人检出 | 固定素材逐条：单人 `docs/evidence/m2-ui-detect.png`、双人 `m2-ui-two-faces.png`、三人素材（Pexels 帧合成的 1080p30 8 s 片段：青年正脸 + 银发女士近景 + 访谈男子微侧）`/home/tris/demo-footage/06_three_faces.mp4`，demo 运行 `faces=3`、NPU 39.8–41.5 ms、fps 30.0 | ✅ A4 通过（1/2/3 脸 + 微侧脸），证据 `docs/evidence/a4-three-faces.png`、`a4-three-masks.png`（三脸遮罩预览） |
 
 ## 6. 已知环境限制与复现命令
 

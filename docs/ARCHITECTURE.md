@@ -309,6 +309,18 @@ CPU 每帧缩放（1080p 纹理、视频区 940 px 宽时进程 CPU 62–78%；�
 960 px 以上则回落到 15–20%）。这是 A2 CPU 目标的关键，已由 `glcolorscale`
 预缩放规避（见 2.2）。
 
+M4 实测（板端 2026-11-18）：
+
+| 场景 | 工具 | fps | CPU | 说明 |
+|------|------|-----|-----|------|
+| 应用内录制（`--record`，demo 分屏，1280×800 输出） | `launch_player.py --demo --record --record-duration` | 30.0（编码 30–32 帧/s） | 184–205% | `display_bypass` 让显示分支走 fakesink；画布 compose 3–6 ms/tick，每 3 s/1 s 分层刷新 |
+| 1 h 长跑（检测+美颜开，1080p30 循环素材） | `launch_player.py --config cfg_faceon.json` | t≥300 s 均值 **30.06**，最后 600 s 全部 ≥30.0 | 90–133% | 3549 个 PERF 样本；RSS +4.8 MB/h、threads 29–32、fds 74–79 无增长（A5） |
+
+录制分路径基准（gst-launch，300 帧 1280×800）：系统内存 `videoconvert`+`mpph264enc` 166 fps；
+`GL NV12 → gldownload → 编码` 20 fps；`GL RGBA → gldownload → 编码` 90 fps；
+`glvideomixer`(2 pad) → `GL RGBA` → 读回 → 编码 36 fps。因此录制链故意保留 RGBA 到
+`gldownload`，由 `mpph264enc` 直接吃 RGBA（NV12 的 GL 转换是主要慢点）。
+
 ## 8. 失败与降级策略
 
 | 失败点 | 表现 | 降级 |
