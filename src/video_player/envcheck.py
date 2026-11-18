@@ -46,12 +46,18 @@ STATUSES = ("ok", "warn", "fail", "skip")
 
 @dataclass
 class Check:
-    """Result of one environment probe."""
+    """Result of one environment probe.
+
+    ``optional`` marks a check whose warning/failure never blocks a board
+    deployment: missing RKNN models only disable the optional face-detection
+    feature, so a fresh clone must still be deployable with ``--require-board``.
+    """
 
     name: str
     status: str
     detail: str = ""
     board_related: bool = False
+    optional: bool = False
 
     def __post_init__(self) -> None:
         if self.status not in STATUSES:
@@ -80,7 +86,7 @@ class Report:
         for check in self.checks:
             if check.status == "fail" and (require_board or not check.board_related):
                 return False
-            if require_board and check.board_related and check.status in ("warn", "fail"):
+            if require_board and check.board_related and not check.optional and check.status in ("warn", "fail"):
                 return False
         return True
 
@@ -237,8 +243,9 @@ def check_models(root: Path) -> Check:
     return Check(
         "models",
         "warn",
-        "no .rknn model in models/ (automatic beauty stays disabled); see models/README.md",
+        "no .rknn model in models/ (automatic face beauty stays disabled); see models/README.md",
         board_related=True,
+        optional=True,
     )
 
 

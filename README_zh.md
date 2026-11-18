@@ -56,7 +56,7 @@ P1 增强项，在 P0 验收后安排：
 
 ## 软件环境搭建
 
-> `install.sh` 目前做环境校验。软件包安装与桌面入口在 M4 补齐。
+> `./install.sh` 先校验运行环境，再为当前用户部署播放器：PATH 上的启动器与桌面入口。无需 `sudo`、不执行 `apt`——系统软件包随板端镜像提供。
 
 - 操作系统：Debian 13（Quectel Pi M2 出厂镜像），GNOME/Wayland 会话
 - Python：3.10 或更高版本（板端为 3.13）
@@ -80,15 +80,22 @@ git clone https://github.com/Trystwo/demo-video-player.git
 
 执行后当前目录下会生成 `demo-video-player` 文件夹。
 
-2. 在板端终端执行安装脚本，检查 Python、GTK4、GStreamer 插件、RKNN 库、显示会话与模型目录。
+2. 在板端终端执行安装脚本：校验 Python、GTK4、GStreamer 插件、RKNN 库、显示会话与模型目录，然后为当前用户部署播放器。
 
 ```bash
 cd demo-video-player
 sudo chmod 755 install.sh
-./install.sh
+./install.sh --require-board
 ```
 
-脚本会输出 `Environment check complete`；完整的部署契约（输出 `Deployment complete`）在 M4 补齐。若提示板级项缺失，可用 `--require-board` 重新执行，并对照 [docs/BOARD.md](docs/BOARD.md) 排查。
+`--require-board` 把板端专属项（mppvideodec、mpph264enc、waylandsink、gtk4paintablesink、librknnrt、librga）从警告提升为失败；`models/*.rknn` 缺失只警告（人脸检测为可选功能）。成功后输出 `Deployment complete.` 与实际写入的路径：
+
+```text
+  launcher:       ~/.local/bin/video-player-demo
+  desktop entry:  ~/.local/share/applications/video-player-demo.desktop
+```
+
+加 `--no-desktop` 可跳过部署；`--desktop-dir DIR` / `--bin-dir DIR` 可覆盖 XDG 目录。
 
 3. 校验环境并运行测试。
 
@@ -113,7 +120,7 @@ demo-video-player/
 ├── src/video_player/           # 包：config、pipeline、beauty、face、envcheck
 │   └── ui/                     # GTK4 窗口
 ├── tests/                      # pytest 用例：config/beauty/face/pipeline/envcheck
-├── install.sh                  # 环境检查 / 部署脚本
+├── install.sh                  # 环境检查 + 部署（启动器、桌面入口）
 ├── requirements.txt            # Python 依赖版本
 ├── README.md                   # 英文文档
 └── README_zh.md                # 中文文档
@@ -121,7 +128,14 @@ demo-video-player/
 
 ## 运行程序
 
-在 `src` 目录下运行：
+从桌面菜单（「Video Player」/「视频播放器」）启动，或使用已安装的启动器：
+
+```bash
+video-player-demo /path/to/video.mp4            # 窗口模式
+video-player-demo --demo /path/to/media-folder  # 全屏演示模式 + 文件夹播放列表
+```
+
+在源码目录里运行也一样：
 
 ```bash
 cd demo-video-player/src
@@ -143,7 +157,7 @@ python3 -m video_player --record /tmp/demo.mp4 --record-duration 10 video.mp4   
 | M1 | GStreamer 硬解播放、GTK4 内嵌、控制、播放列表 | ✅ 2026-11-14（30fps，CPU ≈16%） |
 | M2 | RKNN YuNet 人脸检测（10Hz）、GTK 人脸框/关键点、信息行 NPU 耗时 | ✅ 2026-11-16 |
 | M3 | GPU 磨皮/美白、人脸遮罩与对比模式 | ✅ 2026-11-17（30fps，美颜约 1ms/帧，检测关闭时 CPU 30–32%） |
-| M4 | 验收 A1–A5（A6 延期）、板端截图、演示视频、完整部署脚本 | ⏳ 进行中（录制与演示视频已完成；A4/A5、`install.sh` 待办） |
+| M4 | 验收 A1–A5（A6 延期）、板端截图、演示视频、完整部署脚本 | ⏳ 进行中（录制、演示视频与 `install.sh` 部署已完成；待补 A4/A5 证据） |
 
 ## 相关项目
 

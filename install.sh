@@ -38,7 +38,9 @@ Options:
   -h, --help            Show this help and exit
 
 On the board, --require-board is recommended: it turns the board-only checks
-(mppvideodec, waylandsink, librknnrt, librga, RKNN models) into hard failures.
+(mppvideodec, mpph264enc, waylandsink, gtk4paintablesink, librknnrt, librga)
+into hard failures.  A missing models/*.rknn file only warns, because face
+detection and automatic beauty are optional features.
 
 Deployment is per-user: the script writes a launcher and a desktop entry into
 XDG directories, then prints "Deployment complete." with the paths.

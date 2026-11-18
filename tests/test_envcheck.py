@@ -42,6 +42,24 @@ def test_board_failure_is_ignored_on_dev_hosts() -> None:
     assert _report().ok() is True
 
 
+def test_optional_board_warning_does_not_fail_require_board() -> None:
+    report = Report(
+        platform={"system": "Linux"},
+        checks=[
+            Check("python", "ok", "Python 3.13.0"),
+            Check("gst:mppvideodec", "ok", "available", board_related=True),
+            Check(
+                "models",
+                "warn",
+                "no .rknn model in models/ (automatic face beauty stays disabled)",
+                board_related=True,
+                optional=True,
+            ),
+        ],
+    )
+    assert report.ok(require_board=True) is True
+
+
 def test_board_failure_fails_the_report_with_require_board() -> None:
     assert _report().ok(require_board=True) is False
 

@@ -56,7 +56,7 @@ P1 extensions, planned after the P0 acceptance:
 
 ## Software Environment Setup
 
-> `install.sh` validates the environment today. Package installation and the desktop entry are added in M4.
+> `./install.sh` validates the environment and then deploys the player for the current user: a launcher on `PATH` and a desktop entry. No `sudo` and no `apt` are needed — the board image already ships the system packages.
 
 - OS: Debian 13 (Quectel Pi M2 factory image), GNOME/Wayland session
 - Python: 3.10 or newer (3.13 on the board)
@@ -80,15 +80,22 @@ git clone https://github.com/Trystwo/demo-video-player.git
 
 The command creates a `demo-video-player` folder in the current directory.
 
-2. Run the install script from the board terminal. It checks Python, GTK4, the GStreamer plugins, the RKNN libraries, the display session and the model directory.
+2. Run the install script from the board terminal. It checks Python, GTK4, the GStreamer plugins, the RKNN libraries, the display session and the model directory, then deploys the player for the current user.
 
 ```bash
 cd demo-video-player
 sudo chmod 755 install.sh
-./install.sh
+./install.sh --require-board
 ```
 
-The script prints `Environment check complete`; the full deployment contract with `Deployment complete` arrives in M4. If a board item is missing, re-run with `--require-board` and compare the output with [docs/BOARD.md](docs/BOARD.md).
+`--require-board` turns the board-only checks (mppvideodec, mpph264enc, waylandsink, gtk4paintablesink, librknnrt, librga) into hard failures. A missing `models/*.rknn` file only warns, because face detection is optional. On success the script prints `Deployment complete.` and the paths it wrote:
+
+```text
+  launcher:       ~/.local/bin/video-player-demo
+  desktop entry:  ~/.local/share/applications/video-player-demo.desktop
+```
+
+Use `--no-desktop` to skip deployment, or `--desktop-dir DIR` / `--bin-dir DIR` to override the XDG directories.
 
 3. Verify the environment and run the tests.
 
@@ -113,7 +120,7 @@ demo-video-player/
 ├── src/video_player/           # package: config, pipeline plan, beauty, face, envcheck
 │   └── ui/                     # GTK4 window
 ├── tests/                      # pytest suite for config, beauty, face, pipeline, envcheck
-├── install.sh                  # environment check / deployment script
+├── install.sh                  # environment check + deployment (launcher, desktop entry)
 ├── requirements.txt            # Python dependency pins
 ├── README.md                   # English documentation
 └── README_zh.md                # Chinese documentation
@@ -121,7 +128,14 @@ demo-video-player/
 
 ## Run the program
 
-Start the scaffold window from the `src` directory:
+Launch from the desktop menu ("Video Player" / "视频播放器") or from a terminal with the installed launcher:
+
+```bash
+video-player-demo /path/to/video.mp4          # windowed
+video-player-demo --demo /path/to/media-folder  # fullscreen demo mode, folder playlist
+```
+
+Running from the source tree works the same way:
 
 ```bash
 cd demo-video-player/src
@@ -144,7 +158,7 @@ The window opens on the board's display and plays local H.264/H.265/AAC media wi
 | M1 | GStreamer hardware-decoded playback, GTK4 embedded sink, controls, playlist | ✅ 2026-11-14 (30 fps, CPU ≈16%) |
 | M2 | RKNN YuNet face detection (10 Hz), GTK boxes/landmarks, NPU timing in the info panel | ✅ 2026-11-16 |
 | M3 | GPU smoothing/whitening with face masks and compare mode | ✅ 2026-11-17 (30 fps, beauty ≈1 ms/frame, CPU 30–32% with detection off) |
-| M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ in progress (recording + demo video done; A4/A5 and `install.sh` open) |
+| M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ in progress (recording, demo video and `install.sh` deployment done; A4/A5 evidence pending) |
 
 ## Related Projects
 
