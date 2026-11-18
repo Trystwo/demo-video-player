@@ -166,7 +166,7 @@ More board demos are available in the [Quectel-Pi](https://github.com/Quectel-Pi
 - Demo-level implementation, not a hardened distribution: there is no authentication, sandboxing or DRM.
 - Video and image assets are not bundled. Provide your own, and only company-owned or licensed footage may be used in demos.
 - RKNN model weights are not committed; follow [docs/BOARD.md](docs/BOARD.md) to convert and place them.
-- M1 playback, M2 NPU detection and M3 GPU beauty work on the board: 30 fps with the shader on (detection off, CPU 30–32%), beauty ≈0.8–1.6 ms per frame. The full demo mode (detection + beauty + split view) also holds 30 fps but runs at 117–131% CPU, mostly the 10 Hz YuNet inference inherited from M2. A1 is measured for H.264 1080p30; H.265 is pending a sample clip, and the 1 h soak test is still outstanding.
+- M1 playback, M2 NPU detection and M3 GPU beauty work on the board: 30 fps with the shader on (detection off, CPU 30–32%), beauty ≈0.8–1.6 ms per frame. The full demo mode (detection + beauty + split view) also holds 30 fps but runs at 117–131% CPU, mostly the 10 Hz YuNet inference inherited from M2. A1 is measured for both H.264 and H.265 1080p30 (the H.265 pass uses the rotate-180 selfie clip, demo mode at a steady 30 fps); the 1 h soak test is still outstanding.
 - Network streams are out of this phase; when re-enabled, they will be opened without validating remote content, so only connect to trusted sources.
 
 ## Reporting Issues

@@ -29,9 +29,40 @@ from gi.repository import GLib, Gst  # noqa: E402
 from .config import Config
 from .face import DetectionResult, RknnFaceDetector, resolve_model_path
 
-__all__ = ["FaceDetectionTap", "nv12_to_bgr", "rotate_bgr", "rotation_from_tag"]
+__all__ = [
+    "FaceDetectionTap",
+    "nv12_to_bgr",
+    "rotate_bgr",
+    "rotation_from_tag",
+    "warmup_frame_sizes",
+]
 
 _QUEUE_WAIT_SECONDS = 0.5
+
+# Used for the make-sure-the-NPU-is-awake inference when the source size is
+# not known yet.  1080p matches the demo footage and is big enough that every
+# smaller stream is fast afterwards.
+_DEFAULT_WARMUP_SIZE = (1920, 1080)
+
+
+def warmup_frame_sizes(
+    width: int, height: int, rotation: int = 0
+) -> list[tuple[int, int]]:
+    """Frame sizes to run one dummy inference for before playback starts.
+
+    The RKNN runtime pays ~1.7 s for the very first inference on a large frame
+    (allocator/driver setup) and ~35 ms for every later one, so that cost has
+    to be spent while no video is flowing.  A 640x640 warm-up is *not* enough:
+    it does not touch the large-frame path.  ``rotation`` is the clockwise
+    angle applied before detection, so 90/270 degree streams also warm the
+    swapped size (that second call only costs ~35 ms).
+    """
+    if width <= 0 or height <= 0:
+        width, height = _DEFAULT_WARMUP_SIZE
+    sizes = [(width, height)]
+    if int(rotation or 0) % 180 == 90:
+        sizes.append((height, width))
+    return sizes
 
 
 def nv12_to_bgr(
@@ -145,6 +176,13 @@ class FaceDetectionTap:
         self._probe_id: int = 0
         self._frame_index = 0
         self._interval = max(1, config.detection.interval_frames)
+        # Decoded frame size, reported by the backend once the caps are known;
+        # only used to pick the warm-up frame size.
+        self._source_size: tuple[int, int] = (0, 0)
+
+    def set_source_size(self, width: int, height: int) -> None:
+        """Tell the tap the decoded frame size (used only for the NPU warm-up)."""
+        self._source_size = (int(width), int(height)) if width > 0 and height > 0 else (0, 0)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -167,9 +205,34 @@ class FaceDetectionTap:
         detector.load()
         self._detector = detector
 
+    def _warm_up(self) -> None:
+        """Run the one-off slow inference before the first frame is played.
+
+        Without this the first *real* 1080p frame costs ~2.4 s inside the
+        worker thread, which makes the opening second of video drop frames
+        (~50 % of them) on the board.  Warm-up failures must never break
+        playback, so everything is swallowed.
+        """
+        detector = self._detector
+        if detector is None:
+            return
+        width, height = self._source_size
+        try:
+            import numpy as np
+
+            for frame_width, frame_height in warmup_frame_sizes(
+                width, height, int(self._rotation() or 0)
+            ):
+                detector.detect(
+                    np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+                )
+        except Exception:  # pragma: no cover - warm-up must never break playback
+            pass
+
     def start(self, pad: Gst.Pad) -> None:
         """Attach the sample probe; the model is loaded by :meth:`prepare`."""
         self.prepare()
+        self._warm_up()
         self._running = True
         self._thread = threading.Thread(
             target=self._worker, name="face-detection", daemon=True

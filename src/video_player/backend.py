@@ -629,7 +629,7 @@ class PlaybackBackend:
             fps_pad = self._fps_sink.get_static_pad("sink")
             if fps_pad is not None:
                 fps_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_fps_buffer)
-        self._start_detection(decoder)
+        self._start_detection(decoder, source_size)
         if source_size[0]:
             self._coded_size = source_size
         info: dict[str, object] = {
@@ -666,8 +666,15 @@ class PlaybackBackend:
             self._detection_failed = True
             self._dispatch(self.on_detection_error, f"face detection unavailable: {exc}")
 
-    def _start_detection(self, decoder: Gst.Element) -> None:
-        """Attach the sampled NPU detector to the decoder output (M2)."""
+    def _start_detection(
+        self, decoder: Gst.Element, source_size: tuple[int, int] = (0, 0)
+    ) -> None:
+        """Attach the sampled NPU detector to the decoder output (M2).
+
+        ``source_size`` lets the tap warm the NPU up with a frame of the real
+        size: the first large inference costs ~1.7 s, which would otherwise be
+        paid on the first played frame and drop ~50 % of it.
+        """
         if not self._config.detection.enabled or self._detection_failed:
             return
         pad = decoder.get_static_pad("src")
@@ -677,6 +684,8 @@ class PlaybackBackend:
             self._prepare_detection()
         if self._tap is None or self._detection_failed:
             return
+        if source_size[0] > 0 and source_size[1] > 0:
+            self._tap.set_source_size(*source_size)
         try:
             self._tap.start(pad)
         except Exception as exc:  # pragma: no cover - model load errors handled above
@@ -843,7 +852,12 @@ class PlaybackBackend:
     def _on_fps_measurements(
         self, _sink: Gst.Element, _fps: float, _droprate: float, average_fps: float
     ) -> None:
-        self._last_fps = round(float(average_fps), 1)
+        # fpsdisplaysink reports an instantaneous value plus a *lifetime*
+        # average.  The average starts at zero and crawls up for a minute, so
+        # a perfectly smooth 30 fps stream reads ~20 fps for the first seconds
+        # (and looks like a fps dip in the perf log).  What the UI wants is the
+        # rate frames actually arrive at, measured over a trailing window.
+        self._last_fps = self.measured_fps() or round(float(average_fps), 1)
         self._dispatch(self.on_fps, self._last_fps)
 
     # -- helpers -----------------------------------------------------------

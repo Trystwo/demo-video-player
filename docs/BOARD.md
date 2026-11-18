@@ -35,7 +35,7 @@
 | # | 待验证项 | 命令/方法 | 期望 | 实测（日期/结论） |
 |---|----------|----------|------|------------------|
 | 1 | `mppvideodec` 可硬解 1080p30 H.264 | `scripts/bench_board.sh` / `scripts/perf_probe.py` | 稳定 30fps，单核 CPU 占用低 | ✅ 2026-11-14：12s/360 帧全解 0.80s（≈15× 实时）；GPU 转换路径播放窗口 30fps、进程 CPU 16–17%（A1 达标；证据 `docs/evidence/m1-ui-gl.png`） |
-| 2 | `mppvideodec` 可硬解 1080p30 H.265 | 同上，换 `h265parse` + H.265 素材 | 稳定 30fps | 待测：板端暂无 H.265 样片，M2 前补测 |
+| 2 | `mppvideodec` 可硬解 1080p30 H.265 | 同上，换 `h265parse` + H.265 素材 | 稳定 30fps | **已实测（2026-11-18）**：`user-selfie-1080p30.mp4`（HEVC 1080p30、rotate-180）demo 全开 30.0fps，快照 `docs/evidence/m3-h265-selfie-demo.png` |
 | 3 | 4K30 H.265 解码能力 | 4K H.265 素材 + `fpsdisplaysink` | 连续播放不卡顿（A1 可选加分项） | 可选；4K 不作硬指标（P4），待素材 |
 | 4 | `waylandsink` 可用 | `gst-inspect-1.0 waylandsink` + 最小播放管线 | 窗口正常出画 | 2026-11-14 元素存在；M1 用 `gtk4paintablesink` 内嵌，`waylandsink` 留作降级未出画 |
 | 5 | `gtk4paintablesink` 是否可用 | `gst-inspect-1.0 gtk4paintablesink` | 决定 F9 内嵌方案 | ✅ 2026-11-14 可用且已验证：`gst-plugin-gtk4 0.13.5`；`Gtk.Picture` + `paintable` 播放窗口 30fps |
@@ -128,7 +128,9 @@ bash scripts/bench_board.sh
 | 2026-11-17 | M3 应用 A2（美颜开 + 检测关） | 1080p30 近景、1280×768 窗口：30.0–30.4fps、CPU 30–33%、`beauty: on 0.68–1.36 ms`；同场景美颜关 30.1–30.2fps/30–32% | 修复前同一配置 78–80% CPU |
 | 2026-11-17 | M3 应用（美颜开 + 检测开，真实人脸） | 1080p30 近景：稳定 30.0fps、CPU 110–119%、beauty 1.06–1.56 ms、NPU 37.5–44.0 ms、faces 1 | 检测是 CPU 主要来源；美颜仍 <1.6ms |
 | 2026-11-17 | M3 demo 全开（美颜+检测+强制分屏） | 全屏 1280×800：30.0fps、CPU 117–131%、NPU 37.8–41.2 ms、beauty 1.1–1.5 ms；关美颜 112–121% | 增量主要来自 M2 检测（约 85pp） |
-| 2026-11-17 | M3 掉速窗口归因（检测路径） | 开检测时周期性掉速：15s 素材 t≈9–14s、60s 长片 t≈11–16s/27–33s，fps 21–25 后自行恢复 30.0；同期 beauty 1.0–1.5 ms、NPU 37–44 ms、CPU 112–125% 全平稳；低负载（load 1.32）复现；检测降到 1Hz（CPU 59–62%）仍复现；不带检测的 `perf_probe` 15s 内 buffers/s 稳定 30.0 | 诱因在「检测开启」而非美颜/推理频率；怀疑 `extract_dup` NV12 DMABuf 映射 + `GLib.idle_add` 回主线程周期性阻塞 sink，M2 遗留，交 M4 |
+| 2026-11-18 | M1 A1 H.265 1080p30 硬解（补测） | `user-selfie-1080p30.mp4`（HEVC 1080p30、158MB/92.7s、rotate-180）经 `h265parse`+`mppvideodec` 硬解；demo 全开（美颜+检测+分屏）30.0 fps、`drop=0.000%`、NPU 43.0 ms、beauty 1.1 ms、画面正立且人脸框/蒙版对齐 | A1 的 H.264/H.265 均已达标；快照 `docs/evidence/m3-h265-selfie-demo.png` |
+| 2026-11-18 | M3 fps 读数修正（旧「掉速」证伪） | 界面/PERF 的「周期性 20–25 fps 掉速」不存在：同步采集瞬时 fps、累计平均值与墙钟帧率，全程 `sig_fps 28.9–31`、`drop=0.000%`、墙钟 30.0 帧/s；21–25 是 `fpsdisplaysink` 的 `average_fps`（累计平均，起播丢帧后要几十秒才爬回）+ PERF 采样早于 UI 校正 | 改用 `measured_fps()`（1.5 s 滑窗到达率）；`_maybe_log_perf()` 移到 `_tick()` 末尾；原「检测路径阻塞 sink」归因证伪 |
+| 2026-11-18 | M3 起播丢帧根因（检测开） | 首个真实帧 RKNN 推理 **2.38–2.43 s**（之后 38–41 ms/帧），worker 忙这一秒多导致起播丢约 50% 帧；640×640 零图预热仅 30.9 ms 且**不覆盖大尺寸路径**（首真实帧仍 2.4 s）；另测得 `extract_dup` 1080p NV12 稳定 17–33 ms/次 | 修复：`FaceDetectionTap.start()` 用真实解码尺寸零帧预热（`warmup_frame_sizes()`，90/270 额外预热交换尺寸 ≈35 ms）；复测 cfg_det_only / cfg_faceon / demo 三组 `drop=0.000%`、fps 30.0 全程 |
 | 2026-11-17 | M3 检测线程 CPU 归因 | `/proc/PID/task` 采样（总 CPU 115.2%）：主线程 27.3%、demux:sink 27.6%、video-decoder 15.0%、gstglcontext 11.3%；headless `measure_tap.py` 30.0fps、10 次/s、37.5 ms | M2 遗留成本，M3 未改动 |
 | 2026-11-17 | M3 旋转（90/270/180） | `ffmpeg -display_rotation` 素材 + 四色标记图：tag `rotate-270/rotate-90/rotate-180` 与显示方向自洽；180° 自拍素材人脸框与遮罩对齐 | `face_rect_to_texture()` 反向映射正确（单测覆盖 0/90/180/270） |
 | 2026-11-17 | M3 一键开关（F9 路径） | 运行时 `refresh_beauty()`：`beauty_active False→True`，beauty_ms 稳定 0.9–1.1 ms，无异常 | UI 开关走同一路径 |

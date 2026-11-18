@@ -38,6 +38,7 @@
 | `m3-split-closeup.png` | 上一图裁切放大 1.5×（带 ORIGINAL/BEAUTY 标注） | 分割线两侧皮肤纹理差异清晰；羽化过渡无硬接缝 |
 | `m3-mask.png` | `beauty.debug_mask=true` 遮罩预览（检测开） | 白色=羽化圆角矩形人脸处理区；眼睛/眉毛被肤色门限压暗；框外全黑（背景/头发不处理）；绿框与遮罩对齐 |
 | `m3-rot180-beauty.png` | rotate-180 自拍片源 + 美颜（检测开） | 画面正立、人脸框与磨皮区域均落在脸部（方向处理正确） |
+| `m3-h265-selfie-demo.png` | demo 分屏 + H.265（HEVC 1080p30，rotate-180 自拍素材 `user-selfie-1080p30.mp4`） | `1920×1080`、`X-H265`、`decode: mppvideodec`、`fps: 30.0`、`NPU: 1 face · 43.0 ms`、`beauty: on 1.1 ms`；画面正立、人脸框与分屏线对齐（A1 的 H.265 补测证据） |
 | `m3-rot180-mask.png` | 同上素材的遮罩预览 | 遮罩随检测框反向旋转回纹理坐标，无镜像/错位 |
 
 性能读数（同一批抓取的 `PERF` 行，取稳定段；详见 [../BOARD.md](../BOARD.md) §5.2）：
@@ -49,9 +50,11 @@
 | 检测开 + 美颜开（cfg_faceon） | 30.0 | 110–119% | 1.06–1.56 ms | 37.5–44.0 ms |
 | demo 分屏全开（`--demo`） | 30.0 | 117–131% | 1.1–1.5 ms | 37.8–41.2 ms |
 
-板端背景负载升高时会周期性出现 20–25 fps 的波动窗口（60 s 长片实测；
-波动期间 beauty/NPU 耗时与 CPU 均平稳，load average 4.2→5.9），属调度抖动而非
-美颜成本；上表取稳定段。
+注（2026-11-18）：表中的 fps 是 `fpsdisplaysink` 的累计平均值，早期曾被误读为
+「周期性 20–25 fps 掉速窗口」——实际播放全程 30.0 帧/s、`drop=0.000%`（见
+[../BOARD.md](../BOARD.md) §5.2 的 fps 读数修正与起播丢帧两行）。现在界面与
+PERF 行的 fps 改用 `PlaybackBackend.measured_fps()`（1.5 s 滑窗到达率），检测开启
+时起播丢帧也已用真实尺寸 NPU 预热消除。
 
 复现命令（板端，项目目录；`/tmp/cfg_A.json` = 检测开+美颜关，`/tmp/cfg_B.json`
 = 检测关+美颜开，`/tmp/cfg_C.json` = 都关，`/tmp/cfg_faceon.json` = 检测开+美颜开）：

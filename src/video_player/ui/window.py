@@ -683,7 +683,6 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 self._playlist_list.select_row(row)
 
     def _tick(self) -> bool:
-        self._maybe_log_perf()
         if self.backend.has_media:
             measured = self.backend.measured_fps()
             if measured and abs(measured - self._fps) >= 0.5:
@@ -705,6 +704,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 # Keep the panel's ms/frame in sync with the live GPU timing;
                 # otherwise it stays at the value captured before playback.
                 self._refresh_params_label()
+        # Log after the measured-fps correction above: logging first sampled
+        # fpsdisplaysink's lifetime average, which reads far too low while the
+        # stream warms up and looked like a fps dip on a perfectly smooth run.
+        self._maybe_log_perf()
         return True
 
     def _maybe_log_perf(self) -> None:

@@ -115,7 +115,7 @@ filesrc → qtdemux/matroskademux/tsdemux
 | `src/video_player/face.py` | `Face`、`DetectionResult`、`RknnFaceDetector`（ctypes 调 librknnrt） | M2 已实现（10 Hz 采样） |
 | `src/video_player/face_yunet.py` | YuNet 后处理：按 stride 解码、NMS、映射回帧坐标 | M2 已实现（单测覆盖） |
 | `src/video_player/rknn_runtime.py` | `librknnrt.so` 的最小 ctypes 封装（init/query/inputs/run/outputs/release） | M2 已实现 |
-| `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程 | M2 已实现 |
+| `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程、NPU 起播预热 | M2 已实现（M3 加真实尺寸预热） |
 | `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖） |
 | `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、快照、PERF 日志 | M1–M3 已接线（板端验证） |
 | `scripts/launch_player.py` | 桌面入口包装脚本（原样透传参数） | 可用（M3 修复 `--snapshot` 被吞） |
@@ -124,7 +124,7 @@ filesrc → qtdemux/matroskademux/tsdemux
 | `scripts/convert_yunet.py` | x86 侧 ONNX→RKNN 转换（rk3576，fp16，mean 0/std 1） | 可用（1,084,515B 模型） |
 | `scripts/measure_tap.py` | 板端 headless 检测吞吐测量（`fakesink sync=true`） | 可用（M2 实测工具） |
 | `scripts/probe_board.py` | 环境报告导出（文本/JSON/Markdown） | 可用 |
-| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher 单测 | 96 passed, 8 skipped（无 GL/板卡项跳过） |
+| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热 单测 | 107 passed, 11 skipped（无 numpy/GL/板卡项跳过） |
 
 ## 4. 线程模型
 
@@ -139,10 +139,15 @@ filesrc → qtdemux/matroskademux/tsdemux
 美颜参数在 GLib 主线程由检测结果换算成 uniform 字典后写入 `glshader` 的
 `uniforms` 属性（元素内部在流线程读取），与流线程无共享可变状态。
 
+起播顺序（M3 收尾修正）：`FaceDetectionTap.start()` 在挂 probe 之前先做一次
+**真实解码尺寸**的 NPU 预热（`warmup_frame_sizes()`；90/270 旋转素材额外预热
+交换尺寸），把 RKNN 首个大帧推理的 1.7–2.4 s 一次性成本挪到播放启动之前，
+否则 worker 忙这一秒多会让 sink 丢掉约一半的起播帧（详见 §7）。
+
 ## 5. 零拷贝与格式路径
 
 M2 现状：检测在 decoder 的 src pad 用 `buffer.extract_dup()` 复制 NV12
-（`extract_dup` ≈2.8 ms/次、NV12→BGR ≈3.1 ms/次），尚未使用 RGA。
+（实测 `extract_dup` 1080p NV12 17–33 ms/次——旧注释估的 ~3 ms 偏低 5–10 倍；NV12→BGR ≈3.1 ms/次），尚未使用 RGA。
 M3 未增加 CPU 拷贝：预缩放与美颜都在 GL 纹理上完成，蒙版也不上传纹理
 （shader 内光栅化）；每帧新增的 CPU 工作只有 uniform 结构写入（10 Hz）。
 RGA 直通仍留作后续优化，用于替代检测输入的 `extract_dup`。
@@ -220,17 +225,21 @@ A2 的 fps 与 CPU 目标按「美颜+显示链路」计为达标）；demo 全�
 M2 的 10 Hz YuNet + RKNN 线程池成本（headless `measure_tap.py`：30 fps、
 10 次检测/s、37.5 ms/次；线程采样显示 NPU 侧约占 85 个百分点），列入后续优化。
 
-测量方法：表中数字取播放稳定段（前 2–3 s 有 RKNN/UI 预热，fps 从 0 爬到 30）。
-**开检测时**会周期性出现 20–25 fps 的波动窗口（15 s 素材在 t≈9–14 s、60 s 长片在
-t≈11–16 s 与 27–33 s：fps 掉到 21–25 后自行恢复 30.0）。已用实验把诱因缩小到
-「检测路径开启」本身：①波动期间 `beauty` 1.0–1.5 ms、`NPU` 37–44 ms、进程 CPU
-112–125% 全部平稳（美颜/NPU 成本没有变化）；②低负载（load 1.32）下仍复现，
-不是背景负载；③不带检测的 `perf_probe.py CONV=gl BEAUTY=1 SCALE=1280x720`
-连续 15 s `buffers/s` 稳定 30.0、`gtksnap/s` 30.0（管线本身不掉帧）；④把检测降到
-1 Hz（`interval_frames=10`，CPU 59–62%）仍然复现 → 与推理频率/CPU 负载无关，
-怀疑 decoder src pad 侧的 `extract_dup`（NV12 DMABuf 映射）+ `GLib.idle_add`
-回主线程的路径周期性阻塞 sink/主线程。这是 M2 检测链路的遗留问题，已列入 M4；
-A2 结论按「检测关时 15 s 全程稳定 30 fps」与「开检测时稳定段 30 fps」共同判定。
+测量方法：表中数字均取自 `VIDEO_PLAYER_PERF_LOG=1` 的 `PERF` 行稳定段。
+fps 取 `PlaybackBackend.measured_fps()`——最近 1.5 s 内实际到达的帧数（pad probe
+记录 pts），**不再使用 `fpsdisplaysink` 的 `average_fps`**：后者是从起播开始累计的
+平均值，起播期一旦丢帧就要几十秒才爬回 30，读起来像「周期性掉速」（M3 收尾修正，
+见下）。检测开启时起播会丢约一半帧，根因是 **RKNN 首个大尺寸推理实测 2.38–2.43 s**
+（之后每帧 38–41 ms），worker 忙这一秒多 sink 只能丢帧；640×640 零图预热只要
+30.9 ms，**不覆盖大尺寸输入路径**，所以此前无效。现在 `start()` 用真实解码尺寸
+预热后，连续复测 `fpsdisplaysink` 的 `droprate` 全程 `0.000%`、PERF fps 从第一个
+采样点起就是 30.0（2026-11-18 复测：cfg_det_only / cfg_faceon / `--demo` 三组一致）。
+
+**已证伪的旧结论**：`c71d42e` 记载的「开检测时周期性 20–25 fps 掉速窗口」并不
+存在。同步采集 `fpsdisplaysink` 的瞬时值、累计平均值与墙钟帧率后可见：全过程中
+`sig_fps≈29–31`、`drop=0.000`、墙钟 30.0 帧/s 稳定；界面/日志里的 21–25 只是
+`average_fps` 的累计值，加上 PERF 采样发生在 `_tick()` 用 measured_fps 校正
+`_fps` 之前（现已把 `_maybe_log_perf()` 移到 `_tick()` 末尾）。
 
 M3 排查中确认的 GTK4 慢路径：`Gtk.Picture` 显示纹理时若缩放比 < 0.5 会走
 CPU 每帧缩放（1080p 纹理、视频区 940 px 宽时进程 CPU 62–78%；把视频区放到
@@ -274,8 +283,9 @@ M1 的退出崩溃修复（先销毁窗口/管线，`run_window` 末尾 `os._exi
    推到 0.5 以下；当前默认布局（1280 px 窗口、330 px 侧栏、1280 纹理）留有
    余量，后续做小窗模式时需要重新核对。
 7. **新增**：检测线程 CPU 占比（约占 85 个百分点）是 M2 遗留成本，M3 未改动；
-   若 A2 的 CPU 目标需要严格覆盖 demo 全开场景，需从 RGA 直通/NV12 缩放/
-   降低检测频率入手。
+   其中 `extract_dup` 抽一帧 1080p NV12 实测 17–33 ms（10 Hz 即约 0.18 核），
+   远超旧注释的 ~3 ms。若 A2 的 CPU 目标需要严格覆盖 demo 全开场景，优先从
+   RGA 直通 / NV12 预缩放 / 降低检测频率入手。
 
 ## 10. 目录结构
 
