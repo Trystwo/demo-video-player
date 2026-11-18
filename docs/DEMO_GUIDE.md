@@ -1,6 +1,6 @@
 # 演示指南（草稿）
 
-> 状态：M1（2026-11-14，1080p30 实时）、M2（2026-11-16，NPU 检测 + 人脸框）、M3（2026-11-17，GPU 美颜 + 对比分屏）均已实现并在板端验证；本文件按 M3 实测修订，M4 补充演示视频与最终截图。演示范围（2026-11-14 确认）：本地硬解播放 + 自动美颜 + 一键/分屏对比；网络流与字幕不在本期。
+> 状态：M1（2026-11-14，1080p30 实时）、M2（2026-11-16，NPU 检测 + 人脸框）、M3（2026-11-17，GPU 美颜 + 对比分屏）、M4 应用内录制（2026-11-18，`--record` + 61.8s 演示成片）均已实现并在板端验证；本文件按 M3/M4 实测修订。演示范围（2026-11-14 确认）：本地硬解播放 + 自动美颜 + 一键/分屏对比；网络流与字幕不在本期。
 > 环境与性能前置条件见 [BOARD.md](BOARD.md)，范围见 [PRD.md](PRD.md)，交付与拍摄计划见 [DELIVERY.md](DELIVERY.md)。
 
 ## 1. 演示目标
@@ -54,6 +54,23 @@ python3 -m video_player --check
 9. **多人/侧脸**：播放多人素材，说明最多 3 张脸、≤45° 侧脸仍可检出（A4）。
 10. **收尾（可选）**：连续播放 1h 稳定性（A5，M4 补测）。
 
+## 3.1 录屏/演示视频（M4 新增）
+
+板端没有可用的 HDMI 采集卡，GNOME/PipeWire 录屏也只落 48 字节空文件，因此录制走应用内 `glvideomixer` 合成（视频分支 30fps + UI 覆盖层画布 10fps → NV12/RGBA → `mpph264enc`）。现场要留一段带界面的录像时：
+
+```bash
+# 交互录制：先播放，再按 R 开始/停止；文件为 1280×800@30 H.264
+python3 -m video_player --demo --record /tmp/demo.mp4 /path/to/video.mp4
+
+# 定时录制：到时自动收尾，适合无人值守拍摄
+python3 -m video_player --demo --record /tmp/demo.mp4 --record-duration 12 --config configs/player.example.json /path/to/video.mp4
+```
+
+- 录制时 GPU 交给录制器，DSI 屏的视频区会变黑，属预期；录制文件本身正常（侧栏、信息行、人脸框都在画面里）。
+- 录制第一帧后约 2 秒内会自动预热画布；前 2.5 秒可能出现 mixer 未出帧的空画面，后期剪掉即可（`docs/demo-video/build_video.sh` 里 `TRIM=2.5` 就是为此）。
+- `--record` 会旁路显示分支（`display_bypass=True`），播放/美颜逻辑与性能不变，实测录制时 fps 稳定 30.0、CPU 184–205%。
+- 演示成片与拍摄脚本放在内部目录 `docs/demo-video/`（不随公开仓库导出）：`out/video-player-m3-demo.mp4`（1920×1080@30、61.8s、中英双语硬字幕）、`shoot.sh`、`build_video.sh`、`configs/`、`subtitles_bilingual.ass`。
+
 ## 4. 讲解要点
 
 - 不是“软件滤镜”：解码、检测、美颜分别落在 VPU、NPU、GPU，CPU 只做调度，
@@ -82,7 +99,8 @@ python3 -m video_player --check
 - [x] 主窗口截图 → `docs/images/main-window.png`（2026-11-14，取自 `docs/evidence/m1-ui-gl.png`）
 - [x] 美颜前后对比截图 → `docs/images/beauty-compare.png`（A/B 近景对比，取自 `docs/evidence/m3-beauty-ab.png`）；主窗口分屏 → `docs/images/beauty-split.png`（`m3-split-demo.png`）；同帧近景 → `docs/evidence/m3-split-closeup.png`
 - [ ] 板端环境自检输出（`--markdown`）→ 回填 [BOARD.md](BOARD.md)（部分已回填）
-- [ ] 演示视频（约 90 秒、1080p30、中英双语硬字幕）→ 按 [DELIVERY.md](DELIVERY.md) 拍摄方案执行，成片链接记录到本文件
+- [x] 演示视频（61.8s、1920×1080@30、中英双语硬字幕）→ `docs/demo-video/out/video-player-m3-demo.mp4`（内部，不导出；制作流程见 `docs/demo-video/README.md`、[DELIVERY.md](DELIVERY.md) §6）
+- [x] 录制模式证据 → `docs/evidence/m4-record-split.png`（分屏+面板+信息行）、`docs/evidence/m4-record-selfie-rot180.png`（rotate-180 自拍素材正立录制）
 - [ ] 验收 A1–A6 的逐条证据（fps/CPU/检出率/1h 稳定性）
 
 归档约定：图片放 `docs/images/`，过程证据与历史评审放 `docs/history/`

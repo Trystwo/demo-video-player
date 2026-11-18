@@ -48,6 +48,9 @@
 | 12 | VPU→GL 零拷贝（dmabuf/EGLImage） | 按 [ARCHITECTURE.md](ARCHITECTURE.md) 第 5 节验证 | 无 CPU 帧拷贝，或记录降级 | 2026-11-14：`mppvideodec ! gtk4paintablesink` 直连报 `not-negotiated`；当前走 `glupload+glcolorconvert`（GPU 内转换）→ `GLMemory` RGBA；M3 追加 `glcolorscale`+`glshader` 仍在 GPU 内，dmabuf 直通未启用（当前链路已达标） |
 | 13 | 显示与触屏 | 本地播放 + 触控操作 | 1280×800 全屏正常，触屏可点 | 2026-11-14：DSI-1 connected；GUI 在 Xwayland/`GDK_BACKEND=x11` 下启动成功并截图；Wayland 原生出画与触屏待 M2 前补测 |
 | 14 | 音频输出 | 播放带音轨素材 | PipeWire 正常出声，音量/静音可控 | 2026-11-14：`pulsesink` 可用、`audiotestsrc ! autoaudiosink` rc=0；真实音轨待补测（M1 样片无音轨） |
+| 15 | GTK4 整窗逐帧捕获（录制候选方案 A） | `Gtk.WidgetPaintable` → `render_texture` → `Gdk.pixbuf_get_from_texture` | 未知 | ❌ 2026-11-18：render 15.6 ms + 读回 22.5 ms = **38.7 ms/帧**（≈26 fps 上限），真实 app 内 snapshot 35–70 ms 且 `to_node()` 时有时无 → 不适合 30 fps 录制 |
+| 16 | `glvideomixer` 合成录制（采用方案） | 视频 GL 分支（tee）+ UI RGBA appsrc → mixer → `gldownload` → `mpph264enc` | 1080p 级 30 fps | ✅ 2026-11-18：1280×800@30 录制稳定 30 fps（`enc 30–32/s`），gst-launch 基准 CPU ≈0.8–1.0 核；细节与踩坑见 ARCHITECTURE §2.3 |
+| 17 | `mpph264enc` 编码器输入/参数 | `gst-inspect-1.0 mpph264enc` + RGBA/NV12 路径基准 | 码率参数可用、可吃 RGBA | ✅ 2026-11-18：**没有 `bitrate` 属性**，码率写 `bps`；sink caps 接受 RGBA/NV12 等；`GL RGBA→gldownload→编码` 90 fps vs `GL NV12→gldownload→编码` 20 fps（NV12 转换慢 4 倍） |
 | 15 | 网络流 | HLS 样本 + 局域网 RTSP 摄像头 | 可播放（A6） | 移出本期（2026-11-14），不验收 |
 
 ## 3. 模型与素材清单
@@ -135,6 +138,9 @@ bash scripts/bench_board.sh
 | 2026-11-17 | M3 旋转（90/270/180） | `ffmpeg -display_rotation` 素材 + 四色标记图：tag `rotate-270/rotate-90/rotate-180` 与显示方向自洽；180° 自拍素材人脸框与遮罩对齐 | `face_rect_to_texture()` 反向映射正确（单测覆盖 0/90/180/270） |
 | 2026-11-17 | M3 一键开关（F9 路径） | 运行时 `refresh_beauty()`：`beauty_active False→True`，beauty_ms 稳定 0.9–1.1 ms，无异常 | UI 开关走同一路径 |
 | 2026-11-17 | M1 遗留 seek 缺陷 | PyGObject 绑定顺序为 `seek(rate, format, flags, ...)`；修复后 seek/倍速恢复，`tests/test_seek.py` 4 passed | 回归测试补齐 |
+| 2026-11-18 | 录制链路原型（gst-launch） | 先验 `glvideomixer` 合成：video GL 940×528@30 + UI 1280×800@10fps + mixer 后 capsfilter 1280×800@30 → NV12 → `mpph264enc bps=8M`；输出 `h264 1280×800 30/1`、10.2s/306 帧，CPU ≈0.82–1.02 核 | 仅此一路；混流器要求每个 pad 都推进，UI pad 不能"复用旧帧" |
+| 2026-11-18 | `--record` 应用内录制（成品） | `--demo --record /tmp/x.mp4 --record-duration N`：画布 = 背景 + 视频区（alpha 洞）+ sidebar/info/控制条快照 + 人脸框；`display_bypass=1` 让显示分支让出 GPU | ✅ 稳定 30.0 fps、`enc 30–32/s`、CPU 184–205%、compose 3–6 ms/tick；产物 `h264 1280×800 30/1`、10.8s/325 帧/5.2MB；录制时屏幕视频区为黑（旁路显示） | 抽帧 `.cache/m3shots/rec3_frame7.png`；架构与踩坑见 ARCHITECTURE §2.3 |
+| 2026-11-18 | 录制模式拍摄演示素材 | `docs/demo-video/shoot.sh`（7 段：分屏/强度/关美颜/双人/遮罩/无人脸/自拍 H.265），每段 `--record-duration` 定时自动收尾 | 每段可播放、`nb_frames≈30×时长` | 7/7 成功（13.07/8.47/9.73/8.00/12.33/8.27/10.83s）；首轮 4 段缺 moov 用重试兜住；自拍 180° 录制需在录制链加 `glvideoflip`（已实现） |
 | 待测 | M3 长跑 / 1h 稳定性（A5） | 连续播放 + `free`/句柄检查 | 本轮未做（板端图形会话意外中断，见 §6） |
 
 ## 6. 已知环境限制与复现命令
@@ -165,6 +171,20 @@ bash scripts/bench_board.sh
     python3 scripts/perf_probe.py
   ```
   `PERF` 行格式：`PERF t=15s fps=30.1 beauty=1.20ms faces=1 npu=38.9ms cpu=31%`。
+- M4 录制模式（`--record`）复现命令：
+  ```bash
+  REC_DEBUG=1 python3 scripts/launch_player.py --demo \
+    --record /tmp/demo.mp4 --record-duration 10 --config /tmp/cfg_faceon.json \
+    /tmp/face_1080p30.mp4
+  ffprobe -v error -show_entries stream=width,height,r_frame_rate,nb_frames \
+    -of default=nw=1 /tmp/demo.mp4
+  # 演示素材批量拍摄（板端 docs/demo-video/ 已部署配置与脚本）
+  bash /home/tris/demo-video/shoot.sh            # 7 段全部
+  bash /home/tris/demo-video/shoot.sh 05 07      # 只拍指定段
+  bash /home/tris/demo-video/build_video.sh      # 剪接 + 字幕 → out/*.mp4
+  ```
+  备注：录制时 DSI 屏上视频区是黑的（`display_bypass`，GPU 让给编码），录制文件
+  本身正常；`--snapshot` 在 windowed 模式会失败，录制/截图都在 `--demo` 全屏下做。
 - 测试素材在板端 /tmp（非仓库）：`/tmp/face_1080p30.mp4`（近景，
   由 `test-media/pexels/5534415…` 转码）、`/tmp/face_rot180.mp4`、
   `/tmp/face_selfie.mp4`、`/tmp/m1_sample.mp4`（1080p30 双人）、

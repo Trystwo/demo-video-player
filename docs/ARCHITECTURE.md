@@ -24,6 +24,7 @@ filesrc → qtdemux/matroskademux/tsdemux
   │            ── glupload ── glcolorconvert ── capsfilter(GLMemory RGBA)
   │            ── glcolorscale ── capsfilter(长边 ≤ texture_max_dimension)   ── M3 预缩放
   │            ── glshader `video-beauty`（磨皮+美白+分屏，单 pass）          ── M3
+  │            ── tee（仅 --record 时创建；录制分支见 §2.3）
   │            ── fpsdisplaysink ── gtk4paintablesink ── Gtk.Picture
   │                    ├─ M2：decoder src pad probe 每 N 帧抽 NV12 → 后台线程
   │                    │     NV12→BGR、按 tag 旋转、YuNet RKNN → GLib.idle_add
@@ -102,6 +103,66 @@ filesrc → qtdemux/matroskademux/tsdemux
 - 该元素缺失时自动跳过（`_build_gl_scaler()` 返回空列表），退化为全尺寸纹理：
   效果不受影响，只是 1080p 在窄窗口下 CPU 偏高（降级而不是失败）。
 
+### 2.3 应用内录制模式（`--record`，M3 收尾新增）
+
+板端没有采集卡，GNOME/PipeWire 录屏在这块板子上不可用（`org.gnome.Shell.Screencast`
+只落出一个 48 字节的空文件），x11grab 兜底只有 9–10 fps，所以演示视频改为由应用
+自己录。**整窗快照不可行**：`Gtk.WidgetPaintable` + `render_texture` + pixbuf 读回
+实测 35–70 ms/帧且 `to_node()` 时有时无，GTK 主循环被拖到 20 tick/s。因此录制不是
+"拍屏幕"，而是把已经存在于 GPU 里的视频分支和一个 UI 覆盖层在 `glvideomixer` 里
+合成：
+
+```
+beauty ─┬─ fpsdisplaysink ── gtk4paintablesink   （--record 时旁路为 fakesink）
+        └─ tee ── queue ── [glvideoflip] ── glcolorscale ── capsfilter(GL RGBA)
+                                                     └──> glvideomixer.sink_1
+canvas(10 fps 重建) ── appsrc ── capsfilter(SystemMemory RGBA) ──> glvideomixer.sink_2
+glvideomixer ── capsfilter(GL RGBA) ── gldownload ── mpph264enc(bps) ── h264parse
+             ── mp4mux ── filesink（1280×800@30 或窗口尺寸）
+```
+
+- **视频 pad**：从 `tee` 的新 request pad 接出，先按显示旋转加 `glvideoflip`
+  （`--record` 旁路了显示 sink，而 display matrix 平时是 sink 侧应用的；不加会把
+  rotate-180 的自拍片录成倒的），再 `glcolorscale` 到"屏幕上视频区的实际大小"
+  （避免 mixer 每帧缩放），`capsfilter` 固定为 `GLMemory RGBA`。
+- **UI pad**：`appsrc` 推整窗 RGBA 画布（1280×800），内容 = 主题背景色 +
+  黑色视频区 + 拟合矩形内 alpha=0 的洞（视频透出）+ chrome 图层快照
+  （侧栏/信息行/控制条）+ 每帧自绘的人脸框与 5 点。背景与图层只在 widget
+  变化时重拍（侧栏 3 s、信息行/控制条 1 s、前 2 s 每 tick 一次——刚建窗时
+  widget 还没画出第一帧，快照会是空白），每帧只做 `base.copy()` + 画框。
+- **帧同步**：UI 画布在视频流线程的 pad probe 里跟随视频 buffer 的 PTS 逐帧推送
+  （内容 10 fps 重建、PTS 30 fps 推进）；`videoaggregator` 只要有 pad 不推进就会
+  卡住整条分支并反压 tee，所以两个 pad 必须同速。
+- **旁路显示**：`gtk4paintablesink` 与 `gldownload` 会争抢 GL/带宽（实测录制时显示
+  掉到 27–28 fps），`--record` 时 `PlaybackBackend(display_bypass=True)` 把显示
+  sink 换成 `fakesink`，fps 仍由 `fpsdisplaysink` 从 tee 上的 buffer 统计；录制
+  文件因此能稳在 30 fps（编码侧 30–32 帧/s）。
+- **收尾**：整条播放管线永远不会 post EOS（显示分支一直在播），所以 recorder 在
+  `h264parse` 的 src pad 上装 EVENT 探针，看到 EOS 就把 mp4mux 收尾后再拆分支；
+  `stop()` 超时 1.5 s 兜底。
+- **命令行**：`--record FILE`（录制到文件，窗口内 `R` 键提前停止）、
+  `--record-duration SECONDS`（到点自动停止并关窗，适合脚本化拍摄）。
+  调试：`REC_DEBUG=1`（打印 attempt/canvas/enc/ui/vid 统计）、
+  `REC_DUMP_CANVAS=/path.png`（导出最近一帧画布）。
+
+录制链路的实测参数与坑（板端 1.26.2，1280×800）：
+
+| 项目 | 实测 | 说明 |
+|------|------|------|
+| 整窗快照 | 35–70 ms/帧 | 不可用于 30 fps；`to_node()` 在首帧前返回 None |
+| `glcolorconvert`→NV12 + 读回 | 33 fps（仅读回） / 20 fps（含编码） | 慢 4 倍 |
+| GL RGBA 直读 + `mpph264enc` | 90 fps | 编码器直接吃 RGBA，省 videoconvert |
+| `glvideomixer` 两 pad + 读回 + 编码 | 36 fps（RGBA） / 27.6 fps（NV12） | 选 RGBA 输出 |
+| 画布合成（缓存 base 后） | compose 3–6 ms/tick | 未缓存时 50–60 ms/tick |
+| 录制中整体 | 30.0 fps、CPU 184–205%、enc 30–32/s | 1280×800@30 H.264，10 s ≈ 5 MB |
+
+其它板端踩坑：PyGObject 里 `GstAppSrc` 没有 `push_buffer()` 方法，要
+`emit("push-buffer", buf)` / `emit("end-of-stream")`；`Gst.Bus.add_watch` 的绑定
+签名是 `(priority, func, user_data)`，这里复用 backend 已装的 signal watch；
+`glupload` 不能放进录制分支（GL context 不共享），交给 `glvideomixer` 自己上传；
+GTK4 **不发射** `GtkWidget::destroy`，窗口清理必须挂 `close-request`（M3 顺带
+修正了主窗口退出路径）。
+
 ## 3. 模块划分
 
 | 文件 | 职责 | 状态 |
@@ -117,14 +178,16 @@ filesrc → qtdemux/matroskademux/tsdemux
 | `src/video_player/rknn_runtime.py` | `librknnrt.so` 的最小 ctypes 封装（init/query/inputs/run/outputs/release） | M2 已实现 |
 | `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程、NPU 起播预热 | M2 已实现（M3 加真实尺寸预热） |
 | `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖） |
-| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、快照、PERF 日志 | M1–M3 已接线（板端验证） |
+| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志 | M1–M3 已接线（板端验证） |
+| `src/video_player/ui/capture.py` | 逐 widget 快照（`Gtk.WidgetPaintable`→`render_texture`→pixbuf）与 `CanvasBuilder` 画布合成（缓存 base、分层刷新、人脸框） | M3 收尾新增（录制用） |
+| `src/video_player/recording.py` | 录制分支：`glvideomixer` 合成视频 + UI 画布，`mpph264enc`/`mp4mux` 输出，EOS 收尾与统计 | M3 收尾新增（板端 30 fps 验证） |
 | `scripts/launch_player.py` | 桌面入口包装脚本（原样透传参数） | 可用（M3 修复 `--snapshot` 被吞） |
 | `scripts/perf_probe.py` | 板端帧率探针：pad probe 计帧 + GTK snapshot 计数 + CPU | 可用（M1–M3 实测工具，含 `BEAUTY`/`SCALE` 旋钮） |
 | `scripts/bench_board.sh` | 色彩转换路径 wall-time 基准矩阵 | 可用（M1 实测工具） |
 | `scripts/convert_yunet.py` | x86 侧 ONNX→RKNN 转换（rk3576，fp16，mean 0/std 1） | 可用（1,084,515B 模型） |
 | `scripts/measure_tap.py` | 板端 headless 检测吞吐测量（`fakesink sync=true`） | 可用（M2 实测工具） |
 | `scripts/probe_board.py` | 环境报告导出（文本/JSON/Markdown） | 可用 |
-| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热 单测 | 107 passed, 11 skipped（无 numpy/GL/板卡项跳过） |
+| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制 单测 | 107 passed, 12 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 40 passed） |
 
 ## 4. 线程模型
 
@@ -282,7 +345,11 @@ M1 的退出崩溃修复（先销毁窗口/管线，`run_window` 末尾 `os._exi
    走 CPU 路径）已用预缩放规避，但窗口尺寸/侧栏宽度变化仍可能把绘制比例
    推到 0.5 以下；当前默认布局（1280 px 窗口、330 px 侧栏、1280 纹理）留有
    余量，后续做小窗模式时需要重新核对。
-7. **新增**：检测线程 CPU 占比（约占 85 个百分点）是 M2 遗留成本，M3 未改动；
+7. **新增（M4）**：录制画布的 overlay 与视频之间有 ≤100 ms 的相位差
+   （画布 10 Hz 重建 + 检测结果延迟），静态/慢动作镜头无感，快速运动镜头
+   人脸框会轻微滞后；若以后要录高速素材，可把画布重建提到 15–20 Hz 或给
+   检测结果做位置外推。录制时屏幕上的视频区是黑的（显示被旁路），属预期。
+8. **新增**：检测线程 CPU 占比（约占 85 个百分点）是 M2 遗留成本，M3 未改动；
    其中 `extract_dup` 抽一帧 1080p NV12 实测 17–33 ms（10 Hz 即约 0.18 核），
    远超旧注释的 ~3 ms。若 A2 的 CPU 目标需要严格覆盖 demo 全开场景，优先从
    RGA 直通 / NV12 预缩放 / 降低检测频率入手。
@@ -296,6 +363,7 @@ demos/43-video-player/
 ├── models/                       # RKNN 模型（不入库）
 ├── scripts/                      # 启动、环境探测、性能探针脚本
 ├── src/video_player/             # app/config/beauty/face/pipeline/backend/playlist/envcheck/ui
+│                                 #   + recording.py/capture.py（--record 应用内录制）
 ├── tests/                        # pytest 单测
 ├── install.sh                    # 环境检查 / 部署脚本（M4 完善）
 ├── requirements*.txt             # 运行/开发依赖

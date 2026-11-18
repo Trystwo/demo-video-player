@@ -1,4 +1,4 @@
-# 实测证据（M1–M3）
+# 实测证据（M1–M3 + M4 录制）
 
 这些图片由板端真实应用抓取，不是开发主机截图。抓屏方式：应用内
 `Gtk.WidgetPaintable` + `Gsk.Renderer.render_texture()` 快照
@@ -55,6 +55,24 @@
 [../BOARD.md](../BOARD.md) §5.2 的 fps 读数修正与起播丢帧两行）。现在界面与
 PERF 行的 fps 改用 `PlaybackBackend.measured_fps()`（1.5 s 滑窗到达率），检测开启
 时起播丢帧也已用真实尺寸 NPU 预热消除。
+
+## M4 应用内录制（`--record`，M3 收尾实现）
+
+没有采集卡时，演示视频由应用自己录制：视频分支经 `tee` 进 `glvideomixer`，与
+10 fps 重建的 UI 覆盖层（背景 + 窗口 chrome 快照 + 人脸框）在 GPU 内合成后
+`gldownload` → `mpph264enc` → `mp4mux`。录制时显示分支旁路（`fakesink`），
+所以板端屏幕上视频区是黑的，录制文件本身正常。架构与踩坑见
+[../ARCHITECTURE.md](../ARCHITECTURE.md) §2.3。
+
+| 文件 | 内容 | 关键读数 |
+|------|------|----------|
+| `m4-record-split.png` | 录制文件抽帧：demo 模式分屏（左原图/右美颜），UI 全部合成进画面 | `fps: 30.0`、`NPU: 1 face · 38.1 ms`、`beauty: on 1.6 ms`；侧栏/信息行/控制条/人脸框均与视频对齐 |
+| `m4-record-selfie-rot180.png` | 录制文件抽帧：rotate-180 自拍 H.265 素材 | 画面正立（录制链的 `glvideoflip` 补了 sink 侧的显示旋转）、分屏线与脸对齐 |
+
+录制产物规格（`--demo --record out.mp4 --record-duration N`）：1280×800@30
+H.264、约 5 MB / 10 s、`enc 30–32 帧/s`、CPU 184–205%。7 段演示素材由
+`docs/demo-video/shoot.sh` 拍摄、`docs/demo-video/build_video.sh` 剪接并烧
+双语字幕，成片 1920×1080@30、约 62 s（内部文件，不入公开仓库）。
 
 复现命令（板端，项目目录；`/tmp/cfg_A.json` = 检测开+美颜关，`/tmp/cfg_B.json`
 = 检测关+美颜开，`/tmp/cfg_C.json` = 都关，`/tmp/cfg_faceon.json` = 检测开+美颜开）：

@@ -32,6 +32,7 @@ Demo 规划范围（设计文档的 P0）：
 - **一键对比（已实现）** —— `B` 键开关美颜，`C` 键切换同帧分屏对比（分割位置可拖动），`--demo` 模式强制分屏。
 - **播放控制** —— 播放/暂停、拖动进度、音量、全屏、0.5×–2.0× 倍速、文件夹播放列表与断点续播。
 - **信息面板** —— 显示分辨率、编码格式、硬解/软解、实际帧率与 NPU 推理耗时。
+- **应用内录制（已实现）** —— `--record FILE` 在管线内用 `glvideomixer` 把 GPU 视频分支与 UI 覆盖层画布合成，再由 `mpph264enc` 编码成 30 fps MP4：无需采集卡即可在板端录出带面板、人脸框与信息行的完整窗口画面；`--record-duration` 到时自动停止，窗口内 `R` 键随时开始/停止。
 
 > **本期不做：** 按 2026-11-14 范围决策，网络流（HTTP/HLS/RTSP/RTMP，验收 A6）与字幕移出本期；本期聚焦本地硬解播放、自动美颜与对比视图。
 
@@ -129,9 +130,10 @@ python3 -m video_player /path/to/video.mp4   # 播放文件或文件夹
 python3 -m video_player --demo /path/to/video.mp4   # 全屏演示模式
 python3 -m video_player --check    # 只输出环境自检
 python3 -m video_player --version
+python3 -m video_player --record /tmp/demo.mp4 --record-duration 10 video.mp4   # 录制窗口（30 fps MP4）
 ```
 
-窗口在板端打开，可硬解播放本地 H.264/H.265/AAC 媒体，含播放控制条与文件夹播放列表。美颜面板直接控制 GPU 美颜 pass：磨皮/美白滑杆在播放中实时生效。快捷键：`Space` 播放/暂停、`B` 美颜、`C` 对比、`M` 遮罩预览、`F` 全屏。
+窗口在板端打开，可硬解播放本地 H.264/H.265/AAC 媒体，含播放控制条与文件夹播放列表。美颜面板直接控制 GPU 美颜 pass：磨皮/美白滑杆在播放中实时生效。快捷键：`Space` 播放/暂停、`B` 美颜、`C` 对比、`M` 遮罩预览、`F` 全屏、`R` 开始/停止录制。录制时 GPU 交给录制器、屏幕视频区变黑属预期（录制文件正常），详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §2.3。
 
 ## 当前状态
 
@@ -141,7 +143,7 @@ python3 -m video_player --version
 | M1 | GStreamer 硬解播放、GTK4 内嵌、控制、播放列表 | ✅ 2026-11-14（30fps，CPU ≈16%） |
 | M2 | RKNN YuNet 人脸检测（10Hz）、GTK 人脸框/关键点、信息行 NPU 耗时 | ✅ 2026-11-16 |
 | M3 | GPU 磨皮/美白、人脸遮罩与对比模式 | ✅ 2026-11-17（30fps，美颜约 1ms/帧，检测关闭时 CPU 30–32%） |
-| M4 | 验收 A1–A5（A6 延期）、板端截图、演示视频、完整部署脚本 | ⏳ 计划中 |
+| M4 | 验收 A1–A5（A6 延期）、板端截图、演示视频、完整部署脚本 | ⏳ 进行中（录制与演示视频已完成；A4/A5、`install.sh` 待办） |
 
 ## 相关项目
 

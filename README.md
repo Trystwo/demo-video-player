@@ -32,6 +32,7 @@ Planned scope for the demo (P0 of the design note):
 - **One-key before/after compare (implemented)** — the `B` key toggles the effect, `C` switches to a split-screen original/beautified view rendered in the same frame (adjustable split position); `--demo` forces the split view.
 - **Player controls** — play/pause, seek, volume, fullscreen, 0.5×–2.0× speed, folder playlist and resume.
 - **Info panel** — resolution, codec, hardware vs software decode, fps and NPU inference time.
+- **In-app recording (implemented)** — `--record FILE` composes the GPU video branch with a UI overlay canvas inside `glvideomixer` and encodes it with `mpph264enc`, so a 30 fps MP4 with the full window (panels, face boxes, info line) can be produced on the board without a capture card; `--record-duration` stops automatically and `R` toggles it in the window.
 
 > **Deferred for this phase:** network streams (HTTP/HLS/RTSP/RTMP, acceptance A6) and subtitles are out of scope per the 2026-11-14 scope decision. This phase focuses on local hardware-decoded playback, automatic beauty and the compare view.
 
@@ -108,7 +109,7 @@ demo-video-player/
 │   ├── evidence/               # board screenshots used as acceptance evidence
 │   └── images/                 # README screenshots
 ├── models/                     # RKNN face-detection models (see models/README.md; not committed)
-├── scripts/                    # probe_board.py, launch_player.py
+├── scripts/                    # probe_board.py, launch_player.py, perf_probe.py
 ├── src/video_player/           # package: config, pipeline plan, beauty, face, envcheck
 │   └── ui/                     # GTK4 window
 ├── tests/                      # pytest suite for config, beauty, face, pipeline, envcheck
@@ -129,9 +130,11 @@ python3 -m video_player /path/to/video.mp4   # play a file or a folder
 python3 -m video_player --demo /path/to/video.mp4   # fullscreen demo mode
 python3 -m video_player --check    # environment report only
 python3 -m video_player --version
+python3 -m video_player --demo /path/to/video.mp4 \
+    --record /tmp/demo.mp4 --record-duration 10   # record the window (30 fps MP4)
 ```
 
-The window opens on the board's display and plays local H.264/H.265/AAC media with hardware decoding, transport controls and a folder playlist. The beauty panel controls the GPU pass; the smoothing/whitening sliders apply to the running video as you drag them. Keys: `Space` play/pause, `B` beauty, `C` compare, `M` mask preview, `F` fullscreen.
+The window opens on the board's display and plays local H.264/H.265/AAC media with hardware decoding, transport controls and a folder playlist. The beauty panel controls the GPU pass; the smoothing/whitening sliders apply to the running video as you drag them. Keys: `Space` play/pause, `B` beauty, `C` compare, `M` mask preview, `F` fullscreen, `R` start/stop recording. Recording re-encodes the window on the GPU and takes the GPU from the display sink (the on-screen video area goes black while recording, the file is fine); see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §2.3.
 
 ## Status
 
@@ -141,7 +144,7 @@ The window opens on the board's display and plays local H.264/H.265/AAC media wi
 | M1 | GStreamer hardware-decoded playback, GTK4 embedded sink, controls, playlist | ✅ 2026-11-14 (30 fps, CPU ≈16%) |
 | M2 | RKNN YuNet face detection (10 Hz), GTK boxes/landmarks, NPU timing in the info panel | ✅ 2026-11-16 |
 | M3 | GPU smoothing/whitening with face masks and compare mode | ✅ 2026-11-17 (30 fps, beauty ≈1 ms/frame, CPU 30–32% with detection off) |
-| M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ planned |
+| M4 | Acceptance A1–A5 (A6 deferred), board screenshots, demo video, full deployment script | ⏳ in progress (recording + demo video done; A4/A5 and `install.sh` open) |
 
 ## Related Projects
 

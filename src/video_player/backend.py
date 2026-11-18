@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
+import os
 import time
 from typing import Callable
 
@@ -115,9 +116,13 @@ def _structure_frame_size(structure: Gst.Structure) -> tuple[int, int]:
 class PlaybackBackend:
     """Thin, UI-agnostic wrapper around one GStreamer playback pipeline."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, *, display_bypass: bool = False) -> None:
         Gst.init(None)
         self._config = config
+        # Record mode renders no video on screen: the GPU budget goes to the
+        # recorder's compositor and H.264 read-back, and ``fpsdisplaysink``
+        # still reports the real frame rate from the tee'd buffers.
+        self._display_bypass = bool(display_bypass)
         self._pipeline: Gst.Pipeline | None = None
         self._bus: Gst.Bus | None = None
         self._bus_handler: int | None = None
@@ -143,6 +148,8 @@ class PlaybackBackend:
         self._beauty_ms = 0.0
         self._beauty_started = 0.0
         self._beauty_times: deque[float] = deque(maxlen=60)
+        self._tee: Gst.Element | None = None
+        self._recorder: object | None = None
         self.video_info: dict[str, object] = {}
         self.uri: str | None = None
 
@@ -162,6 +169,8 @@ class PlaybackBackend:
         self.on_detection_error: Callable[[str], None] | None = None
         #: Called when the GPU beauty pass cannot run (missing element / converter).
         self.on_beauty_error: Callable[[str], None] | None = None
+        #: Called with a human-readable message when the recorder fails.
+        self.on_recording_error: Callable[[str], None] | None = None
 
     # -- properties --------------------------------------------------------
 
@@ -213,6 +222,76 @@ class PlaybackBackend:
         needed to change strength or toggle the effect.
         """
         self._push_beauty_uniforms()
+
+    # -- recording ---------------------------------------------------------
+
+    @property
+    def recording(self):
+        """The active :class:`video_player.recording.Recorder` (or None)."""
+        return self._recorder
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recorder is not None
+
+    def start_recording(
+        self,
+        path: str | Path,
+        canvas_size: tuple[int, int],
+        video_size: tuple[int, int] | None = None,
+    ):
+        """Tee the GPU video branch into a 30 fps MP4 with a UI overlay.
+
+        The recorder composites the already-GPU-resident video with a UI canvas
+        (chrome snapshots + face boxes) inside ``glvideomixer``; see
+        :mod:`video_player.recording` for why whole-window capture is too slow.
+
+        Raises:
+            PlaybackError: when there is no GL video branch or the recorder
+                elements are unavailable.
+        """
+        if self._recorder is not None:
+            raise PlaybackError("recording is already running")
+        pipeline = self._pipeline
+        if pipeline is None or self._tee is None:
+            raise PlaybackError(
+                "recording needs a playing GL pipeline (video_convert=gl, "
+                "glcolorscale/glshader/gtk4paintablesink available)"
+            )
+        # numpy is only needed by the recorder (canvas + geometry); importing it
+        # lazily keeps the player importable on hosts without numpy.
+        from .recording import Recorder, RecordingError
+
+        # The display sink applies the MP4 display matrix on its own; the
+        # recorded branch taps the decoder before it, so it has to replay the
+        # same rotation (otherwise a rotate-180 clip is recorded upside down).
+        recorder = Recorder(
+            pipeline,
+            self._tee,
+            path,
+            canvas_size=canvas_size,
+            video_size=video_size,
+            rotation=self._rotation,
+        )
+        recorder.on_error = self._on_recording_error
+        try:
+            recorder.start()
+        except RecordingError as exc:
+            raise PlaybackError(f"cannot start recording: {exc}") from exc
+        self._recorder = recorder
+        return recorder
+
+    def stop_recording(self) -> None:
+        """Finish the current recording file (no-op when not recording)."""
+        recorder, self._recorder = self._recorder, None
+        if recorder is None:
+            return
+        stop = getattr(recorder, "stop", None)
+        if stop is not None:
+            stop()
+
+    def _on_recording_error(self, message: str) -> None:
+        self._dispatch(self.on_recording_error, message)
 
     # -- playback control --------------------------------------------------
 
@@ -344,6 +423,9 @@ class PlaybackBackend:
 
     def close(self) -> None:
         """Stop playback and release all GStreamer resources."""
+        # Finish the recording before the pipeline goes away, otherwise the MP4
+        # would be left without its moov atom.
+        self.stop_recording()
         self._stop_detection()
         pipeline, self._pipeline = self._pipeline, None
         if self._bus is not None:
@@ -357,6 +439,7 @@ class PlaybackBackend:
         self._video_sink = None
         self._fps_sink = None
         self._volume_element = None
+        self._tee = None
         self._beauty = None
         self._beauty_available = False
         self._beauty_ms = 0.0
@@ -378,14 +461,25 @@ class PlaybackBackend:
     # -- pipeline construction --------------------------------------------
 
     def _build_video_output(self) -> None:
-        """Create the video sink (embedded paintable sink when available)."""
+        """Create the video sink, optionally bypassing the on-screen output."""
         pipeline = self._pipeline
         assert pipeline is not None
         configured = self._config.player.render_sink
         embed = None
-        if configured == "gtk4paintablesink":
+        if self._display_bypass:
+            embed = Gst.ElementFactory.make("fakesink", "video-sink")
+            if embed is None:
+                raise PlaybackError("no fakesink available for record mode")
+            embed.set_property("sync", True)
+        elif configured == "gtk4paintablesink":
             embed = Gst.ElementFactory.make("gtk4paintablesink", "video-sink")
 
+        if self._display_bypass:
+            if self._build_fps_wrapper(embed) is None:
+                pipeline.add(embed)
+                self._video_sink = embed
+                self._fps_sink = embed
+            return
         if embed is None:
             # Off-board / fallback: plain sink, the UI shows an external window.
             fallback = Gst.ElementFactory.make(configured, "video-sink")
@@ -399,19 +493,28 @@ class PlaybackBackend:
             return
 
         self._video_sink = embed
+        if self._build_fps_wrapper(embed) is not None:
+            return
+        pipeline.add(embed)
+        self._fps_sink = embed
+        self._paintable = embed.get_property("paintable")
+
+    def _build_fps_wrapper(self, embed: Gst.Element) -> Gst.Element | None:
+        """Wrap ``embed`` in an fps-displaying sink (None when unavailable)."""
+        pipeline = self._pipeline
+        assert pipeline is not None
         fps = Gst.ElementFactory.make("fpsdisplaysink", "fps-sink")
         if fps is None:
-            pipeline.add(embed)
-            self._fps_sink = embed
-            self._paintable = embed.get_property("paintable")
-            return
+            return None
         fps.set_property("video-sink", embed)
         fps.set_property("text-overlay", False)
         fps.set_property("signal-fps-measurements", True)
         fps.connect("fps-measurements", self._on_fps_measurements)
         pipeline.add(fps)
         self._fps_sink = fps
-        self._paintable = embed.get_property("paintable")
+        if not self._display_bypass:
+            self._paintable = embed.get_property("paintable")
+        return fps
 
     def _video_converters(self, source_size: tuple[int, int] = (0, 0)) -> list[Gst.Element]:
         """Return the colour-conversion elements for the video branch.
@@ -599,18 +702,37 @@ class PlaybackBackend:
                 "the CPU converter path plays without beauty"
             )
         filters = [*converters, beauty] if beauty is not None else list(converters)
-        elements = (queue, parser, decoder, *filters)
+        chain = [queue, parser, decoder, *filters]
+        # A tee in front of the display sink lets the recorder tap the same GPU
+        # buffers without another upload (see start_recording()).  Without the
+        # element the player simply plays on, just unrecordable.
+        tee: Gst.Element | None = None
+        if self._fps_sink is not None:
+            tee = Gst.ElementFactory.make("tee", "video-tee")
+            if tee is not None:
+                chain.append(tee)
+            else:
+                chain.append(self._fps_sink)
+        elements = (queue, parser, decoder, *filters, *([tee] if tee is not None else []))
         for element in elements:
             pipeline.add(element)
-        chain = [queue, parser, decoder, *filters]
-        if self._fps_sink is not None:
-            chain.append(self._fps_sink)
         for upstream, downstream in zip(chain, chain[1:]):
             if not upstream.link(downstream):
                 self._fail(
                     f"cannot link {upstream.get_name()} to {downstream.get_name()}"
                 )
                 return
+        if tee is not None and self._fps_sink is not None:
+            tee_pad = tee.request_pad_simple("src_%u")
+            sink_pad = self._fps_sink.get_static_pad("sink")
+            if (
+                tee_pad is None
+                or sink_pad is None
+                or tee_pad.link(sink_pad) != Gst.PadLinkReturn.OK
+            ):
+                self._fail("cannot link the video tee to the display sink")
+                return
+        self._tee = tee
         provider_pad = queue.get_static_pad("sink")
         if provider_pad is None or pad.link(provider_pad) != Gst.PadLinkReturn.OK:
             self._fail("cannot link demuxer video pad to the video queue")
@@ -794,6 +916,12 @@ class PlaybackBackend:
 
     def _on_bus_message(self, _bus: Gst.Bus, message: Gst.Message) -> None:
         message_type = message.type
+        source = message.src
+        source_name = source.get_name() if isinstance(source, Gst.Element) else ""
+        if source_name.startswith("rec-"):
+            # The recorder watches its own elements (its EOS is the end of the
+            # file it is writing, not of the playback stream).
+            return
         if message_type == Gst.MessageType.TAG:
             self._on_tag_message(message)
         elif message_type == Gst.MessageType.EOS:

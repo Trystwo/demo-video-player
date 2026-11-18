@@ -53,6 +53,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="treat missing RK3576 board features (VPU/NPU/GPU) as failures",
     )
     parser.add_argument(
+        "--record",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "record the window to FILE (MP4, 30 fps, UI included) while it plays; "
+            "press R in the window to stop early"
+        ),
+    )
+    parser.add_argument(
+        "--record-duration",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "stop --record after SECONDS and close the window; used to shoot "
+            "the demo video segments"
+        ),
+    )
+    parser.add_argument(
         "--snapshot",
         type=Path,
         metavar="FILE",
@@ -127,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
         fullscreen=args.fullscreen or args.demo,
         snapshot=args.snapshot,
         snapshot_delay=args.snapshot_delay,
+        record=args.record,
+        record_duration=args.record_duration,
     )
 
 

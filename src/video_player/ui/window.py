@@ -36,6 +36,10 @@ SPEED_VALUES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 
 INFO_PLACEHOLDER = "resolution —   codec —   decode —   fps —   NPU —"
 
+#: Attempts to attach the recording branch; the first ones can fail while the
+#: pipeline is still bringing up its GL context.
+RECORD_START_RETRIES = 10
+
 CSS = b"""
 .video-surface { background-color: #000000; }
 .video-placeholder { color: rgba(255, 255, 255, 0.65); font-size: 13pt; }
@@ -140,12 +144,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
         *,
         demo: bool = False,
         fullscreen: bool = False,
+        record: Path | None = None,
+        record_duration: float | None = None,
     ) -> None:
         super().__init__(application=application)
         self.config = config
         self.demo = demo
         self.playlist = Playlist(media)
-        self.backend = PlaybackBackend(config)
+        # ``--record`` bypasses the on-screen video sink so the recorder
+        # owns the GPU and the recorded file stays a smooth 30 fps.
+        self.backend = PlaybackBackend(config, display_bypass=record is not None)
         self._fps = 0.0
         self._duration_ns = 0
         self._updating_seek = False
@@ -156,6 +164,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._beauty_error: str | None = None
         self._show_faces = True
         self._last_detection_label_at = 0.0
+        self._record_path = record
+        self._record_duration = record_duration
+        self._record_deadline = 0.0
+        self._record_done = False
+        self._recorder = None
+        self._canvas_builder = None
+        self._record_timer_id = 0
+        self._record_attempts = 0
+        self._record_failures = 0
+        self._record_ticks = 0
+        self._record_tick_ms = 0.0
+        self._record_error: str | None = None
         self._perf_log = os.environ.get("VIDEO_PLAYER_PERF_LOG") == "1"
         self._perf_last = 0.0
         self._perf_cpu = 0.0
@@ -172,6 +192,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.backend.on_detection = self._on_detection
         self.backend.on_detection_error = self._on_detection_error
         self.backend.on_beauty_error = self._on_beauty_error
+        self.backend.on_recording_error = self._on_recording_error
 
         self.set_title("Video Player · Quectel Pi M2")
         self.set_default_size(1280, 800)
@@ -205,7 +226,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.add_controller(controller)
 
         self._timer_id = GLib.timeout_add(200, self._tick)
-        self.connect("destroy", self._on_destroy)
+        self._closed = False
+        # GTK4 no longer emits GtkWidget::destroy, so the teardown hook is
+        # close-request; it runs synchronously from Window.close()/destroy().
+        self.connect("close-request", self._on_close_request)
 
         if fullscreen or demo:
             self.fullscreen()
@@ -248,6 +272,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._placeholder.add_css_class("video-placeholder")
         overlay.add_overlay(self._placeholder)
         box.append(overlay)
+        self._player_overlay = overlay
 
         self._info_label = Gtk.Label(label=INFO_PLACEHOLDER)
         self._info_label.set_xalign(0.0)
@@ -311,6 +336,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         fullscreen.set_tooltip_text("Fullscreen (f)")
         fullscreen.connect("clicked", self._on_fullscreen_clicked)
         bar.append(fullscreen)
+        self._controls_bar = bar
         return bar
 
     def _build_sidebar(self) -> Gtk.Widget:
@@ -395,6 +421,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         note.set_wrap(True)
         note.add_css_class("dim-label")
         panel.append(note)
+        self._sidebar_panel = panel
         return panel
 
     # -- playback -------------------------------------------------------
@@ -708,6 +735,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         # fpsdisplaysink's lifetime average, which reads far too low while the
         # stream warms up and looked like a fps dip on a perfectly smooth run.
         self._maybe_log_perf()
+        if self._record_path is not None:
+            self._maybe_start_recording()
         return True
 
     def _maybe_log_perf(self) -> None:
@@ -799,10 +828,233 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if name in ("m", "M"):
             self._toggle_debug_mask()
             return True
+        if name in ("r", "R"):
+            self._toggle_recording()
+            return True
         if name in ("o", "O"):
             self._on_open_clicked(self._open_button)
             return True
         return False
+
+    # -- recording (demo video capture) ---------------------------------
+
+    def _maybe_start_recording(self) -> None:
+        """Start ``--record`` once the window is painted and a video plays.
+
+        The recorder taps the GPU video branch and composites it with a UI
+        canvas; both pieces only exist after the window mapped and the video
+        branch was built, so this is retried from ``_tick`` until it succeeds.
+        """
+        if self._closed or self._record_done:
+            return
+        path = self._record_path
+        if path is None or self._recorder is not None or self._record_error:
+            return
+        if not self.get_mapped() or not self.backend.has_media:
+            return
+        if not self.backend.is_playing or not self.backend.video_info:
+            return
+        if self._record_attempts >= 60:
+            self._record_error = "the window never became ready for recording"
+            self._hint(f"Recording unavailable: {self._record_error}")
+            return
+        self._record_attempts += 1
+        if os.environ.get("REC_DEBUG"):
+            print(
+                f"[rec] attempt={self._record_attempts} media={self.backend.has_media} "
+                f"playing={self.backend.is_playing} info={bool(self.backend.video_info)}",
+                flush=True,
+            )
+        # numpy-backed canvas code is imported lazily: the player itself must
+        # stay importable on hosts without numpy.
+        from .capture import CanvasBuilder
+
+        builder = CanvasBuilder(self)
+        builder.add_layer("sidebar", self._sidebar_panel)
+        builder.add_layer("info", self._info_label)
+        builder.add_layer("controls", self._controls_bar)
+        builder.add_layer("hint", self._hint_label)
+        builder.set_video_widget(self._player_overlay)
+        builder.set_backdrop(self._theme_background())
+        if not builder.refresh_background():
+            if os.environ.get("REC_DEBUG"):
+                print(
+                    f"[rec] canvas not ready: size={builder.size} "
+                    f"video_area={builder.video_area}",
+                    flush=True,
+                )
+            return
+        if os.environ.get("REC_DEBUG"):
+            print(
+                f"[rec] canvas {builder.size} video_area={builder.video_area}",
+                flush=True,
+            )
+        from ..recording import fit_rect
+
+        info = self.backend.video_info
+        frame_width = int(info.get("width") or 0)
+        frame_height = int(info.get("height") or 0)
+        area = builder.video_area
+        video_size = None
+        if area is not None and frame_width > 0 and frame_height > 0:
+            fitted = fit_rect(frame_width, frame_height, area)
+            video_size = (fitted.width, fitted.height)
+        try:
+            recorder = self.backend.start_recording(path, builder.size, video_size)
+        except PlaybackError as exc:
+            self._record_failures += 1
+            if os.environ.get("REC_DEBUG"):
+                print(f"[rec] start failed ({self._record_failures}): {exc}", flush=True)
+            if self._record_failures >= RECORD_START_RETRIES:
+                self._record_error = str(exc)
+                self._hint(f"Recording unavailable: {exc}")
+            return
+        self._record_failures = 0
+        self._canvas_builder = builder
+        self._recorder = recorder
+        self._update_record_geometry()
+        if self._record_duration:
+            self._record_deadline = time.monotonic() + float(self._record_duration)
+        self._record_timer_id = GLib.timeout_add(100, self._on_record_tick)
+        if os.environ.get("REC_DEBUG"):
+            print(f"[rec] started {path} canvas={builder.size}", flush=True)
+
+    def _theme_background(self) -> tuple[int, int, int, int]:
+        """Window background colour, used to fill the recording canvas."""
+        try:
+            found, colour = self.get_style_context().lookup_color("window_bg_color")
+            if found:
+                return (
+                    int(round(colour.red * 255)),
+                    int(round(colour.green * 255)),
+                    int(round(colour.blue * 255)),
+                    255,
+                )
+        except (AttributeError, TypeError, ValueError):  # pragma: no cover
+            pass
+        return (0xFA, 0xFA, 0xFA, 255)
+
+    @staticmethod
+    def _save_rgba_png(image, path: str) -> None:
+        """Write an RGBA ``numpy`` canvas to a PNG file (debug aid)."""
+        import numpy as np
+        from gi.repository import GdkPixbuf, GLib
+
+        array = np.ascontiguousarray(image, dtype=np.uint8)
+        height, width = array.shape[0], array.shape[1]
+        data = GLib.Bytes.new(array.tobytes())
+        pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+            data, GdkPixbuf.Colorspace.RGB, True, 8, width, height, width * 4
+        )
+        pixbuf.savev(path, "png", [], [])
+
+    def _update_record_geometry(self) -> None:
+        """Tell the recorder where the video sits inside the window canvas."""
+        builder = self._canvas_builder
+        recorder = self._recorder
+        if builder is None or recorder is None:
+            return
+        area = builder.video_area
+        info = self.backend.video_info
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+        if area is None or width <= 0 or height <= 0:
+            return
+        from ..recording import fit_rect
+
+        recorder.set_video_geometry(fit_rect(width, height, area), (width, height))
+
+    def _on_record_tick(self) -> bool:
+        """Refresh the UI canvas at 10 fps and hand it to the recorder."""
+        self._record_ticks += 1
+        builder = self._canvas_builder
+        recorder = self._recorder
+        if builder is None or recorder is None:
+            self._record_timer_id = 0
+            return False
+        if self._record_deadline and time.monotonic() >= self._record_deadline:
+            self._record_deadline = 0.0
+            self._stop_recording()
+            GLib.idle_add(self.close)
+            return False
+        debug = bool(os.environ.get("REC_DEBUG"))
+        started_at = time.perf_counter()
+        if builder.size != (self.get_width(), self.get_height()):
+            builder.refresh_background()
+            self._update_record_geometry()
+        # Layer capture costs 2-10 ms per widget: the sidebar is big and rarely
+        # changes (3 s), the info line and controls only tick once a second.
+        # The first two seconds are different: the window may still be painting
+        # its first frames, and a widget snapshot of an unpainted widget comes
+        # back blank, so every layer is refreshed until the tree settled.
+        if self._record_ticks <= 20:
+            builder.refresh()
+        else:
+            if self._record_ticks % 30 == 1:
+                builder.refresh(("sidebar",))
+            if self._record_ticks % 10 == 1:
+                builder.refresh(("info", "controls", "hint"))
+        info = self.backend.video_info
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+        faces = self._faces if self._show_faces else ()
+        canvas = builder.compose(faces=faces, frame_size=(width, height))
+        if canvas is not None:
+            recorder.set_canvas(canvas)
+        if debug:
+            self._record_tick_ms += (time.perf_counter() - started_at) * 1000.0
+            if self._record_ticks % 10 == 0:
+                for line in builder.layer_report():
+                    print(f"[rec] layer {line}", flush=True)
+                dump = os.environ.get("REC_DUMP_CANVAS")
+                if dump and canvas is not None:
+                    try:
+                        self._save_rgba_png(canvas, dump)
+                    except Exception as exc:  # pragma: no cover - debug aid
+                        print(f"[rec] canvas dump failed: {exc}", flush=True)
+                value = recorder.stats
+                encoded, pushes, buffers = value() if callable(value) else value
+                print(
+                    f"[rec] enc={encoded} ui={pushes} vid={buffers} "
+                    f"t={self._record_ticks / 10:.0f}s "
+                    f"tick={self._record_tick_ms / 10:.1f}ms",
+                    flush=True,
+                )
+                self._record_tick_ms = 0.0
+        return True
+
+    def _stop_recording(self, *, finished: bool = True) -> None:
+        if self._record_timer_id:
+            GLib.source_remove(self._record_timer_id)
+            self._record_timer_id = 0
+        self._canvas_builder = None
+        self._record_deadline = 0.0
+        self._record_done = finished
+        if self._recorder is not None:
+            self._recorder = None
+            # Finishes the MP4 (EOS + moov atom) while the pipeline lives.
+            self.backend.stop_recording()
+
+    def _toggle_recording(self) -> None:
+        self._record_done = False
+        if self._recorder is not None:
+            path = self._recorder.path
+            self._stop_recording()
+            self._hint(f"Recording saved to {path}")
+            return
+        if self._record_path is None:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            self._record_path = Path.cwd() / f"player-{stamp}.mp4"
+        self._record_error = None
+        self._record_attempts = 0
+        self._record_failures = 0
+        self._record_ticks = 0
+        self._maybe_start_recording()
+
+    def _on_recording_error(self, message: str) -> None:
+        self._record_error = message
+        self._hint(f"Recording stopped: {message}")
+        GLib.idle_add(self._stop_recording)
 
     def capture_snapshot(self, path: Path | str) -> bool:
         """Render the whole window to a PNG file (used by ``--snapshot``).
@@ -830,11 +1082,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return False
         return bool(texture.save_to_png(str(target)))
 
-    def _on_destroy(self, _window: Gtk.Window) -> None:
+    def _on_close_request(self, _window: Gtk.Window) -> bool:
+        if self._closed:
+            return False
+        self._closed = True
+        if os.environ.get("REC_DEBUG"):
+            print("[rec] window closing", flush=True)
+        self._stop_recording()
         if self._timer_id:
             GLib.source_remove(self._timer_id)
             self._timer_id = 0
         self.backend.close()
+        return False
 
 
 class PlayerApplication(Gtk.Application):
@@ -849,6 +1108,8 @@ class PlayerApplication(Gtk.Application):
         fullscreen: bool = False,
         snapshot: Path | None = None,
         snapshot_delay: float = 3.0,
+        record: Path | None = None,
+        record_duration: float | None = None,
     ) -> None:
         # Non-unique: the demo may be launched from SSH and the desktop at
         # once, and D-Bus name registration is unreliable in remote sessions.
@@ -861,6 +1122,8 @@ class PlayerApplication(Gtk.Application):
         self._fullscreen = fullscreen
         self._snapshot = snapshot
         self._snapshot_delay = max(0.5, float(snapshot_delay))
+        self._record = record
+        self._record_duration = record_duration
         self._snapshot_attempts = 0
         self._window: PlayerWindow | None = None
 
@@ -879,6 +1142,8 @@ class PlayerApplication(Gtk.Application):
                 self._media,
                 demo=self._demo,
                 fullscreen=self._fullscreen,
+                record=self._record,
+                record_duration=self._record_duration,
             )
         self._window.present()
         if self._snapshot is not None:
@@ -905,9 +1170,9 @@ class PlayerApplication(Gtk.Application):
         else:
             print("error: window snapshot failed", file=sys.stderr)
         if window is not None:
-            # Destroy the window first so the GStreamer (GL) pipeline is torn
+            # Close the window first so the GStreamer (GL) pipeline is torn
             # down while GTK is still alive; quitting first can crash on exit.
-            window.destroy()
+            window.close()
         self.quit()
         return False
 
@@ -920,6 +1185,8 @@ def run_window(
     fullscreen: bool = False,
     snapshot: Path | None = None,
     snapshot_delay: float = 3.0,
+    record: Path | None = None,
+    record_duration: float | None = None,
 ) -> int:  # pragma: no cover - needs a display
     """Open the GTK window and block until it closes; returns the exit code."""
     # The detection worker runs numpy/OpenCV decoding in a Python thread; a
@@ -933,6 +1200,8 @@ def run_window(
         fullscreen=fullscreen,
         snapshot=snapshot,
         snapshot_delay=snapshot_delay,
+        record=record,
+        record_duration=record_duration,
     )
     code = application.run([])
     sys.stdout.flush()
