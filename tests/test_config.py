@@ -27,6 +27,9 @@ def test_defaults_are_valid_and_match_example_file() -> None:
     assert config.detection.core_mask == 0
     assert config.detection.model_path == "models/yunet_rk3576.rknn"
     assert config.detection.interval_frames == 3
+    assert config.detection.hold_ms == 600
+    assert config.beauty.face_slim == 0.0
+    assert config.beauty.eye_enlarge == 0.0
 
     # The shipped example file is the documented defaults.
     example = Config.load()
@@ -45,8 +48,19 @@ def test_values_are_clamped_to_safe_ranges() -> None:
     config = Config.from_dict(
         {
             "player": {"volume": 250, "speed": 3.5, "texture_max_dimension": 99999},
-            "beauty": {"smoothing": -20, "whitening": 180, "feather_px": 500},
-            "detection": {"interval_frames": 0, "max_faces": 99, "min_score": 1.5},
+            "beauty": {
+                "smoothing": -20,
+                "whitening": 180,
+                "feather_px": 500,
+                "face_slim": 150,
+                "eye_enlarge": -5,
+            },
+            "detection": {
+                "interval_frames": 0,
+                "max_faces": 99,
+                "min_score": 1.5,
+                "hold_ms": 99999,
+            },
             "debug": {"fps_window": 10000},
         }
     )
@@ -59,6 +73,9 @@ def test_values_are_clamped_to_safe_ranges() -> None:
     assert config.detection.interval_frames == 1
     assert config.detection.max_faces == 8
     assert config.detection.min_score == 1.0
+    assert config.detection.hold_ms == 5000
+    assert config.beauty.face_slim == 100.0
+    assert config.beauty.eye_enlarge == 0.0
     assert config.debug.fps_window == 600
 
 
@@ -108,3 +125,14 @@ def test_missing_explicit_file_reports_config_error(tmp_path) -> None:
 def test_to_dict_is_json_serialisable() -> None:
     text = json.dumps(Config.load().to_dict())
     assert '"smoothing": 60' in text
+
+
+def test_experimental_beauty_rounds_to_one_decimal() -> None:
+    config = Config.from_dict({"beauty": {"face_slim": 33.33, "eye_enlarge": 66.66}})
+    assert config.beauty.face_slim == 33.3
+    assert config.beauty.eye_enlarge == 66.7
+
+
+def test_hold_ms_must_be_a_number() -> None:
+    with pytest.raises(ConfigError, match="hold_ms"):
+        Config.from_dict({"detection": {"hold_ms": "soon"}})

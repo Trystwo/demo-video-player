@@ -1,11 +1,12 @@
-# 视频播放器架构设计（M1 播放 + M2 检测 + M3 GPU 美颜实现版）
+# 视频播放器架构设计（M1–M5：播放、检测、GPU 美颜、录制与实验性 warp）
 
-> 状态：M1 硬解播放、M2 NPU 人脸检测、M3 GPU 美颜与对比模式均已实现并在板端验证：
-> 1080p30 播放稳定 30 fps；磨皮/美白在 Mali GPU 的单个 `glshader` 内完成
-> （单帧 0.8–1.6 ms，相对纯播放的 CPU 增量约 +1–2 个百分点）；人脸遮罩由 NPU
-> 检测框光栅化，分屏对比在同一帧、同一次 pass 内完成。证据见
-> `docs/evidence/m3-*.png`，实测数据见 [BOARD.md](BOARD.md) §5.2，
-> 范围变更同步到 [PRD.md](PRD.md)。
+> 状态：M1 硬解播放、M2 NPU 人脸检测、M3 GPU 美颜与对比模式、M4 录制与交付打磨、
+> M5 检测保持与实验性瘦脸/大眼 warp 均已实现并在板端验证：1080p30 播放稳定 30 fps；
+> 磨皮/美白在 Mali GPU 的单个 `glshader` 内完成（M3 单帧 0.8–1.6 ms，相对纯播放的
+> CPU 增量约 +1–2 个百分点）；人脸遮罩由 NPU 检测框光栅化，分屏对比在同一帧、
+> 同一次 pass 内完成。证据见 `docs/evidence/m3-*.png`，实测数据见
+> [BOARD.md](BOARD.md) §5.2，范围变更同步到 [PRD.md](PRD.md)；M5 的检测保持与
+> warp 实测见 §7。
 
 ## 1. 目标与约束
 
@@ -49,17 +50,18 @@ filesrc → qtdemux/matroskademux/tsdemux
   `mppvideodec ! gtk4paintablesink` 在板端协商失败（not-negotiated），
   所以先经 GL 上传，再以 `GLMemory` RGBA 提交。
 
-### 2.1 M3 美颜元素（已实现，`glshader` 单 pass）
+### 2.1 美颜元素（M3 颜色美颜 + M5 几何 warp，`glshader` 单 pass）
 
 - 美颜不新增自定义 GStreamer 元素，而是一个 `glshader`（元素名 `video-beauty`），
   插在 GL 转换链尾部、`fpsdisplaysink` 之前。顶点阶段使用元素内建的
   `a_position`/`a_texcoord`/`u_matrix`（已板端验证，无需自写顶点 shader）；
   片元阶段是 `beauty.BEAUTY_FRAGMENT_SHADER`。
 - **不需要第二张蒙版纹理**：所有参数（最多 3 组人脸框、磨皮/美白强度、羽化像素、
-  向外扩张比例、肤色门限、分屏位置、调试开关）都以 scalar `G_TYPE_FLOAT`
-  uniform 传入，遮罩在片元里由「圆角矩形 SDF + `smoothstep` 羽化」光栅化，
-  再乘 YCbCr 肤色权重，避免把 CPU 生成的 mask 位图上传成纹理（也规避了
-  `glshader` 只有一个采样器输入的约束）。uniform 清单：
+  向外扩张比例、肤色门限、分屏位置、调试开关，以及 M5 的主脸中心/双眼/下颌
+  控制点与 warp 强度）都以 scalar `G_TYPE_FLOAT` uniform 传入，遮罩在片元里由
+  「圆角矩形 SDF + `smoothstep` 羽化」光栅化，再乘 YCbCr 肤色权重，避免把 CPU
+  生成的 mask 位图上传成纹理（也规避了 `glshader` 只有一个采样器输入的约束）。
+  uniform 清单：
 
   | uniform | 含义 |
   |---------|------|
@@ -71,13 +73,29 @@ filesrc → qtdemux/matroskademux/tsdemux
   | `u_skin` | 肤色门限权重（保护眼睛/眉毛/发际线） |
   | `u_compare`, `u_split` | 分屏开关与分割位置（0–1，画面宽度比例） |
   | `u_debug` | 输出遮罩灰度预览 |
-  | `u_active` | 无脸 / 关闭 / 参数为恒等时置 0，片元直接透传，不采样邻域 |
+  | `u_active` | 美颜关闭或参数为恒等时置 0，片元直接透传，不采样邻域 |
+  | `u_slim`, `u_eyes` | M5 实验性瘦脸/大眼强度 0–1（0 = 关闭，与 M4 等价） |
+  | `u_warp_ready`, `u_warp_cx/cy` | M5 主脸 warp 开关、主脸中心（纹理 UV） |
+  | `u_warp_lx0/ly0/lx1/ly1` | M5 双眼中心（纹理 UV，大眼向眼心采样） |
+  | `u_warp_jx0/jy0/jx1/jy1` | M5 左右下颌控制点（纹理 UV，瘦脸向脸外采样） |
+  | `u_warp_eye_r`, `u_warp_slim_r`, `u_warp_face_w` | M5 大眼/瘦脸作用半径与主脸脸宽（归一化 UV） |
+
+  以上 scalar uniform 共 **41 个 `G_TYPE_FLOAT`**（M3 的 25 个 + M5 新增 16 个；
+  `tex` 是采样器，不计入）。
 
 - 磨皮是 8 邻域双边近似（9 tap）：空间权重随 `u_smoothing` 放大半径
   （1.5–8.5 px），值域权重抑制跨边缘混合，因此皱纹被平滑而睫毛/发丝等强边缘保留；
   美白向白点插值并回补饱和度（`1 - 0.18*amount`），避免提亮后发灰。
-- **无脸时段整条链路透传**（`u_active=0`），不产生采样与混合开销；检测关闭或
-  模型不可用时同样透传，播放不受影响。
+- **检测保持（M5，消除美颜闪烁）**：10 Hz 检测在快速运动或检测条件不佳的素材上
+  会偶发 `raw=0` 的空档，M4 及更早版本每个空档都会清空人脸框与关键点，表现为美颜
+  周期性闪断。M5 在 backend 里维护最近一次结果与时间戳，空档未超过
+  `detection.hold_ms`（默认 600）时继续 dispatch 上一次的 faces 并标记
+  `held=True`（UI 人脸框同步保持，不再闪断）；5 点关键点做 EMA
+  （`alpha=0.35`，点数≠5 或中心跳变 >0.3×脸宽时重置），warp 控制点因此不抖。
+  v2 成片中最明显的周期性美颜闪烁（01 近景素材可复现，空档 6 次）在 v3 中降为 0。
+- **无脸/超时段落透传**：无脸超过 hold 窗口或检测关闭、模型不可用时，shader 的
+  人脸遮罩为 0（`u_face*=0`），输出原像素，不产生采样与混合开销；美颜关闭或参数
+  为恒等时 `u_active=0` 直接透传。播放不受影响。
 - 坐标系：`mppvideodec` 输出未旋转帧，屏幕旋转由 sink 按 `image-orientation`
   tag 完成；检测线程先把 BGR 旋转到屏幕方向再送 YuNet，所以检测框在「显示
   坐标系」，写 uniform 前经 `beauty.face_rect_to_texture()` 反向旋转回纹理
@@ -182,22 +200,59 @@ mp4mux → filesink`，队列 `leaky=0` / `max-size-buffers=8`（宁可阻塞也
 并被写进录制文件（`ffprobe` 可见 `rotation=-180`），所以纯视频录制**不能再对像素
 做翻转**——否则播放器会把矩阵和像素各转一次，录制文件看起来上下颠倒。
 
+### 2.5 实验性美颜：瘦脸 / 大眼（关键点 warp，M5）
+
+M5 在 M3 颜色美颜（磨皮/美白）之外加了一组**几何形变**：瘦脸收窄下颌线、大眼放大
+眼睛。两者共用 YuNet 的 5 点关键点，默认 `face_slim=0`、`eye_enlarge=0`，即默认与
+M4 完全等价，只有把滑杆调离 0 才启用。
+
+- **关键点 → 纹理坐标**：YuNet 输出右眼、左眼、鼻尖、右嘴角、左嘴角 5 点（显示
+  坐标系，检测线程已按 display matrix 旋正）。`beauty.point_to_texture()` 按
+  0/90/180/270 做与 `face_rect_to_texture()` 一致的逆映射，把点换算到 shader 的
+  纹理 UV，四个方向均有单测。
+- **几何注入**：`beauty.warp_uniforms()` 由 5 点 + 主脸框生成 16 个 warp uniform：
+  主脸中心、双眼中心、左右下颌控制点、大眼/瘦脸作用半径与脸宽。下颌控制点取
+  「眼中心与同侧嘴角中点，沿远离脸中心方向外移 0.18×脸宽、下移 0.30×脸高」；
+  半径 `eye_r = 0.16×脸宽`、`slim_r = 0.26×脸宽`；所有值 clamp 到 [0,1]。5 点缺失、
+  点数≠5 或框退化时 `u_warp_ready=0` 且全部归零——不做半套 warp，避免关键点补齐
+  时跳变。
+- **shader 反向 warp**：片元按输出像素的 UV 反算采样点——大眼在眼心附近把采样点
+  向眼心收（`-delta × 0.40 × u_eyes`，眼睛内容被放大），瘦脸在下颌把采样点向脸外
+  推（`+side × 0.065 × 脸宽 × u_slim`，轮廓内容向内收）。衰减为
+  `falloff = 1 - smoothstep(0, radius, |delta|)`；总位移再乘
+  `warp_gate = 主脸 mask × 肤色门限`，因此背景、头发、衣服与眼镜框不动；最终
+  `clamp(uv, 0, 1)` 防越界采样。
+- **执行顺序**：先用 warp 后的 UV 采样 base，遮罩/肤色仍用未 warp 的像素坐标计算，
+  磨皮在 warp 后的采样上做；分屏对比（F9）左半依然输出未 warp 的原图。
+- **UI / 配置 / 演示约束**：侧栏「实验性 / Experimental」折叠面板（默认折叠）内是
+  两个 0–100 滑杆，实时生效；配置项 `beauty.face_slim`、`beauty.eye_enlarge`
+  （float，默认 0）。演示配置必须 `detection.max_faces=1`：素材背景里还有第二张
+  脸，多脸时背景人脸也会被磨皮遮罩覆盖。warp 只作用主脸——backend 用
+  `face.primary_face()` 按面积取最大者并排到 `u_face0`，不依赖检测器返回顺序。
+- **常量与调参**：大眼位移常量 `EYE_MAGNIFY=0.40`、瘦脸 `SLIM_PUSH=0.065`
+  （shader 内联，NumPy 参考实现 `tests/test_beauty_warp.py` 使用同名常量）。初版
+  取 0.35 / 0.05 时，同源 A/B 帧差 YAVG=1.59、PSNR 35.3 dB，用户级不可辨；上调后
+  成片中瘦脸与大眼可辨，未观察到背景/头发位移或眼镜框变形。
+- **性能**：warp 只改采样坐标、不增加采样次数；美颜+检测时 `beauty_ms`
+  0.86–0.87 → 0.86–0.96（瘦脸/大眼=100），增量 ≤0.1 ms，fps 仍 30.0（见 §7）。
+
 ## 3. 模块划分
 
 | 文件 | 职责 | 状态 |
 |------|------|------|
 | `src/video_player/app.py` | 命令行入口、`--check`、启动 GTK | 可用 |
-| `src/video_player/config.py` | 配置数据类、严格校验与钳位、读写 JSON | 可用（单测覆盖，M3 新增 texture_max_dimension / split / skin_guard 等） |
+| `src/video_player/config.py` | 配置数据类、严格校验与钳位、读写 JSON | 可用（单测覆盖，M3 新增 texture_max_dimension / split / skin_guard 等，M5 新增 face_slim / eye_enlarge / hold_ms） |
 | `src/video_player/envcheck.py` | 板端/开发主机环境自检、报告格式化 | 可用（单测覆盖） |
 | `src/video_player/pipeline.py` | 容器/caps → demux/parser/decoder 选择、URI 工具 | M1 已实现（单测覆盖） |
-| `src/video_player/backend.py` | GStreamer 播放后端：构建管线（含 GL 预缩放与美颜）、状态/seek/音量/fps/快照/uniforms 推送 | M1–M3 可用（板端 30fps） |
+| `src/video_player/backend.py` | GStreamer 播放后端：构建管线（含 GL 预缩放与美颜）、状态/seek/音量/fps/快照/uniforms 推送 | M1–M3 可用（板端 30fps）；M5 加检测保持（`hold_ms` + 关键点 EMA）与主脸排序 |
 | `src/video_player/playlist.py` | 媒体参数展开、播放列表模型 | 可用（单测覆盖） |
-| `src/video_player/face.py` | `Face`、`DetectionResult`、`RknnFaceDetector`（ctypes 调 librknnrt） | M2 已实现（10 Hz 采样） |
+| `src/video_player/face.py` | `Face`、`DetectionResult`、`RknnFaceDetector`（ctypes 调 librknnrt） | M2 已实现（10 Hz 采样）；M5 加 `primary_face` / `smooth_landmarks` / `held` 标记 |
 | `src/video_player/face_yunet.py` | YuNet 后处理：按 stride 解码、NMS、映射回帧坐标 | M2 已实现（单测覆盖） |
 | `src/video_player/rknn_runtime.py` | `librknnrt.so` 的最小 ctypes 封装（init/query/inputs/run/outputs/release） | M2 已实现 |
-| `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程、NPU 起播预热 | M2 已实现（M3 加真实尺寸预热） |
-| `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖） |
-| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志 | M1–M3 已接线（板端验证） |
+| `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程、NPU 起播预热（在 pipeline PLAYING 前、主线程执行） | M2 已实现；M3 加真实尺寸预热；2026-11-18 从 `start()` 移到 `prepare()`，避免 streaming thread 上 RKNN `std::bad_alloc` |
+| `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖）；M5 加 16 个 warp uniform、`point_to_texture`、`warp_uniforms` 与实验性瘦脸/大眼（单测覆盖） |
+| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、中英文切换、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志 | M1–M3 已接线（板端验证）；中英文切换已板端点击验证；M5 加「实验性」折叠面板（瘦脸/大眼滑杆） |
+| `src/video_player/i18n.py` | 中英文文案表、`--lang`/按钮切换、XDG 语言偏好持久化（默认中文，按钮显示目标语言） | 新增；单测覆盖，板端已验证 |
 | `src/video_player/ui/capture.py` | 逐 widget 快照（`Gtk.WidgetPaintable`→`render_texture`→pixbuf）与 `CanvasBuilder` 画布合成（缓存 base、分层刷新、人脸框） | M3 收尾新增（录制用） |
 | `src/video_player/recording.py` | 录制分支：`glvideomixer` 合成视频 + UI 画布（`--record`），以及演示素材用的纯视频模式（`video_only=True`，无合成器）；`mpph264enc`/`mp4mux` 输出，EOS 收尾与统计 | M3 收尾新增，M4 收尾加纯视频模式（板端 30 fps 验证） |
 | `scripts/launch_player.py` | 桌面入口包装脚本（原样透传参数） | 可用（M3 修复 `--snapshot` 被吞） |
@@ -206,13 +261,13 @@ mp4mux → filesink`，队列 `leaky=0` / `max-size-buffers=8`（宁可阻塞也
 | `scripts/convert_yunet.py` | x86 侧 ONNX→RKNN 转换（rk3576，fp16，mean 0/std 1） | 可用（1,084,515B 模型） |
 | `scripts/measure_tap.py` | 板端 headless 检测吞吐测量（`fakesink sync=true`） | 可用（M2 实测工具） |
 | `scripts/probe_board.py` | 环境报告导出（文本/JSON/Markdown） | 可用 |
-| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制 单测 | 108 passed, 12 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 44 passed） |
+| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制/中英文/检测保持/warp 单测 | 149 passed, 15 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 44 passed） |
 
 ## 4. 线程模型
 
 | 线程 | 职责 | 注意 |
 |------|------|------|
-| GStreamer streaming thread | 解码、GL 上传/转换/预缩放、美颜 shader、sink 提交 | 不做阻塞调用；检测只投递请求；shader 只读 uniform |
+| GStreamer streaming thread | 解码、GL 上传/转换/预缩放、美颜 shader、sink 提交 | 不做阻塞调用；检测只投递请求；shader 只读 uniform；**不要在这里做 RKNN 预热**（见 §9 第 9 条） |
 | NPU 工作线程 | RKNN 推理 + 锚点解码 + NMS | 队列深度 1，忙时丢帧不排队，避免延迟累积 |
 | GLib 主循环 | GTK UI、进度/音量同步、信息面板刷新、uniforms 推送 | UI 只读共享状态，不直接阻塞等 NPU |
 
@@ -264,15 +319,19 @@ CPU 侧只保留：检测输入的 640×640 RGB（由 pad probe 抽帧）、UI �
 - `player`：硬解开关、渲染 sink、色彩转换路径（`video_convert`：
   `auto`/`gl`/`sw`）、音量、倍速、断点续播、**`texture_max_dimension`**
   （GL 纹理长边上限，默认 1280，0 = 不预缩放）；
-- `beauty`：开关、磨皮/美白强度（0–100 → 0–1）、对比模式、羽化像素、
-  **`expand`**（人脸框外扩 0–1，默认 0.12）、**`skin_guard`**（肤色门限，
-  默认 true）、**`split`**（分屏位置 0.05–0.95，默认 0.5）、
-  **`debug_mask`**（遮罩预览，默认 false）；
-- `detection`：模型路径、检测间隔帧数、最大人脸数、分数阈值、跟踪补帧；
+- `beauty`：开关、磨皮/美白强度（0–100 → 0–1）、**`face_slim`** / **`eye_enlarge`**
+  （M5 实验性瘦脸/大眼 warp 强度，float 0–100，默认 0 = 与 M4 完全等价；按 0.1
+  取整）、对比模式、羽化像素、**`expand`**（人脸框外扩 0–1，默认 0.12）、
+  **`skin_guard`**（肤色门限，默认 true）、**`split`**（分屏位置 0.05–0.95，
+  默认 0.5）、**`debug_mask`**（遮罩预览，默认 false）；
+- `detection`：模型路径、检测间隔帧数、最大人脸数、分数阈值、跟踪补帧、
+  **`hold_ms`**（检测空档保持窗口 0–5000 ms，默认 600；0 = 关闭保持、无脸立即
+  清空，即 M4 行为）；
 - `debug`：信息面板、fps 统计窗口、日志级别。
 
 加载时做类型校验和范围钳位（如音量 0–100、倍速 0.5–2.0、间隔 1–10、
-`split` 0.05–0.95、`texture_max_dimension` 0–8192），未知字段直接报错
+`split` 0.05–0.95、`texture_max_dimension` 0–8192、`face_slim`/`eye_enlarge`
+0–100、`hold_ms` 0–5000），未知字段直接报错
 （见 `ConfigError`），避免手改配置静默失效。
 
 ## 7. 性能预算（1080p30，33.3 ms/帧）
@@ -340,6 +399,21 @@ M4 实测（板端 2026-11-18）：
 `glvideomixer`(2 pad) → `GL RGBA` → 读回 → 编码 36 fps。因此录制链故意保留 RGBA 到
 `gldownload`，由 `mpph264enc` 直接吃 RGBA（NV12 的 GL 转换是主要慢点）。
 
+M5 实测（板端 2026-11-18，同一台板卡；素材 `07_wechat_selfie_h265.mp4`，HEVC
+1920×1080@30、37.65 s；`perfdbg.py` patch `start_recording` 后采样
+`measured_fps()` / `beauty_ms`）：
+
+| 场景 | fps | `beauty_ms` | 说明 |
+|------|-----|-------------|------|
+| 美颜 + 检测 | 30.0 | 0.86–0.87 | 基线（检测保持开启） |
+| 美颜、检测关 | 30.0 | 0.64–1.20 | 无 NPU 线程与保持逻辑 |
+| 美颜关 | 30.0 | 0.87–1.77 | 透传仍有元素开销 |
+| 美颜 + 检测 + 瘦脸/大眼 = 100 | 30.0 | 0.86–0.96 | warp 增量 ≤0.1 ms |
+
+结论：warp 只改采样坐标、不增加采样次数；检测保持与关键点 EMA 只在 10 Hz 检测
+回调里维护状态（GLib 主线程），不进入流线程。M5 的 fps 与 M4 持平（30.0），A2 的
+余量不变。
+
 ## 8. 失败与降级策略
 
 | 失败点 | 表现 | 降级 |
@@ -347,6 +421,7 @@ M4 实测（板端 2026-11-18）：
 | NPU/模型不可用 | 检测器初始化失败（如模型文件缺失） | 已实现：检测关闭，信息行显示 `NPU: off`，硬解播放与美颜透传不受影响 |
 | `glshader` 缺失或 shader 编译失败 | 建元素/设 `fragment` 失败 | 已实现：美颜禁用、开关置灰，信息行显示 `beauty: unavailable`，播放继续（M3） |
 | `glcolorscale` 缺失 | 无法预缩放纹理 | 已实现：跳过该级，全尺寸纹理提交；效果不变，窄窗口下 CPU 偏高（M3） |
+| 关键点缺失或退化（无脸、点数≠5、框过小） | 实验性瘦脸/大眼无法定位控制点 | 已实现：`u_warp_ready=0` 时 warp 原样透传，磨皮/美白与播放不受影响（M5） |
 | GL/dmabuf 不可用 | 上传/纹理链路报错 | RGA 转换 + CPU 上传，必要时降到 720p |
 | `gtk4paintablesink` 缺失 | 无法嵌入 GTK 窗口 | `waylandsink` 独立全屏窗口（F9 对比仍可用） |
 | `glupload`/`glcolorconvert` 缺失 | `video_convert=gl` 报错 | `auto` 回落 `videoconvert`（1080p 约 15 fps，信息面板暴露真实值）；`sw` 路径下美颜自动禁用 |
@@ -384,6 +459,16 @@ M1 的退出崩溃修复（先销毁窗口/管线，`run_window` 末尾 `os._exi
    其中 `extract_dup` 抽一帧 1080p NV12 实测 17–33 ms（10 Hz 即约 0.18 核），
    远超旧注释的 ~3 ms。若 A2 的 CPU 目标需要严格覆盖 demo 全开场景，优先从
    RGA 直通 / NV12 预缩放 / 降低检测频率入手。
+9. **已定（2026-11-18）**：NPU 起播预热必须在 pipeline PLAYING 前、主线程的
+   `FaceDetectionTap.prepare()` 里完成。把它放在 `start()`（由 pad-added 在
+   GStreamer streaming thread 调用）时，1080p 零帧推理会让 librknnrt 在
+   `rknn_inputs_set` 抛 C++ `std::bad_alloc`，进程直接 SIGABRT；Python 的
+   `except Exception` 兜不住 C++ 异常。
+10. **新增（M5）**：检测保持只桥接 `< detection.hold_ms`（默认 600 ms）的检测空档；
+   01 近景素材的空档从 6 次降到 0，但检测极差的 03 病态素材仍会从 15 次残留 6 次
+   （>600 ms 无脸的时段仍会闪断），彻底解决需要跟踪器或提高检测频率。实验性 warp
+   依赖 YuNet 5 点关键点质量，远距离小脸/大角度侧脸时控制点会漂移；功能默认关闭，
+   不影响 P0 验收。
 
 ## 10. 目录结构
 

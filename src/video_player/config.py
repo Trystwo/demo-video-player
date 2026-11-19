@@ -129,6 +129,10 @@ class BeautyConfig:
     enabled: bool = True
     smoothing: int = 60
     whitening: int = 40
+    #: Experimental geometric effects (M5).  Both use the same 0-100 scale as the
+    #: colour effects but deform the face instead of filtering it; 0 means off.
+    face_slim: float = 0.0
+    eye_enlarge: float = 0.0
     compare_mode: bool = False
     feather_px: int = 24
     expand: float = 0.12
@@ -140,6 +144,12 @@ class BeautyConfig:
         self.enabled = _as_bool(self.enabled, name="beauty.enabled")
         self.smoothing = int(_clamp(_as_int(self.smoothing, name="beauty.smoothing"), 0, 100))
         self.whitening = int(_clamp(_as_int(self.whitening, name="beauty.whitening"), 0, 100))
+        self.face_slim = round(
+            _clamp(_as_float(self.face_slim, name="beauty.face_slim"), 0.0, 100.0), 1
+        )
+        self.eye_enlarge = round(
+            _clamp(_as_float(self.eye_enlarge, name="beauty.eye_enlarge"), 0.0, 100.0), 1
+        )
         self.compare_mode = _as_bool(self.compare_mode, name="beauty.compare_mode")
         self.feather_px = int(_clamp(_as_int(self.feather_px, name="beauty.feather_px"), 0, 64))
         self.expand = round(
@@ -161,6 +171,13 @@ class DetectionConfig:
     min_score: float = 0.5
     track_fill: bool = True
     core_mask: int = 0
+    #: How long the last face/mask is kept when one detection comes back empty.
+    #: The NPU runs every ``interval_frames`` (about 10 Hz at 1080p30); a single
+    #: empty result used to drop the mask for a frame, and the shader snapping
+    #: back to a pass-through for one frame reads as a visible flicker.  Holding
+    #: the previous faces for a few hundred ms bridges those results; 0 disables
+    #: the hold and restores the old strict behaviour.
+    hold_ms: int = 600
 
     def validate(self) -> None:
         self.enabled = _as_bool(self.enabled, name="detection.enabled")
@@ -177,6 +194,9 @@ class DetectionConfig:
         self.track_fill = _as_bool(self.track_fill, name="detection.track_fill")
         self.core_mask = int(
             _clamp(_as_int(self.core_mask, name="detection.core_mask"), 0, 3)
+        )
+        self.hold_ms = int(
+            _clamp(_as_int(self.hold_ms, name="detection.hold_ms"), 0, 5000)
         )
 
 

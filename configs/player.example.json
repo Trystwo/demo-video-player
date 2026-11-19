@@ -13,6 +13,8 @@
     "enabled": true,
     "smoothing": 60,
     "whitening": 40,
+    "face_slim": 0.0,
+    "eye_enlarge": 0.0,
     "compare_mode": false,
     "feather_px": 24,
     "expand": 0.12,
@@ -27,7 +29,8 @@
     "max_faces": 3,
     "min_score": 0.5,
     "track_fill": true,
-    "core_mask": 0
+    "core_mask": 0,
+    "hold_ms": 600
   },
   "debug": {
     "show_info_panel": true,

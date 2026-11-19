@@ -112,7 +112,7 @@ bash scripts/bench_board.sh
 - 预期缺失（板端才有）：`mppvideodec`、`mpph264enc`、`waylandsink`、
   `gtk4paintablesink`、`librknnrt.so`、`librga.so`、RKNN 模型
 
-### 5.2 目标板实测（M1–M2 已回填）
+### 5.2 目标板实测（M1–M5 已回填）
 
 | 日期 | 项目 | 结果 | 备注 |
 |------|------|------|------|
@@ -137,6 +137,7 @@ bash scripts/bench_board.sh
 | 2026-11-17 | M3 demo 全开（美颜+检测+强制分屏） | 全屏 1280×800：30.0fps、CPU 117–131%、NPU 37.8–41.2 ms、beauty 1.1–1.5 ms；关美颜 112–121% | 增量主要来自 M2 检测（约 85pp） |
 | 2026-11-18 | M1 A1 H.265 1080p30 硬解（补测） | `user-selfie-1080p30.mp4`（HEVC 1080p30、158MB/92.7s、rotate-180）经 `h265parse`+`mppvideodec` 硬解；demo 全开（美颜+检测+分屏）30.0 fps、`drop=0.000%`、NPU 43.0 ms、beauty 1.1 ms、画面正立且人脸框/蒙版对齐 | A1 的 H.264/H.265 均已达标；快照 `docs/evidence/m3-h265-selfie-demo.png` |
 | 2026-11-18 | M3 fps 读数修正（旧「掉速」证伪） | 界面/PERF 的「周期性 20–25 fps 掉速」不存在：同步采集瞬时 fps、累计平均值与墙钟帧率，全程 `sig_fps 28.9–31`、`drop=0.000%`、墙钟 30.0 帧/s；21–25 是 `fpsdisplaysink` 的 `average_fps`（累计平均，起播丢帧后要几十秒才爬回）+ PERF 采样早于 UI 校正 | 改用 `measured_fps()`（1.5 s 滑窗到达率）；`_maybe_log_perf()` 移到 `_tick()` 末尾；原「检测路径阻塞 sink」归因证伪 |
+| 2026-11-18 | M3 预热位置回归（std::bad_alloc） | 模型 `yunet_rk3576.rknn` 就位后，1080p 自拍 + 检测启动在 `start()`（pad-added / streaming thread）执行 1080p 零帧预热，`rknn_inputs_set` 抛 C++ `std::bad_alloc`，进程 SIGABRT；同素材关检测正常 | 预热移到 `prepare()`：pipeline PLAYING 前、主线程完成；板端复测 NPU 1 脸 46.4ms、beauty 1.5ms、快照成功 |
 | 2026-11-18 | M3 起播丢帧根因（检测开） | 首个真实帧 RKNN 推理 **2.38–2.43 s**（之后 38–41 ms/帧），worker 忙这一秒多导致起播丢约 50% 帧；640×640 零图预热仅 30.9 ms 且**不覆盖大尺寸路径**（首真实帧仍 2.4 s）；另测得 `extract_dup` 1080p NV12 稳定 17–33 ms/次 | 修复：`FaceDetectionTap.start()` 用真实解码尺寸零帧预热（`warmup_frame_sizes()`，90/270 额外预热交换尺寸 ≈35 ms）；复测 cfg_det_only / cfg_faceon / demo 三组 `drop=0.000%`、fps 30.0 全程 |
 | 2026-11-17 | M3 检测线程 CPU 归因 | `/proc/PID/task` 采样（总 CPU 115.2%）：主线程 27.3%、demux:sink 27.6%、video-decoder 15.0%、gstglcontext 11.3%；headless `measure_tap.py` 30.0fps、10 次/s、37.5 ms | M2 遗留成本，M3 未改动 |
 | 2026-11-17 | M3 旋转（90/270/180） | `ffmpeg -display_rotation` 素材 + 四色标记图：tag `rotate-270/rotate-90/rotate-180` 与显示方向自洽；180° 自拍素材人脸框与遮罩对齐 | `face_rect_to_texture()` 反向映射正确（单测覆盖 0/90/180/270） |
@@ -147,6 +148,10 @@ bash scripts/bench_board.sh
 | 2026-11-18 | 录制模式拍摄演示素材 | `docs/demo-video/shoot.sh`（7 段：分屏/强度/关美颜/双人/遮罩/无人脸/自拍 H.265），每段 `--record-duration` 定时自动收尾 | 每段可播放、`nb_frames≈30×时长` | 7/7 成功（13.07/8.47/9.73/8.00/12.33/8.27/10.83s）；首轮 4 段缺 moov 用重试兜住；自拍 180° 录制需在录制链加 `glvideoflip`（已实现） |
 | 2026-11-18 | M4 A5 1 h 长跑 | 板端 pid 42428：`--config /tmp/cfg_faceon.json /home/tris/soak_1h.mp4`（1080p30 循环播放 60 min，检测+美颜开），PERF 每秒 + 每分钟 RSS/线程/fd 采样；脚本 `.cache/a5/analyze.py` | ✅ 3549 个样本：t≥300 s 共 3250 个，均值 **30.06 fps**（min 24.5 / max 30.7），仅 7 个 <29.5、2 个 <25，且全部落在 t=1165–1170 s —— 当时我在板端并行部署/构建成片（NPU 同步飙到 117 ms）的外部负载窗口；最后 600 s 全部 ≥30.0 fps（均值 30.07）。RSS 330,664→335,548 kB（+4.8 MB/h）、threads 29–32、fds 74–79 无增长，播放结束自动退出（`app exited at t=3600s`） | A5 通过：无帧率衰减、无内存/句柄泄漏 |
 | 2026-11-18 | M4 A4 正脸/侧脸/多人检出 | 固定素材逐条：单人 `docs/evidence/m2-ui-detect.png`、双人 `m2-ui-two-faces.png`、三人素材（Pexels 帧合成的 1080p30 8 s 片段：青年正脸 + 银发女士近景 + 访谈男子微侧）`/home/tris/demo-footage/06_three_faces.mp4`，demo 运行 `faces=3`、NPU 39.8–41.5 ms、fps 30.0 | ✅ A4 通过（1/2/3 脸 + 微侧脸），证据 `docs/evidence/a4-three-faces.png`、`a4-three-masks.png`（三脸遮罩预览） |
+| 2026-11-18 | M5 检测保持（`detection.hold_ms`） | 01 近景 1080p H.264（复现 v2 闪烁）：`hold_ms=600` 时 129 次检测中 raw=0 共 12 次、美颜空档 **0** 次；`hold_ms=0` 时同样 raw=0 12 次 → 空档 **6** 次。07 微信自拍（v3 唯一源）`hold=600`：167 次检测、raw=0 **0**、空档 **0**。病态素材 03 空档 15→6 | 空档=相邻两次检测结果之间 faces 为空的次数；v2 闪烁根因是空档帧 `u_active=0` 整段透传；>600 ms 无脸的极差素材仍会残留空档（已知限制） |
+| 2026-11-18 | M5 实验性 warp 性能（瘦脸/大眼） | 美颜+检测：30.0 fps / beauty 0.86–0.87 ms；美颜无检测：30.0 fps / 0.64–1.20 ms；美颜关：30.0 fps / 0.87–1.77 ms；美颜+检测+瘦脸/大眼=100：30.0 fps / 0.86–0.96 ms（warp 增量 ≤0.1 ms） | 单个 `glshader` pass 内完成反向 warp（新增 16 个 scalar uniform，共 41 个 float）；「美颜关」行的 0.87–1.77 ms 是透传元素开销 |
+| 2026-11-18 | M5 纯视频录制吞吐 | 07 微信自拍 HEVC 1080p30 源：`Recorder(video_only=True)` + `mpph264enc` RGBA 直编稳态 ≈30 fps（wall 与内容时长一致），9 段主录制 `r_frame_rate` 均 `30/1` | `docs/demo-video/record_video.py`；另 1 段 `10_split_warp` 为 QC/成片补拍 |
+| 2026-11-18 | M5 成片 v3 自检 | `video-player-m5-demo-v3.mp4`：52.03 s / 1920×1080@30 / H.264 yuv420p / CRF21 / 35.5 MB / 无音轨 / 无 rotation side data / faststart；`framemd5` 1561 帧相邻重复帧 0（要求 <2%）；闪烁/纹理回弹检测 0 段（480×270 灰度中央人脸区 Laplacian 方差：中位数 588、阈值 1059、最大 879） | 抽帧目视（t=3/7.5/9.5/15/25/32/36/41/44/48 s）画面正立、无闪烁、字幕不遮脸、瘦脸/大眼可辨；构建脚本 `docs/demo-video/build_video_v3.sh` |
 
 ## 6. 已知环境限制与复现命令
 
@@ -190,6 +195,12 @@ bash scripts/bench_board.sh
   ```
   备注：录制时 DSI 屏上视频区是黑的（`display_bypass`，GPU 让给编码），录制文件
   本身正常；`--snapshot` 在 windowed 模式会失败，录制/截图都在 `--demo` 全屏下做。
+- 本机（x86 开发机，**非板端**）后期工具链限制：无系统 `ffmpeg`/`ffprobe`、无 sudo，
+  统一用 `.cache/bin/ffmpeg`、`.cache/bin/ffprobe`（ffmpeg 7.0.2-static，含
+  `ass`/`subtitles`/`xfade`/`fade`/`drawtext`）；本机也没有 WenQuanYi 字体，字幕
+  烧录前从板端拷 `/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc` 到 `.cache/fonts/`，
+  滤镜加 `fontsdir=.cache/fonts`。板端相反：系统自带 ffmpeg 与 WenQuanYi Zen Hei，
+  可直接用系统命令；v3 成片即由 `docs/demo-video/build_video_v3.sh` 在此组合下构建。
 - 测试素材在板端 /tmp（非仓库）：`/tmp/face_1080p30.mp4`（近景，
   由 `test-media/pexels/5534415…` 转码）、`/tmp/face_rot180.mp4`、
   `/tmp/face_selfie.mp4`、`/tmp/m1_sample.mp4`（1080p30 双人）、

@@ -79,6 +79,26 @@ uniform float u_face2_x;
 uniform float u_face2_y;
 uniform float u_face2_w;
 uniform float u_face2_h;
+// Experimental warp (M5): normalised 0-1 strengths and the primary face's
+// five YuNet landmarks mapped into texture space.  All positions are UVs, so
+// the warp is resolution independent (the UI texture and the recorded texture
+// have different pixel sizes but the same UVs).
+uniform float u_slim;
+uniform float u_eyes;
+uniform float u_warp_ready;
+uniform float u_warp_cx;
+uniform float u_warp_cy;
+uniform float u_warp_lx0;
+uniform float u_warp_ly0;
+uniform float u_warp_lx1;
+uniform float u_warp_ly1;
+uniform float u_warp_jx0;
+uniform float u_warp_jy0;
+uniform float u_warp_jx1;
+uniform float u_warp_jy1;
+uniform float u_warp_eye_r;
+uniform float u_warp_slim_r;
+uniform float u_warp_face_w;
 
 // Signed distance to a rounded box centred on the origin (negative inside).
 float rounded_box(vec2 p, vec2 half_size, float radius) {
@@ -148,9 +168,64 @@ vec3 whiten(vec3 rgb, float amount) {
     return mix(vec3(lifted_luma), lifted, 1.0 - 0.18 * amount);
 }
 
+// --- M5 experimental warp -------------------------------------------------
+// Backwards warps: the shader samples *elsewhere* for the output pixel, so a
+// sample taken further out at the jaw makes the face edge move inwards (slim),
+// and a sample taken closer to the eye centre makes the eye bigger.
+//
+// Falloff is 1 at the control point and 0 at `radius` (the spec's
+// smoothstep(radius, 0, dist) spelled explicitly).
+float warp_falloff(vec2 delta, float radius) {
+    return 1.0 - smoothstep(0.0, max(radius, 0.0001), length(delta));
+}
+
+vec2 eye_offset(vec2 uv, vec2 eye) {
+    vec2 delta = uv - eye;
+    return -delta * (0.40 * u_eyes * warp_falloff(delta, u_warp_eye_r));
+}
+
+vec2 slim_offset(vec2 uv, vec2 jaw, vec2 centre) {
+    vec2 delta = uv - jaw;
+    float side = jaw.x < centre.x ? -1.0 : 1.0;
+    return vec2(side, 0.0)
+        * (0.065 * u_warp_face_w * u_slim * warp_falloff(delta, u_warp_slim_r));
+}
+
+// Main-face mask (box 0 only): the warp must never touch the background or a
+// second face.  The skin gate keeps hair/glasses inside the box still.
+float warp_gate(vec2 px, vec3 rgb) {
+    float mask = face_mask(px, vec4(u_face0_x, u_face0_y, u_face0_w, u_face0_h));
+    return mask * mix(1.0, skin_gate(rgb), u_skin);
+}
+
+vec2 warp_uv(vec2 uv) {
+    if (u_warp_ready < 0.5) {
+        return uv;
+    }
+    vec2 px = uv * vec2(u_full_w, u_full_h);
+    float gate = warp_gate(px, texture2D(tex, uv).rgb);
+    if (gate <= 0.001) {
+        return uv;
+    }
+    vec2 centre = vec2(u_warp_cx, u_warp_cy);
+    vec2 offset = vec2(0.0);
+    if (u_eyes > 0.001) {
+        offset += eye_offset(uv, vec2(u_warp_lx0, u_warp_ly0));
+        offset += eye_offset(uv, vec2(u_warp_lx1, u_warp_ly1));
+    }
+    if (u_slim > 0.001) {
+        offset += slim_offset(uv, vec2(u_warp_jx0, u_warp_jy0), centre);
+        offset += slim_offset(uv, vec2(u_warp_jx1, u_warp_jy1), centre);
+    }
+    return clamp(uv + offset * gate, vec2(0.0), vec2(1.0));
+}
+
 void main() {
-    vec4 base = texture2D(tex, v_texcoord);
+    // The mask/gate always use the *unwarped* position so the region does not
+    // travel with the warp; only the colour sample is warped.
     vec2 px = v_texcoord * vec2(u_full_w, u_full_h);
+    vec2 uv = u_active > 0.5 ? warp_uv(v_texcoord) : v_texcoord;
+    vec4 base = texture2D(tex, uv);
 
     float mask = face_mask(px, vec4(u_face0_x, u_face0_y, u_face0_w, u_face0_h));
     mask = max(mask, face_mask(px, vec4(u_face1_x, u_face1_y, u_face1_w, u_face1_h)));
@@ -170,7 +245,7 @@ void main() {
     if (mask > 0.002) {
         float smoothing = 0.90 * u_smoothing * mask;
         if (smoothing > 0.002) {
-            rgb = mix(rgb, smooth_face(v_texcoord, base.rgb), smoothing);
+            rgb = mix(rgb, smooth_face(uv, base.rgb), smoothing);
         }
         float whitening = u_whitening * mask;
         if (whitening > 0.002) {
@@ -178,11 +253,11 @@ void main() {
         }
     }
 
-    // Compare mode: left half stays original, right half is beautified, with a
-    // thin separator so the split is obvious in screenshots (F9).
+    // Compare mode: left half stays the original frame (unwarped), right half is
+    // beautified, with a thin separator so the split is obvious (F9).
     if (u_compare > 0.5) {
         if (v_texcoord.x < u_split) {
-            rgb = base.rgb;
+            rgb = texture2D(tex, v_texcoord).rgb;
         }
         if (abs(px.x - u_split * u_full_w) < 1.5) {
             rgb = vec3(1.0);
@@ -199,17 +274,27 @@ class BeautyParams:
 
     smoothing: float = 0.6
     whitening: float = 0.4
+    #: Experimental M5 warp strengths (0.0-1.0; the UI exposes 0-100).
+    face_slim: float = 0.0
+    eye_enlarge: float = 0.0
 
     @classmethod
     def from_config(cls, config: BeautyConfig) -> "BeautyParams":
         return cls(
             smoothing=_clamp01(config.smoothing / 100.0),
             whitening=_clamp01(config.whitening / 100.0),
+            face_slim=_clamp01(config.face_slim / 100.0),
+            eye_enlarge=_clamp01(config.eye_enlarge / 100.0),
         )
 
     def is_identity(self) -> bool:
         """True when the shader would leave the frame untouched."""
-        return self.smoothing <= 0.0 and self.whitening <= 0.0
+        return (
+            self.smoothing <= 0.0
+            and self.whitening <= 0.0
+            and self.face_slim <= 0.0
+            and self.eye_enlarge <= 0.0
+        )
 
     def uniforms(
         self,
@@ -217,6 +302,8 @@ class BeautyParams:
         frame_size: tuple[int, int] = (0, 0),
         texture_size: tuple[int, int] | None = None,
         faces: Iterable["Face | Sequence[float]"] = (),
+        landmarks: Sequence[Sequence[float]] | None = None,
+        face_box: "Face | Sequence[float] | None" = None,
         rotation: int = 0,
         compare_mode: bool = False,
         split: float = 0.5,
@@ -233,7 +320,13 @@ class BeautyParams:
                 of the detection boxes (already rotated upright).
             texture_size: size of the frame the shader samples.  Defaults to
                 ``frame_size``; 90/270 degree display matrices swap the axes.
-            faces: detected faces in display coordinates.
+            faces: detected faces in display coordinates.  The **first** entry is
+                the primary face: the warp mask uses ``u_face0`` and the warp
+                landmarks belong to it (``normalise_face_boxes`` keeps the order).
+            landmarks: five YuNet points of the primary face, in display
+                coordinates.  Defaults to ``faces[0].landmarks`` when omitted.
+            face_box: primary face box; defaults to ``faces[0]``.  Only used to
+                place the jaw control points.
             rotation: clockwise display rotation applied to the decoded frame
                 before it reaches the screen (the detector rotates by the same
                 amount, so boxes must be mapped back for the shader).
@@ -243,6 +336,12 @@ class BeautyParams:
             max(0, int(v))
             for v in (texture_size or frame_size)
         )
+        face_list = list(faces)
+        primary = face_list[0] if face_list else None
+        if landmarks is None and primary is not None:
+            landmarks = getattr(primary, "landmarks", ())
+        if face_box is None and primary is not None:
+            face_box = primary
         values: dict[str, float] = {
             "u_texel_x": 1.0 / texture_w if texture_w else 0.0,
             "u_texel_y": 1.0 / texture_h if texture_h else 0.0,
@@ -250,6 +349,8 @@ class BeautyParams:
             "u_full_h": float(texture_h),
             "u_smoothing": self.smoothing,
             "u_whitening": self.whitening,
+            "u_slim": self.face_slim,
+            "u_eyes": self.eye_enlarge,
             "u_active": 1.0 if active and not self.is_identity() else 0.0,
             "u_compare": 1.0 if compare_mode else 0.0,
             "u_split": _clamp01(split),
@@ -259,12 +360,20 @@ class BeautyParams:
             "u_debug": 1.0 if debug else 0.0,
         }
         boxes = normalise_face_boxes(
-            faces, frame_w, frame_h, rotation=rotation, limit=BEAUTY_MAX_FACES
+            face_list, frame_w, frame_h, rotation=rotation, limit=BEAUTY_MAX_FACES
         )
         for index in range(BEAUTY_MAX_FACES):
             box = boxes[index] if index < len(boxes) else (0.0, 0.0, 0.0, 0.0)
             for component, value in zip(_FACE_COMPONENTS, box):
                 values[f"u_face{index}_{component}"] = float(value)
+        values.update(
+            warp_uniforms(
+                landmarks,
+                face_box,
+                (frame_w, frame_h),
+                rotation=rotation,
+            )
+        )
         return values
 
 
@@ -301,6 +410,157 @@ def face_rect_to_texture(
     if rotation == 270:
         return (1.0 - y - height, x, height, width)
     return (x, y, width, height)
+
+
+#: YuNet five-point landmark order, as returned by the detector in display
+#: coordinates.  The same order the face overlay draws.
+LANDMARK_RIGHT_EYE = 0
+LANDMARK_LEFT_EYE = 1
+LANDMARK_NOSE = 2
+LANDMARK_MOUTH_RIGHT = 3
+LANDMARK_MOUTH_LEFT = 4
+
+#: Warp uniforms written by :func:`warp_uniforms` (every key always present so
+#: the shader's uniform set never changes at runtime).
+WARP_UNIFORM_KEYS = (
+    "u_warp_ready",
+    "u_warp_cx",
+    "u_warp_cy",
+    "u_warp_lx0",
+    "u_warp_ly0",
+    "u_warp_lx1",
+    "u_warp_ly1",
+    "u_warp_jx0",
+    "u_warp_jy0",
+    "u_warp_jx1",
+    "u_warp_jy1",
+    "u_warp_eye_r",
+    "u_warp_slim_r",
+    "u_warp_face_w",
+)
+
+
+def point_to_texture(
+    x: float,
+    y: float,
+    frame_width: float,
+    frame_height: float,
+    rotation: int = 0,
+) -> tuple[float, float]:
+    """Map one display-space point to shader texture UV coordinates.
+
+    Inverse of the display rotation, matching :func:`face_rect_to_texture`:
+    0 -> ``(x, y)``, 90 -> ``(y, 1-x)``, 180 -> ``(1-x, 1-y)``,
+    270 -> ``(1-y, x)`` (all normalised to [0, 1]).
+    """
+    if frame_width <= 0 or frame_height <= 0:
+        return (0.0, 0.0)
+    u = float(x) / float(frame_width)
+    v = float(y) / float(frame_height)
+    rotation %= 360
+    if rotation == 90:
+        return (v, 1.0 - u)
+    if rotation == 180:
+        return (1.0 - u, 1.0 - v)
+    if rotation == 270:
+        return (1.0 - v, u)
+    return (u, v)
+
+
+def warp_uniforms(
+    landmarks: Sequence[Sequence[float]] | None,
+    face_box: "Face | Sequence[float] | None",
+    frame_size: tuple[int, int],
+    rotation: int = 0,
+) -> dict[str, float]:
+    """Geometry for the M5 face warp in texture UV space.
+
+    Args:
+        landmarks: the primary face's five YuNet points in display coordinates
+            (right eye, left eye, nose, right mouth corner, left mouth corner).
+        face_box: primary face box in display coordinates; the jaw control
+            points are placed relative to it.
+        frame_size: *displayed* frame size (the landmarks' coordinate space).
+        rotation: display rotation applied after decoding (see
+            :func:`point_to_texture`).
+
+    Returns:
+        A dict with every :data:`WARP_UNIFORM_KEYS` entry.  ``u_warp_ready`` is
+        0.0 (and all other entries 0.0) unless the full five-point geometry is
+        available: a partial warp would jump as soon as the detector supplies
+        the missing points.  Values are clamped to [0, 1] because the shader
+        clamps its UVs anyway.
+    """
+    values = {key: 0.0 for key in WARP_UNIFORM_KEYS}
+    frame_w, frame_h = (max(0, int(v)) for v in frame_size)
+    if frame_w <= 0 or frame_h <= 0:
+        return values
+    if landmarks is None or len(landmarks) != 5:
+        return values
+    try:
+        points = [(float(x), float(y)) for x, y in landmarks]
+    except (TypeError, ValueError):
+        return values
+    if face_box is None:
+        return values
+    try:
+        box_x, box_y, box_w, box_h = _rect_of(face_box)
+    except (TypeError, ValueError):
+        return values
+    if box_w <= 0.0 or box_h <= 0.0:
+        return values
+
+    centre_x = box_x + box_w * 0.5
+    centre_y = box_y + box_h * 0.5
+
+    def jaw_point(eye: int, mouth: int) -> tuple[float, float]:
+        """Midpoint of eye and mouth corner, pushed outwards and downwards.
+
+        ``outwards`` is derived from the midpoint's own side of the face centre
+        so the rule works for any head pose and display rotation instead of
+        assuming which image side landmark 0 happens to be on.
+        """
+        midpoint_x = (points[eye][0] + points[mouth][0]) * 0.5
+        midpoint_y = (points[eye][1] + points[mouth][1]) * 0.5
+        outwards = 1.0 if midpoint_x >= centre_x else -1.0
+        return (
+            midpoint_x + outwards * 0.18 * box_w,
+            midpoint_y + 0.30 * box_h,
+        )
+
+    jaw_right = jaw_point(LANDMARK_RIGHT_EYE, LANDMARK_MOUTH_RIGHT)
+    jaw_left = jaw_point(LANDMARK_LEFT_EYE, LANDMARK_MOUTH_LEFT)
+
+    def uv(point: tuple[float, float]) -> tuple[float, float]:
+        u, v = point_to_texture(point[0], point[1], frame_w, frame_h, rotation)
+        return (_clamp01(u), _clamp01(v))
+
+    centre = uv((centre_x, centre_y))
+    right_eye = uv(points[LANDMARK_RIGHT_EYE])
+    left_eye = uv(points[LANDMARK_LEFT_EYE])
+    right_jaw = uv(jaw_right)
+    left_jaw = uv(jaw_left)
+    face_w_uv = _clamp01(box_w / float(frame_w))
+
+    values.update(
+        {
+            "u_warp_ready": 1.0,
+            "u_warp_cx": centre[0],
+            "u_warp_cy": centre[1],
+            "u_warp_lx0": right_eye[0],
+            "u_warp_ly0": right_eye[1],
+            "u_warp_lx1": left_eye[0],
+            "u_warp_ly1": left_eye[1],
+            "u_warp_jx0": right_jaw[0],
+            "u_warp_jy0": right_jaw[1],
+            "u_warp_jx1": left_jaw[0],
+            "u_warp_jy1": left_jaw[1],
+            "u_warp_eye_r": _clamp01(0.16 * face_w_uv),
+            "u_warp_slim_r": _clamp01(0.26 * face_w_uv),
+            "u_warp_face_w": face_w_uv,
+        }
+    )
+    return values
 
 
 def normalise_face_boxes(

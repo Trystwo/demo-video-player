@@ -84,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to wait before --snapshot is taken (default: 3)",
     )
     parser.add_argument(
+        "--lang",
+        choices=("zh", "en"),
+        metavar="{zh,en}",
+        help="UI language for this launch (default: saved preference, else zh)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
@@ -147,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         snapshot_delay=args.snapshot_delay,
         record=args.record,
         record_duration=args.record_duration,
+        language=args.lang,
     )
 
 

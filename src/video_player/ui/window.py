@@ -25,6 +25,7 @@ from ..backend import PlaybackBackend, PlaybackError  # noqa: E402
 from ..beauty import BeautyParams  # noqa: E402
 from ..config import Config  # noqa: E402
 from ..face import DetectionResult, Face  # noqa: E402
+from ..i18n import Translator, save_language  # noqa: E402
 from ..pipeline import VIDEO_SUFFIXES  # noqa: E402
 from ..playlist import Playlist  # noqa: E402
 
@@ -33,8 +34,6 @@ GST_SECOND = 1_000_000_000
 
 SPEED_CHOICES = ("0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x")
 SPEED_VALUES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
-
-INFO_PLACEHOLDER = "resolution —   codec —   decode —   fps —   NPU —"
 
 #: Attempts to attach the recording branch; the first ones can fail while the
 #: pipeline is still bringing up its GL context.
@@ -114,21 +113,19 @@ def _closest_speed_index(speed: float) -> int:
     return min(range(len(SPEED_VALUES)), key=lambda index: abs(SPEED_VALUES[index] - speed))
 
 
-def _labelled_row(label: str, widget: Gtk.Widget) -> Gtk.Widget:
+def _labelled_row(label: Gtk.Label, widget: Gtk.Widget) -> Gtk.Widget:
     row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-    text = Gtk.Label(label=label)
-    text.set_xalign(0.0)
-    text.set_hexpand(True)
-    row.append(text)
+    label.set_xalign(0.0)
+    label.set_hexpand(True)
+    row.append(label)
     row.append(widget)
     return row
 
 
-def _labelled_scale(label: str, scale: Gtk.Scale) -> Gtk.Widget:
+def _labelled_scale(label: Gtk.Label, scale: Gtk.Scale) -> Gtk.Widget:
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    text = Gtk.Label(label=label)
-    text.set_xalign(0.0)
-    box.append(text)
+    label.set_xalign(0.0)
+    box.append(label)
     box.append(scale)
     return box
 
@@ -146,10 +143,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         fullscreen: bool = False,
         record: Path | None = None,
         record_duration: float | None = None,
+        language: str | None = None,
     ) -> None:
         super().__init__(application=application)
         self.config = config
         self.demo = demo
+        self._t = Translator(language)
         self.playlist = Playlist(media)
         # ``--record`` bypasses the on-screen video sink so the recorder
         # owns the GPU and the recorded file stays a smooth 30 fps.
@@ -164,6 +163,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._beauty_error: str | None = None
         self._show_faces = True
         self._last_detection_label_at = 0.0
+        self._current_path: Path | None = None
+        self._hint_key: str | None = None
+        self._hint_values: dict[str, object] = {}
         self._record_path = record
         self._record_duration = record_duration
         self._record_deadline = 0.0
@@ -194,23 +196,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.backend.on_beauty_error = self._on_beauty_error
         self.backend.on_recording_error = self._on_recording_error
 
-        self.set_title("Video Player · Quectel Pi M2")
         self.set_default_size(1280, 800)
 
         header = Gtk.HeaderBar()
         self.set_titlebar(header)
-        self._open_button = Gtk.Button(label="Open")
-        self._open_button.set_tooltip_text("Open a local video file")
+        self._open_button = Gtk.Button()
         self._open_button.connect("clicked", self._on_open_clicked)
         header.pack_start(self._open_button)
 
-        self._compare_button = Gtk.ToggleButton(label="Compare")
-        self._compare_button.set_tooltip_text(
-            "Split view: original on the left, beautified on the right (C)"
-        )
+        self._compare_button = Gtk.ToggleButton()
         self._compare_button.set_active(config.beauty.compare_mode)
         self._compare_button.connect("toggled", self._on_compare_toggled)
-        header.pack_end(self._compare_button)
+
+        self._language_button = Gtk.Button()
+        self._language_button.connect("clicked", self._on_language_clicked)
+        end_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        end_box.append(self._compare_button)
+        end_box.append(self._language_button)
+        header.pack_end(end_box)
 
         paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
         paned.set_position(940)
@@ -236,7 +239,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self.playlist:
             GLib.idle_add(self._start_index, 0)
         else:
-            self._hint("Open a video to start. Folder arguments become a playlist.")
+            self._set_hint_key("hint_open")
+        self._apply_language()
 
     # -- layout ---------------------------------------------------------
 
@@ -264,17 +268,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._face_overlay.set_vexpand(True)
         overlay.add_overlay(self._face_overlay)
 
-        self._placeholder = Gtk.Label(
-            label="Open a video file to start playback\n\n"
-            "Local MP4 / MKV H.264 & H.265 files are decoded on the RK3576 VPU"
-        )
+        self._placeholder = Gtk.Label()
         self._placeholder.set_justify(Gtk.Justification.CENTER)
         self._placeholder.add_css_class("video-placeholder")
         overlay.add_overlay(self._placeholder)
         box.append(overlay)
         self._player_overlay = overlay
 
-        self._info_label = Gtk.Label(label=INFO_PLACEHOLDER)
+        self._info_label = Gtk.Label()
         self._info_label.set_xalign(0.0)
         self._info_label.set_selectable(True)
         self._info_label.add_css_class("info-line")
@@ -294,24 +295,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         self._play_button = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
-        self._play_button.set_tooltip_text("Play / pause (space)")
         self._play_button.connect("clicked", self._on_play_clicked)
         bar.append(self._play_button)
 
         self._prev_button = Gtk.Button.new_from_icon_name("media-skip-backward-symbolic")
-        self._prev_button.set_tooltip_text("Previous item (p)")
         self._prev_button.connect("clicked", self._on_previous_clicked)
         bar.append(self._prev_button)
 
         self._next_button = Gtk.Button.new_from_icon_name("media-skip-forward-symbolic")
-        self._next_button.set_tooltip_text("Next item (n)")
         self._next_button.connect("clicked", self._on_next_clicked)
         bar.append(self._next_button)
 
         self._seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1000, 1)
         self._seek.set_hexpand(True)
         self._seek.set_draw_value(False)
-        self._seek.set_tooltip_text("Seek position")
         self._seek.connect("value-changed", self._on_seek_changed)
         bar.append(self._seek)
 
@@ -322,20 +319,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._volume.set_size_request(110, -1)
         self._volume.set_value(self.config.player.volume)
         self._volume.set_draw_value(False)
-        self._volume.set_tooltip_text("Volume")
         self._volume.connect("value-changed", self._on_volume_changed)
         bar.append(self._volume)
 
         self._speed = Gtk.DropDown.new_from_strings(list(SPEED_CHOICES))
         self._speed.set_selected(_closest_speed_index(self.config.player.speed))
-        self._speed.set_tooltip_text("Playback speed")
         self._speed.connect("notify::selected", self._on_speed_changed)
         bar.append(self._speed)
 
-        fullscreen = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic")
-        fullscreen.set_tooltip_text("Fullscreen (f)")
-        fullscreen.connect("clicked", self._on_fullscreen_clicked)
-        bar.append(fullscreen)
+        self._fullscreen_button = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic")
+        self._fullscreen_button.connect("clicked", self._on_fullscreen_clicked)
+        bar.append(self._fullscreen_button)
         self._controls_bar = bar
         return bar
 
@@ -347,9 +341,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         panel.set_margin_start(4)
         panel.set_margin_end(8)
 
-        playlist_title = Gtk.Label(label="Playlist")
-        playlist_title.set_xalign(0.0)
-        panel.append(playlist_title)
+        self._playlist_title = Gtk.Label()
+        self._playlist_title.set_xalign(0.0)
+        panel.append(self._playlist_title)
 
         self._playlist_list = Gtk.ListBox()
         self._playlist_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -364,33 +358,37 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         panel.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        beauty_title = Gtk.Label(label="Beauty")
-        beauty_title.set_xalign(0.0)
-        panel.append(beauty_title)
+        self._beauty_title = Gtk.Label()
+        self._beauty_title.set_xalign(0.0)
+        panel.append(self._beauty_title)
 
         self._beauty_switch = Gtk.Switch()
         self._beauty_switch.set_active(self.config.beauty.enabled)
         self._beauty_switch.connect("notify::active", self._on_beauty_toggled)
-        panel.append(_labelled_row("Automatic face beauty", self._beauty_switch))
+        self._auto_beauty_label = Gtk.Label()
+        panel.append(_labelled_row(self._auto_beauty_label, self._beauty_switch))
 
         self._smoothing = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self._smoothing.set_value(self.config.beauty.smoothing)
         self._smoothing.set_draw_value(True)
         self._smoothing.set_hexpand(True)
         self._smoothing.connect("value-changed", self._on_smoothing_changed)
-        panel.append(_labelled_scale("Smoothing", self._smoothing))
+        self._smoothing_label = Gtk.Label()
+        panel.append(_labelled_scale(self._smoothing_label, self._smoothing))
 
         self._whitening = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self._whitening.set_value(self.config.beauty.whitening)
         self._whitening.set_draw_value(True)
         self._whitening.set_hexpand(True)
         self._whitening.connect("value-changed", self._on_whitening_changed)
-        panel.append(_labelled_scale("Whitening", self._whitening))
+        self._whitening_label = Gtk.Label()
+        panel.append(_labelled_scale(self._whitening_label, self._whitening))
 
         self._compare_switch = Gtk.Switch()
         self._compare_switch.set_active(self.config.beauty.compare_mode)
         self._compare_switch.connect("notify::active", self._on_compare_switch_toggled)
-        panel.append(_labelled_row("Original / beautified", self._compare_switch))
+        self._compare_label = Gtk.Label()
+        panel.append(_labelled_row(self._compare_label, self._compare_switch))
 
         self._split = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 0.9, 0.05)
         self._split.set_value(self.config.beauty.split)
@@ -398,12 +396,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._split.set_digits(2)
         self._split.set_hexpand(True)
         self._split.connect("value-changed", self._on_split_changed)
-        panel.append(_labelled_scale("Split position", self._split))
+        self._split_label = Gtk.Label()
+        panel.append(_labelled_scale(self._split_label, self._split))
 
         self._faces_switch = Gtk.Switch()
         self._faces_switch.set_active(self._show_faces)
         self._faces_switch.connect("notify::active", self._on_show_faces_toggled)
-        panel.append(_labelled_row("Show face boxes", self._faces_switch))
+        self._faces_label = Gtk.Label()
+        panel.append(_labelled_row(self._faces_label, self._faces_switch))
 
         self._params_label = Gtk.Label()
         self._params_label.set_xalign(0.0)
@@ -412,17 +412,107 @@ class PlayerWindow(Gtk.ApplicationWindow):
         panel.append(self._params_label)
         self._refresh_params_label()
 
-        note = Gtk.Label(
-            label="Smoothing and whitening run in the GPU shader, limited to the "
-            "feathered face mask from the NPU detector. Keys: B beauty, C compare, "
-            "M mask preview."
+        self._note_label = Gtk.Label()
+        self._note_label.set_xalign(0.0)
+        self._note_label.set_wrap(True)
+        self._note_label.add_css_class("dim-label")
+        panel.append(self._note_label)
+
+        # M5 experimental warp controls live in a collapsed expander so the
+        # stable M3 beauty controls stay the default path.
+        self._experimental_expander = Gtk.Expander()
+        self._experimental_expander.set_expanded(False)
+        warp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        warp_box.set_margin_top(6)
+        warp_box.set_margin_start(8)
+
+        self._face_slim = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
         )
-        note.set_xalign(0.0)
-        note.set_wrap(True)
-        note.add_css_class("dim-label")
-        panel.append(note)
+        self._face_slim.set_value(self.config.beauty.face_slim)
+        self._face_slim.set_draw_value(True)
+        self._face_slim.set_hexpand(True)
+        self._face_slim.connect("value-changed", self._on_face_slim_changed)
+        self._face_slim_label = Gtk.Label()
+        warp_box.append(_labelled_scale(self._face_slim_label, self._face_slim))
+
+        self._eye_enlarge = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
+        )
+        self._eye_enlarge.set_value(self.config.beauty.eye_enlarge)
+        self._eye_enlarge.set_draw_value(True)
+        self._eye_enlarge.set_hexpand(True)
+        self._eye_enlarge.connect("value-changed", self._on_eye_enlarge_changed)
+        self._eye_enlarge_label = Gtk.Label()
+        warp_box.append(_labelled_scale(self._eye_enlarge_label, self._eye_enlarge))
+
+        self._experimental_note_label = Gtk.Label()
+        self._experimental_note_label.set_xalign(0.0)
+        self._experimental_note_label.set_wrap(True)
+        self._experimental_note_label.add_css_class("dim-label")
+        warp_box.append(self._experimental_note_label)
+        self._experimental_expander.set_child(warp_box)
+        panel.append(self._experimental_expander)
+
         self._sidebar_panel = panel
         return panel
+
+    # -- language -------------------------------------------------------
+
+    def _apply_language(self) -> None:
+        """Retranslate every long-lived widget after a language change."""
+        t = self._t
+        if self._current_path is not None:
+            self.set_title(t("title_with_media", name=self._current_path.name))
+        else:
+            self.set_title(t("app_title"))
+
+        self._open_button.set_label(t("open"))
+        self._open_button.set_tooltip_text(t("open_tooltip"))
+        self._compare_button.set_label(t("compare"))
+        self._compare_button.set_tooltip_text(t("compare_tooltip"))
+        self._language_button.set_label(t("switch_language"))
+        self._language_button.set_tooltip_text(t("switch_language_tooltip"))
+
+        self._placeholder.set_text(t("placeholder"))
+        self._playlist_title.set_text(t("playlist"))
+        self._beauty_title.set_text(t("beauty"))
+        self._auto_beauty_label.set_text(t("auto_beauty"))
+        self._smoothing_label.set_text(t("smoothing"))
+        self._whitening_label.set_text(t("whitening"))
+        self._compare_label.set_text(t("original_beautified"))
+        self._split_label.set_text(t("split_position"))
+        self._faces_label.set_text(t("show_face_boxes"))
+        self._note_label.set_text(t("note"))
+        self._experimental_expander.set_label(t("experimental"))
+        self._face_slim_label.set_text(t("face_slim"))
+        self._eye_enlarge_label.set_text(t("eye_enlarge"))
+        self._experimental_note_label.set_text(t("experimental_note"))
+
+        self._play_button.set_tooltip_text(t("play_pause"))
+        self._prev_button.set_tooltip_text(t("previous"))
+        self._next_button.set_tooltip_text(t("next"))
+        self._seek.set_tooltip_text(t("seek"))
+        self._volume.set_tooltip_text(t("volume"))
+        self._speed.set_tooltip_text(t("speed"))
+        self._fullscreen_button.set_tooltip_text(t("fullscreen"))
+
+        self._refresh_params_label()
+        if self.backend.has_media:
+            self._update_info_label()
+        else:
+            self._info_label.set_text(t("info_placeholder"))
+        if self._hint_key is not None:
+            self._hint_label.set_text(t(self._hint_key, **self._hint_values))
+
+    def _on_language_clicked(self, _button: Gtk.Button) -> None:
+        self._t.toggle()
+        try:
+            save_language(self._t.language)
+        except OSError:
+            # A read-only home directory must not break the switch.
+            pass
+        self._apply_language()
 
     # -- playback -------------------------------------------------------
 
@@ -448,7 +538,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _play_path(self, path: Path) -> None:
         if not path.exists():
-            self._show_error(f"media file not found: {path}")
+            self._show_error(self._t("media_file_not_found", path=path))
             return
         list_index = self.playlist.add(path)
         self.playlist.select(list_index)
@@ -468,8 +558,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._placeholder.set_visible(False)
         self._sync_playlist()
         self._update_play_icon(True)
-        self.set_title(f"{path.name} · Video Player")
-        self._hint("")
+        self._current_path = path
+        self.set_title(self._t("title_with_media", name=path.name))
+        self._set_hint_key(None)
 
     def _on_play_clicked(self, _button: Gtk.Button | None) -> None:
         if not self.backend.has_media:
@@ -487,7 +578,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return
         target = self.playlist.previous()
         if target is None:
-            self._hint("This is the first item in the playlist.")
+            self._set_hint_key("hint_first")
             return
         self._play_path(target)
 
@@ -497,7 +588,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return
         target = self.playlist.next()
         if target is None:
-            self._hint("This is the last item in the playlist.")
+            self._set_hint_key("hint_last")
             return
         self._play_path(target)
 
@@ -539,6 +630,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.config.beauty.split = round(scale.get_value(), 3)
         self._refresh_beauty()
 
+    def _on_face_slim_changed(self, scale: Gtk.Scale) -> None:
+        self.config.beauty.face_slim = round(scale.get_value(), 1)
+        self._refresh_beauty()
+
+    def _on_eye_enlarge_changed(self, scale: Gtk.Scale) -> None:
+        self.config.beauty.eye_enlarge = round(scale.get_value(), 1)
+        self._refresh_beauty()
+
     def _on_beauty_toggled(self, switch: Gtk.Switch, _param: object) -> None:
         self.config.beauty.enabled = switch.get_active()
         self._refresh_beauty()
@@ -572,19 +671,33 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _refresh_params_label(self) -> None:
         beauty = self.config.beauty
         params = BeautyParams.from_config(beauty)
-        state = "on" if beauty.enabled else "off"
+        t = self._t
+        state = t("beauty_state_on" if beauty.enabled else "beauty_state_off")
         if beauty.compare_mode:
-            state += f", split {beauty.split:.0%}"
+            state += t("beauty_split", split=beauty.split)
+        warp = ""
+        if params.face_slim > 0.0 or params.eye_enlarge > 0.0:
+            warp = t(
+                "beauty_warp",
+                slim=params.face_slim,
+                eyes=params.eye_enlarge,
+            )
         extra = ""
         if self.backend.beauty_available:
-            extra = f", {self.backend.beauty_ms:.1f} ms/frame"
+            extra = t("beauty_ms", ms=self.backend.beauty_ms)
         elif not beauty.enabled:
             extra = ""
         else:
-            extra = ", GPU pass unavailable"
+            extra = t("beauty_gpu_unavailable")
         self._params_label.set_text(
-            f"beauty {state} (smoothing {params.smoothing:.2f}, "
-            f"whitening {params.whitening:.2f}){extra}"
+            t(
+                "beauty_params",
+                state=state,
+                smoothing=params.smoothing,
+                whitening=params.whitening,
+                warp=warp,
+                extra=extra,
+            )
         )
 
     def _on_beauty_error(self, message: str) -> None:
@@ -592,7 +705,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._beauty_switch.set_sensitive(False)
         self._beauty_switch.set_active(False)
         self.config.beauty.enabled = False
-        self._hint(message)
+        self._set_hint_key("beauty_error", message=message)
+        self._hint_label.add_css_class("error-hint")
         self._refresh_params_label()
         self._update_info_label()
 
@@ -631,7 +745,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _on_detection_error(self, message: str) -> None:
         self._detection_error = message
-        self._hint(f"Face detection disabled: {message}")
+        self._set_hint_key("face_detection_disabled", message=message)
         self._update_info_label()
 
     def _on_show_faces_toggled(self, switch: Gtk.Switch, _param: object) -> None:
@@ -650,24 +764,27 @@ class PlayerWindow(Gtk.ApplicationWindow):
             if target is not None:
                 self._play_path(target)
                 return
-        self._hint("Playback finished.")
+        self._set_hint_key("hint_finished")
 
     def _show_error(self, message: str) -> None:
-        self._hint_label.set_text(f"Playback error: {message}")
+        self._set_hint_key("playback_error", message=message)
         self._hint_label.add_css_class("error-hint")
         self._update_play_icon(False)
 
     # -- helpers --------------------------------------------------------
 
-    def _hint(self, text: str) -> None:
+    def _set_hint_key(self, key: str | None, **values: object) -> None:
+        self._hint_key = key
+        self._hint_values = values
         self._hint_label.remove_css_class("error-hint")
-        self._hint_label.set_text(text)
+        self._hint_label.set_text("" if key is None else self._t(key, **values))
 
     def _update_play_icon(self, playing: bool) -> None:
         icon = "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
         self._play_button.set_icon_name(icon)
 
     def _update_info_label(self) -> None:
+        t = self._t
         info = self.backend.video_info
         width = info.get("width", "—")
         height = info.get("height", "—")
@@ -675,22 +792,33 @@ class PlayerWindow(Gtk.ApplicationWindow):
         decoder = info.get("decoder", "—")
         fps = self._fps or info.get("fps") or "—"
         if self._detection_error:
-            npu = "off"
+            npu = t("npu_off")
         elif self._faces:
-            npu = f"{len(self._faces)} face · {self._detection_ms:.1f} ms"
+            count = len(self._faces)
+            npu = t("npu_face" if count == 1 else "npu_faces", count=count, ms=self._detection_ms)
         else:
             npu = "—"
         if self._beauty_error or not self.backend.beauty_available:
-            beauty = "unavailable" if self._beauty_error else "off"
-            if not self._beauty_error and self.config.beauty.enabled:
-                beauty = "off"
+            beauty = (
+                t("beauty_unavailable")
+                if self._beauty_error
+                else t("beauty_state_off")
+            )
         elif not self.config.beauty.enabled:
-            beauty = "off"
+            beauty = t("beauty_state_off")
         else:
-            beauty = f"on {self.backend.beauty_ms:.1f} ms"
+            beauty = t("beauty_on", ms=self.backend.beauty_ms)
         self._info_label.set_text(
-            f"{width}×{height}   {codec}   decode: {decoder}   "
-            f"fps: {fps}   NPU: {npu}   beauty: {beauty}"
+            t(
+                "info_line",
+                width=width,
+                height=height,
+                codec=codec,
+                decoder=decoder,
+                fps=fps,
+                npu=npu,
+                beauty=beauty,
+            )
         )
 
     def _sync_playlist(self) -> None:
@@ -768,9 +896,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def _on_open_clicked(self, _button: Gtk.Button) -> None:
-        dialog = Gtk.FileDialog(title="Open video")
+        dialog = Gtk.FileDialog(title=self._t("open_video"))
         file_filter = Gtk.FileFilter()
-        file_filter.set_name("Video files")
+        file_filter.set_name(self._t("video_files"))
         for suffix in VIDEO_SUFFIXES:
             file_filter.add_pattern(f"*{suffix}")
         filters = Gio.ListStore.new(Gtk.FileFilter)
@@ -855,8 +983,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if not self.backend.is_playing or not self.backend.video_info:
             return
         if self._record_attempts >= 60:
-            self._record_error = "the window never became ready for recording"
-            self._hint(f"Recording unavailable: {self._record_error}")
+            self._record_error = self._t("recording_not_ready")
+            self._set_hint_key("recording_unavailable", message=self._record_error)
             return
         self._record_attempts += 1
         if os.environ.get("REC_DEBUG"):
@@ -907,7 +1035,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 print(f"[rec] start failed ({self._record_failures}): {exc}", flush=True)
             if self._record_failures >= RECORD_START_RETRIES:
                 self._record_error = str(exc)
-                self._hint(f"Recording unavailable: {exc}")
+                self._set_hint_key("recording_unavailable", message=exc)
             return
         self._record_failures = 0
         self._canvas_builder = builder
@@ -1040,7 +1168,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._recorder is not None:
             path = self._recorder.path
             self._stop_recording()
-            self._hint(f"Recording saved to {path}")
+            self._set_hint_key("recording_saved", path=path)
             return
         if self._record_path is None:
             stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1053,7 +1181,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _on_recording_error(self, message: str) -> None:
         self._record_error = message
-        self._hint(f"Recording stopped: {message}")
+        self._set_hint_key("recording_stopped", message=message)
         GLib.idle_add(self._stop_recording)
 
     def capture_snapshot(self, path: Path | str) -> bool:
@@ -1110,6 +1238,7 @@ class PlayerApplication(Gtk.Application):
         snapshot_delay: float = 3.0,
         record: Path | None = None,
         record_duration: float | None = None,
+        language: str | None = None,
     ) -> None:
         # Non-unique: the demo may be launched from SSH and the desktop at
         # once, and D-Bus name registration is unreliable in remote sessions.
@@ -1124,6 +1253,7 @@ class PlayerApplication(Gtk.Application):
         self._snapshot_delay = max(0.5, float(snapshot_delay))
         self._record = record
         self._record_duration = record_duration
+        self._language = language
         self._snapshot_attempts = 0
         self._window: PlayerWindow | None = None
 
@@ -1144,6 +1274,7 @@ class PlayerApplication(Gtk.Application):
                 fullscreen=self._fullscreen,
                 record=self._record,
                 record_duration=self._record_duration,
+                language=self._language,
             )
         self._window.present()
         if self._snapshot is not None:
@@ -1187,6 +1318,7 @@ def run_window(
     snapshot_delay: float = 3.0,
     record: Path | None = None,
     record_duration: float | None = None,
+    language: str | None = None,
 ) -> int:  # pragma: no cover - needs a display
     """Open the GTK window and block until it closes; returns the exit code."""
     # The detection worker runs numpy/OpenCV decoding in a Python thread; a
@@ -1202,6 +1334,7 @@ def run_window(
         snapshot_delay=snapshot_delay,
         record=record,
         record_duration=record_duration,
+        language=language,
     )
     code = application.run([])
     sys.stdout.flush()

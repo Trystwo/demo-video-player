@@ -179,6 +179,7 @@ class FaceDetectionTap:
         # Decoded frame size, reported by the backend once the caps are known;
         # only used to pick the warm-up frame size.
         self._source_size: tuple[int, int] = (0, 0)
+        self._warmed_up = False
 
     def set_source_size(self, width: int, height: int) -> None:
         """Tell the tap the decoded frame size (used only for the NPU warm-up)."""
@@ -187,11 +188,14 @@ class FaceDetectionTap:
     # -- lifecycle ---------------------------------------------------------
 
     def prepare(self) -> None:
-        """Load the model up front so playback is not delayed by the NPU.
+        """Load the model and warm the NPU up before playback starts.
 
-        The window opens the media right after the pipeline is built; loading
-        YuNet there would push the first frames back by ~2 s and drag down the
-        cumulative fps counter.  ``start`` calls this again (idempotent).
+        This runs from :meth:`PlaybackBackend.open` before the pipeline goes to
+        PLAYING, so the one-off RKNN allocation happens while no decoder/GL
+        buffers are alive.  It deliberately does *not* run from the pad-added
+        callback: on the RK3576, calling ``rknn_inputs_set`` for a 1080p dummy
+        frame on a GStreamer streaming thread aborts the process with
+        ``std::bad_alloc``.  ``start`` calls this again (idempotent).
         """
         if self._detector is not None:
             return
@@ -204,14 +208,20 @@ class FaceDetectionTap:
         )
         detector.load()
         self._detector = detector
+        if not self._warmed_up:
+            self._warmed_up = True
+            self._warm_up()
 
     def _warm_up(self) -> None:
         """Run the one-off slow inference before the first frame is played.
 
         Without this the first *real* 1080p frame costs ~2.4 s inside the
         worker thread, which makes the opening second of video drop frames
-        (~50 % of them) on the board.  Warm-up failures must never break
-        playback, so everything is swallowed.
+        (~50 % of them) on the board.  This must be called from
+        :meth:`prepare` on the main thread, before the pipeline owns decoder
+        buffers; doing it later from ``pad-added`` crashes librknnrt with
+        ``std::bad_alloc``.  Warm-up failures must never break playback, so
+        everything Python can catch is swallowed.
         """
         detector = self._detector
         if detector is None:
@@ -230,9 +240,8 @@ class FaceDetectionTap:
             pass
 
     def start(self, pad: Gst.Pad) -> None:
-        """Attach the sample probe; the model is loaded by :meth:`prepare`."""
+        """Attach the sample probe; model load and warm-up are already done."""
         self.prepare()
-        self._warm_up()
         self._running = True
         self._thread = threading.Thread(
             target=self._worker, name="face-detection", daemon=True

@@ -19,6 +19,7 @@ All callbacks are dispatched through the GTK main loop.
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 import os
 import time
@@ -32,7 +33,7 @@ from gi.repository import GLib, GObject, Gst  # noqa: E402
 from .beauty import BEAUTY_FRAGMENT_SHADER, BeautyParams
 from .config import Config
 from .detection import FaceDetectionTap, rotation_from_tag
-from .face import DetectionResult, Face
+from .face import DetectionResult, Face, primary_face, smooth_landmarks
 from .pipeline import decoder_for, demux_for, is_stream_uri, parser_for
 
 __all__ = ["PlaybackBackend", "PlaybackError"]
@@ -142,6 +143,13 @@ class PlaybackBackend:
         self._coded_size: tuple[int, int] = (0, 0)
         self._texture_size: tuple[int, int] = (0, 0)
         self._faces: tuple[Face, ...] = ()
+        #: Smoothed landmarks of the tracked (largest) face, in display
+        #: coordinates; drives the M5 warp.  Kept with :attr:`_faces`.
+        self._landmarks: tuple[tuple[float, float], ...] = ()
+        #: ``time.monotonic()`` of the last non-empty detection.
+        self._last_face_seen = 0.0
+        #: Number of empty detections that were bridged by the hold window.
+        self._held_detections = 0
         self._beauty: Gst.Element | None = None
         self._beauty_available = False
         self._beauty_error_reported = False
@@ -218,6 +226,16 @@ class PlaybackBackend:
     @property
     def beauty_active(self) -> bool:
         return bool(self._beauty is not None and self._config.beauty.enabled)
+
+    @property
+    def faces(self) -> tuple[Face, ...]:
+        """Faces currently driving the shader (possibly held; see ``hold_ms``)."""
+        return self._faces
+
+    @property
+    def held_detections(self) -> int:
+        """How many empty detections were bridged by the hold window."""
+        return self._held_detections
 
     def refresh_beauty(self) -> None:
         """Push the current beauty configuration to the running shader.
@@ -363,6 +381,9 @@ class PlaybackBackend:
         self._coded_size = (0, 0)
         self._texture_size = (0, 0)
         self._faces = ()
+        self._landmarks = ()
+        self._last_face_seen = 0.0
+        self._held_detections = 0
         self.video_info = {}
         target = Gst.State.PLAYING if autoplay else Gst.State.PAUSED
         self._pipeline.set_state(target)
@@ -469,6 +490,8 @@ class PlaybackBackend:
         self._beauty_started = 0.0
         self._beauty_times.clear()
         self._faces = ()
+        self._landmarks = ()
+        self._last_face_seen = 0.0
         self._paintable = None
         self._decoder_name = None
         self._converter_name = None
@@ -625,10 +648,18 @@ class PlaybackBackend:
         if not texture[0] or not texture[1]:
             texture = (display_width, display_height)
         beauty = self._config.beauty
+        primary = primary_face(self._faces)
+        ordered = self._faces
+        if primary is not None and len(self._faces) > 1:
+            # u_face0 is what the M5 warp gates on, so the largest face must be
+            # first regardless of the detector's ordering.
+            ordered = (primary,) + tuple(f for f in self._faces if f is not primary)
         return BeautyParams.from_config(beauty).uniforms(
             frame_size=(display_width, display_height),
             texture_size=texture,
-            faces=self._faces,
+            faces=ordered,
+            landmarks=self._landmarks,
+            face_box=primary,
             rotation=self._rotation,
             compare_mode=beauty.compare_mode,
             split=beauty.split,
@@ -868,8 +899,31 @@ class PlaybackBackend:
 
     def _on_detection_result(self, result: DetectionResult) -> None:
         # The shader mask follows the newest detection; no faces means the
-        # beauty pass leaves the frame untouched (F6/F7 contract).
-        self._faces = tuple(result.faces)
+        # beauty pass leaves the frame untouched (F6/F7 contract).  A single
+        # empty result between two good ones used to un-mask exactly one frame,
+        # and the shader snapping back to pass-through for that frame is the
+        # flicker M5 fixes: keep the previous faces for ``detection.hold_ms``.
+        now = time.monotonic()
+        hold_seconds = self._config.detection.hold_ms / 1000.0
+        faces = tuple(result.faces)
+        if faces:
+            self._faces = faces
+            self._last_face_seen = now
+            self._landmarks = smooth_landmarks(
+                self._landmarks, primary_face(self._faces)
+            )
+        elif (
+            hold_seconds > 0.0
+            and self._faces
+            and (now - self._last_face_seen) < hold_seconds
+        ):
+            self._held_detections += 1
+            # Same faces for the shader and the overlay: the UI boxes must not
+            # blink either, so the callback sees the held result too.
+            result = replace(result, faces=self._faces, held=True)
+        else:
+            self._faces = ()
+            self._landmarks = ()
         self._push_beauty_uniforms()
         self._dispatch(self.on_detection, result)
 

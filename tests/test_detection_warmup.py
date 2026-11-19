@@ -92,47 +92,65 @@ def test_warmup_frame_sizes_skips_the_swap_for_upright_streams(
     assert warmup_frame_sizes(1920, 1080, rotation) == [(1920, 1080)]
 
 
-def test_prepare_loads_without_running_an_inference(
+def test_prepare_loads_and_warms_up_before_start(
     fake_detector: type[_FakeDetector],
 ) -> None:
+    np = pytest.importorskip("numpy")
     tap = FaceDetectionTap(Config(), lambda result: None)
     tap.prepare()
     detector = fake_detector.instances[-1]
     assert detector.loaded is True
-    assert detector.detected == []
+    assert detector.detected == [(1080, 1920, 3)]
     tap._detector = None  # detach so the fake is not closed behind our back
+    assert np is not None
 
 
-def test_start_warms_up_with_a_real_sized_frame(
+def test_prepare_warms_up_with_a_real_sized_frame(
     fake_detector: type[_FakeDetector],
 ) -> None:
-    np = pytest.importorskip("numpy")
+    pytest.importorskip("numpy")
     tap = FaceDetectionTap(Config(), lambda result: None, rotation=lambda: 180)
     tap.set_source_size(1920, 1080)
     pad = _FakePad()
+    tap.prepare()
+    detector = fake_detector.instances[-1]
+    assert detector.detected == [(1080, 1920, 3)]
     tap.start(pad)  # type: ignore[arg-type]
     try:
-        detector = fake_detector.instances[-1]
+        # start() must not repeat the inference on the streaming thread.
         assert detector.detected == [(1080, 1920, 3)]
     finally:
         tap.stop()
     assert detector.closed is True
     assert pad.removed == [7]
-    assert np is not None
 
 
-def test_start_warms_up_the_rotated_size_for_quarter_turns(
+def test_prepare_warms_up_the_rotated_size_for_quarter_turns(
     fake_detector: type[_FakeDetector],
 ) -> None:
     pytest.importorskip("numpy")
     tap = FaceDetectionTap(Config(), lambda result: None, rotation=lambda: 90)
     tap.set_source_size(1920, 1080)
-    tap.start(_FakePad())  # type: ignore[arg-type]
+    tap.prepare()
     try:
         assert fake_detector.instances[-1].detected == [
             (1080, 1920, 3),
             (1920, 1080, 3),
         ]
+    finally:
+        tap.stop()
+
+
+def test_warm_up_runs_only_once(
+    fake_detector: type[_FakeDetector],
+) -> None:
+    pytest.importorskip("numpy")
+    tap = FaceDetectionTap(Config(), lambda result: None)
+    tap.prepare()
+    tap.prepare()
+    tap.start(_FakePad())  # type: ignore[arg-type]
+    try:
+        assert fake_detector.instances[-1].detected == [(1080, 1920, 3)]
     finally:
         tap.stop()
 

@@ -51,6 +51,71 @@ class DetectionResult:
     #: True when the scheduler reused the previous detection instead of running
     #: the NPU for this frame.
     reused: bool = False
+    #: True when this result was empty but the backend kept the previous faces
+    #: (see :attr:`video_player.config.DetectionConfig.hold_ms`).  The UI shows
+    #: the held boxes; the shader keeps the held mask.
+    held: bool = False
+
+
+def face_centre(face: "Face") -> tuple[float, float]:
+    """Centre of the face box, in frame pixels."""
+    return (face.x + face.width / 2.0, face.y + face.height / 2.0)
+
+
+def primary_face(faces: Sequence[Face]) -> "Face | None":
+    """Return the largest face by box area (the one the demo is about) or None."""
+    best: Face | None = None
+    best_area = -1.0
+    for face in faces:
+        area = face.width * face.height
+        if area > best_area:
+            best = face
+            best_area = area
+    return best
+
+
+def smooth_landmarks(
+    previous: Sequence[tuple[float, float]] | None,
+    face: "Face | None",
+    *,
+    alpha: float = 0.35,
+) -> tuple[tuple[float, float], ...]:
+    """Exponential-moving-average the five landmarks of the tracked face.
+
+    The NPU runs at ~10 Hz while the display runs at 30 fps, so the raw
+    landmark points (used as the eye/warp control points in M5) jitter by a few
+    pixels from detection to detection.  ``alpha`` is the weight of the new
+    sample: ``smoothed = previous + alpha * (new - previous)``.
+
+    The history is dropped -- the new points are returned as-is -- when the
+    point count changes or the face centre jumps by more than 30 % of the face
+    width: that is a different face, not motion, and blending across it would
+    put the control points halfway between two people.
+    """
+    if face is None:
+        return ()
+    if len(face.landmarks) != 5:
+        return ()
+    current = tuple((float(x), float(y)) for x, y in face.landmarks)
+    if previous is None or len(previous) != 5:
+        return current
+    old = tuple((float(x), float(y)) for x, y in previous)
+    threshold = 0.3 * float(face.width)
+    old_x = sum(point[0] for point in old) / len(old)
+    old_y = sum(point[1] for point in old) / len(old)
+    new_x = sum(point[0] for point in current) / len(current)
+    new_y = sum(point[1] for point in current) / len(current)
+    if (new_x - old_x) ** 2 + (new_y - old_y) ** 2 > threshold**2:
+        return current
+    weight = max(0.0, min(1.0, float(alpha)))
+    return tuple(
+        (
+            old_point[0] + weight * (new_point[0] - old_point[0]),
+            old_point[1] + weight * (new_point[1] - old_point[1]),
+        )
+        for old_point, new_point in zip(old, current)
+    )
+
 
 
 @runtime_checkable

@@ -20,6 +20,7 @@ def test_parser_defaults() -> None:
     assert args.require_board is False
     assert args.snapshot is None
     assert args.snapshot_delay == 3.0
+    assert args.lang is None
 
 
 def test_parser_accepts_media_and_flags() -> None:
@@ -32,6 +33,8 @@ def test_parser_accepts_media_and_flags() -> None:
             "out/ui.png",
             "--snapshot-delay",
             "1.5",
+            "--lang",
+            "en",
             "clip.mp4",
             "folder",
         ]
@@ -41,6 +44,7 @@ def test_parser_accepts_media_and_flags() -> None:
     assert args.config == Path("custom.json")
     assert args.snapshot == Path("out/ui.png")
     assert args.snapshot_delay == 1.5
+    assert args.lang == "en"
 
 
 def test_version_flag_prints_package_version(capsys: pytest.CaptureFixture[str]) -> None:
