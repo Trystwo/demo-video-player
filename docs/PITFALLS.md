@@ -25,7 +25,10 @@
 | `Gtk.WidgetPaintable.to_node()` 返回 None | 窗口尚未真正绘制出首帧 | 按 500 ms 轮询重试（实测启动后约 2.5–5 s 才就绪）；录制/截图等 `to_node()` 可用再开始 |
 | `--snapshot` 无输出/失败 | 非全屏（windowed）模式下窗口快照路径不可用 | 用 `--demo`/全屏模式；或直接走 `--record` |
 | 关窗时崩溃/资源泄漏 | GTK4 **不发射** `GtkWidget::destroy` 信号 | 清理逻辑挂 `close-request`，`window.close()`；退出顺序仍是「先关窗、再 quit、末尾 `os._exit`」 |
-| 新增 shader uniform 后画面无变化，也没有报错 | `glshader` 的 `uniforms` 只接受 `G_TYPE_FLOAT` 标量（gdouble/int 被静默忽略，甚至全黑）；Python 侧返回键集必须与 shader 的 `uniform float` 声明**完全一致**，缺键/多键都不报错 | 改 shader 声明时同步改 `beauty.uniforms()`/`WARP_UNIFORM_KEYS`；`tests/test_beauty_warp.py::test_warp_uniform_keys_match_the_shader_declaration` 校验键集一致（shader 共 41 个 `uniform float`）；板端再用 `debug_mask=1`/颜色探针/抽帧确认，不能只看「没报错」 |
+| 新增 shader uniform 后画面无变化，也没有报错 | `glshader` 的 `uniforms` 只接受 `G_TYPE_FLOAT` 标量（gdouble/int 被静默忽略，甚至全黑）；Python 侧返回键集必须与 shader 的 `uniform float` 声明**完全一致**，缺键/多键都不报错 | 改 shader 声明时同步改 `beauty.uniforms()`/`WARP_UNIFORM_KEYS`；|
+| 展开侧栏「实验性」后窗口被撑出屏幕，底部滑杆点不到 | 侧栏没有滚动容器，`Gtk.Expander` 展开直接增大窗口自然高度；1280x800 板屏上旧代码窗口实测 1280x913 | 侧栏整体套 `Gtk.ScrolledWindow`；playlist 内部滚动区固定 160 px；展开后用 `GLib.timeout_add(150, …)` 延迟滚到底。**不要**用 `GLib.idle_add` 立即改 `vadjustment`：板端 GTK 4.18 实测 SIGSEGV（exit 139），timeout 版本正常 |
+| 鼠标滚轮在磨皮/美白/分割/瘦脸/大眼滑杆上只改数值，不能滚动侧栏 | `Gtk.Scale` 自带滚轮调节；外层 `Gtk.ScrolledWindow` 收不到事件 | 给每个 `Gtk.Scale` 装 `Gtk.EventControllerScroll`（VERTICAL，`PropagationPhase.CAPTURE`），在回调里 `return True` 并把 `dy * 48` 加到 `_sidebar_scroll` 的 vadjustment；滚轮剩 0 或内容不超高时返回 False。playlist 自己的滚动区不要拦截 |
+| 桌面图标启动后播放中闪退，界面上没有任何报错 | `Terminal=false` 时 stderr 不可见；原生崩溃不会打印 Python traceback；板端无 coredumpctl，`ulimit -c 0` | `diagnostics.py` 在启动时 `faulthandler.enable` 到 `$XDG_CACHE_HOME/video-player-demo/crash.log`，关键 UI 操作追加 `actions.log`；复现后看 `crash.log` 栈与 `actions.log` 最后操作。桌面启动的用户实例日志默认在 `~/.cache/video-player-demo/` |
 
 ## 3. 录制（`--record` 与演示素材采集）
 
@@ -39,7 +42,8 @@
 | `Gst.Bus` 上收不到录制分支 EOS | 录制元素名以 `rec-` 开头，被 backend 的 bus 处理误当播放消息 | backend 的 `_on_bus_message` 对 `rec-` 前缀直接 return，录制分支自己收尾 |
 | 后期或播放器忽略录制文件的方向，成片倒置/转两次 | `mp4mux` 会把源 Display Matrix（本次 07 微信素材 `rotation=-180`）原样写进录制文件；ffmpeg 默认按矩阵 autorotate，播放器也按 tag 旋转 | 后期用 ffmpeg 默认 autorotate 解码成 1080p 正立中间层再合成；最终输出加 `-map_metadata -1` 不带 rotation side data；源/成片都用 `ffprobe -show_entries stream_side_data=rotation` 复核 |
 | 本机后期报 `ffmpeg: command not found`，或字幕中文变方框 | 本机（开发机）无系统 ffmpeg/ffprobe、无 sudo，也没有 WenQuanYi 字体；板端相反，系统自带 ffmpeg 与字体 | 用静态构建 `.cache/bin/ffmpeg`、`.cache/bin/ffprobe`（ffmpeg 7.0.2-static，含 `ass`/`subtitles`/`xfade`/`fade`/`drawtext`）；从板端拷 `/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc` 到 `.cache/fonts/`，`ass`/`subtitles` 滤镜加 `fontsdir=.cache/fonts` |
-| 调小瘦脸/大眼常量后成片「看不出效果」，但 A/B 帧差仍非零 | 反向 warp 位移量小，差异集中在眼与下颌边缘：`EYE_MAGNIFY=0.35`/`SLIM_PUSH=0.05` 时同源 A/B 帧差 YAVG=1.59（PSNR 35.3 dB）仍肉眼不明显；且成片素材录的是录制当时的常量 | 常量固定为 `0.40`/`0.065`（单测 NumPy 参考实现同步）；调整常量后必须重录 07/08/09/10 等相关片段并抽帧目视（ramp/分屏）确认，不能只信帧差指标 |
+| 瘦脸把脸「凹进去一块」/ 大眼像凸眼，整体不自然（用户反馈） | 初版 warp 只在左右下颌控制点周围 0.26×脸宽 半径内做局部水平推 0.065×脸宽 → 局部凹陷而非整体收窄；大眼是圆形径向放大 0.40，眼心放大率 1/(1-0.40)=1.67× → 凸眼；且位移再乘肤色门限，逐像素权重让位移随皮肤纹理斑驳、边界断裂 | 重做为**显示空间几何**（`docs/ARCHITECTURE.md` §2.5）：瘦脸按主脸框在**整个下半脸**沿 x 向轮廓外采样（`smoothstep(-0.05,0.30,rel.y)` 眼线以上不动 + `smoothstep(0.15,0.95,|rel.x|)` 中线不动，强度 `SLIM_STRENGTH=0.16`）；大眼用眼周**椭圆各向异性**放大（`EYE_MAGNIFY=0.22`、半径 `0.16×脸宽`、纵横比 `0.72`，中心放大 1.28×）；`warp_gate` 只用未外扩主脸框的圆角 SDF，**不再乘肤色门限** |
+| 修 warp 时同源 A/B 两段录制的同 PTS 帧无法逐像素比较 | 两次录制进程启动/预热耗时不同 → 内容时间偏移数帧；人物在动，直接帧差 YAVG≈7、差异 bbox 覆盖全帧（旧版静态素材时才碰巧对齐） | ①先用 `.cache/qc/preview_warp.py` 在**同一张帧**上做 CPU `cv2.remap` 参数网格预览（最可靠）；②板端 A/B 按 30 fps 抽帧序列找最佳时间偏移后再比，或用 `cv2.findTransformECC` 对齐；③成片验证以抽帧目视（ramp 起止/分屏）为准，不只看帧差指标。改常量后必须重录 07/08/09/10 片段并重建 v3 |
 
 ## 4. 人脸检测 / 美颜
 
@@ -50,14 +54,14 @@
 | 美颜「没覆盖全脸」 | 蒙版是「检测框外扩 12% 的圆角矩形」+ 肤色门限；YuNet 框是内脸框，不含额头/发际/耳/下颌缘；镜框/眉毛/眼白会被肤色门限压低 | 用 5 点关键点拟合椭圆蒙版、加大 `expand`/`feather`；演示镜头避免极端角度 |
 | 实时播放有周期性顿挫（平均 fps 30 但体感卡） | 检测在**解码线程**里同步 `extract_dup()` 整帧 NV12（1920×1080 ≈ 3.2 MB，17–33 ms），每 3 帧堵一次，随后积压帧连发 | 已规划：取样移到独立线程 / 用 RGA 先缩放到 640×640；临时可加大 `detection.interval_frames` |
 | 背景里路人也被磨皮 / 蒙版在背景闪 | 检测返回多张脸（含远处小脸），`max_faces` 默认 3 | 演示/单人场景把 `detection.max_faces` 设为 1（只保留分数最高的人脸） |
-| 瘦脸/大眼 warp 作用到背景路人，或人脸框与关键点对不上 | warp 的 5 点关键点必须来自**主脸**（框面积最大，`face.primary_face()` 把它排到 `faces[0]`，shader 的 `warp_gate` 只认 `u_face0`）；背景有第二张脸时，若 `max_faces>1`，主脸排序/关键点可能对应到错误人脸 | 演示素材背景有第二张脸时必须 `detection.max_faces=1`（`docs/demo-video/configs/video_*.json` 已统一）；多脸场景开实验 warp 前先确认 `faces[0]` 是最大脸；`tests/test_detection_hold.py` 覆盖主脸排第一与无 landmarks 时不启用 warp |
+| 瘦脸/大眼 warp 作用到背景路人，或人脸框与关键点对不上 | warp 几何必须来自**主脸**（框面积最大，`face.primary_face()` 把它排到 `faces[0]`，shader 的 `warp_gate` 只认 `u_face0`）；大眼用主脸 5 点关键点、瘦脸用主脸框，背景有第二张脸时若 `max_faces>1`，主脸排序可能对应到错误人脸 | 演示素材背景有第二张脸时必须 `detection.max_faces=1`（`docs/demo-video/configs/video_*.json` 已统一）；多脸场景开实验 warp 前先确认 `faces[0]` 是最大脸；`tests/test_detection_hold.py` 覆盖主脸排第一与无 landmarks 时不启用 warp |
 | 自拍/手机素材检测分数贴阈值（0.5–0.6）易丢 | 特写人脸过大（占画面 1600×950 px），YuNet 在 640×640 输入上偏弱 | 演示素材选中等景别；必要时降低 `min_score` 或依赖 `detection.hold_ms` 保持 |
 
 ## 5. 测试 / 本机环境
 
 | 现象 | 原因 | 规避 |
 |---|---|---|
-| `pytest` 报 `ModuleNotFoundError: gi` / numpy 缺失 | 系统 `python3` 有 `gi` 无 numpy；`.venv/bin/python` 有 numpy 无 gi（用 `PYTHONPATH=/usr/lib/python3/dist-packages` 可补） | 常规单测用系统 `python3 -m pytest tests -q`（M5 收尾：149 passed / 15 skipped）；需要 numpy 的测试用 `.venv/bin/python` 并补 `PYTHONPATH` |
+| `pytest` 报 `ModuleNotFoundError: gi` / numpy 缺失 | 系统 `python3` 有 `gi` 无 numpy；`.venv/bin/python` 有 numpy 无 gi（用 `PYTHONPATH=/usr/lib/python3/dist-packages` 可补） | 常规单测用系统 `python3 -m pytest tests -q`（M5 收尾：164 passed / 15 skipped）；需要 numpy 的测试用 `.venv/bin/python` 并补 `PYTHONPATH` |
 | `.venv` 下 3 个测试失败 | numpy 1.26 与测试断言的历史差异（beauty mask 羽化、NV12 跨步转换、YuNet NMS 数量），M3 前代码同样失败（M5 收尾复测 211 passed / 3 failed，仍为同样 3 个） | 非回归；以系统 python（无 numpy）结果为准 |
 | 板端 `pytest` 不存在 | 板端未装 pytest | 板端用脚本/应用实测验证；单测在本机跑 |
 
@@ -69,7 +73,7 @@
 | 飞书 `<ol seq>` 编号不生效 | 该 API 不支持 `seq` 属性（`degrade_code=5002`） | 需要编号用普通段落手写 `1.` `2.` `3.`；或 `docs +update --command block_replace` 局部替换 |
 | `docs +create` 后标题重复 | 工具会自动在正文前插入 `<title>` | 正文 XML 不要自带 title |
 | 全局替换字幕/视频后旧 token 失效 | 飞书文档里的图片/视频是 token 引用 | 替换媒体后确认 block 内 token 已更新；删除旧 block 前先 fetch 核对 |
-| 成片体积偏大，飞书/Release 上传慢 | 同一 v3 时间轴 CRF18 编码为 57.3 MB；演示清晰度对更高码率收益有限 | 最终编码用 CRF21（35.5 MB，仍满足清晰度）并保留 `+faststart`；发布前用 `ffprobe` 复核体积/分辨率/时长 |
+| 成片体积偏大，飞书/Release 上传慢 | 同一 v3 时间轴 CRF18 编码为 57.3 MB；演示清晰度对更高码率收益有限 | 最终编码用 CRF21（35.4 MB，仍满足清晰度）并保留 `+faststart`；发布前用 `ffprobe` 复核体积/分辨率/时长 |
 
 ## 7. 复现入口
 

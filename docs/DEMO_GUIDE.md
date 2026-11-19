@@ -1,6 +1,6 @@
 # 演示指南
 
-> 状态：M1（2026-11-14，1080p30 实时）、M2（2026-11-16，NPU 检测 + 人脸框）、M3（2026-11-17，GPU 美颜 + 对比分屏）、M4 应用内录制（2026-11-18，`--record` + 61.8s 演示成片）、M5（2026-11-18，检测保持 + 实验性瘦脸/大眼 + 52.03s v3 成片）均已实现并在板端验证；本文件按 M5 实测修订。演示范围（2026-11-14 确认）：本地硬解播放 + 自动美颜 + 一键/分屏对比 + 实验性几何美颜；网络流与字幕不在本期。
+> 状态：M1（2026-11-14，1080p30 实时）、M2（2026-11-16，NPU 检测 + 人脸框）、M3（2026-11-17，GPU 美颜 + 对比分屏）、M4 应用内录制（2026-11-18，`--record` + 61.8s 演示成片）、M5（2026-11-18 检测保持 + 实验性瘦脸/大眼；2026-11-19 按用户反馈重做 warp 几何、重剪 52.10s v3 成片）均已实现并在板端验证；本文件按 M5 实测修订。演示范围（2026-11-14 确认）：本地硬解播放 + 自动美颜 + 一键/分屏对比 + 实验性几何美颜；网络流与字幕不在本期。
 > 环境与性能前置条件见 [BOARD.md](BOARD.md)，范围见 [PRD.md](PRD.md)，交付与拍摄计划见 [DELIVERY.md](DELIVERY.md)。
 
 ## 1. 演示目标
@@ -19,7 +19,7 @@
 | 系统 | Debian 13 出厂镜像，GNOME/Wayland 会话 | 就绪 |
 | 板端依赖 | `./install.sh --require-board` 全部通过并输出 `Deployment complete.` | `mppvideodec`/`gtk4paintablesink`/`glshader`/`glcolorscale`/`librknnrt` 均已验证；启动器与桌面入口已部署 |
 | 模型 | `models/yunet_rk3576.rknn` 已放置（`scripts/convert_yunet.py` 生成） | 已就绪（M2） |
-| 素材 | 唯一素材 `07_wechat_selfie_h265.mp4`：HEVC 1920×1080@30、37.65 s、display matrix -180（播放器自动校正方向）；板端 `/home/tris/demo-footage/` | 已就绪（M5 v3 全部镜头均取自该素材） |
+| 素材 | 唯一素材 `selfie-demo-1080p30-h265.mp4`：HEVC 1920×1080@30、37.65 s、display matrix -180（播放器自动校正方向）；板端 `/home/tris/demo-footage/` | 已就绪（M5 v3 全部镜头均取自该素材） |
 | 检测保持/实验配置 | `detection.hold_ms=600`（检测保持）；`beauty.face_slim` / `beauty.eye_enlarge` 默认 0（关闭） | 已就绪（M5，`configs/player.example.json`） |
 | 音频 | 板载扬声器或耳机 | 就绪 |
 | 环境 | 现场灯光均匀，人物面向屏幕，与镜头 ≤45° 侧脸也可验证 | — |
@@ -54,9 +54,11 @@ python3 -m video_player --check
 6. **一键对比**：`Compare` 按钮或 `C` 键切换分屏/整帧；`Split position` 拖动分割线；
    `B` 键直接开关美颜。三者都在同一帧内完成（F9）。
 7. **实验性美颜（M5）**：展开侧栏的「实验性 / Experimental」折叠面板（默认折叠），
-   把「瘦脸 / Face slim」与「大眼 / Eye enlarge」两个 0–100 滑杆分别拖到 100 再归零。
-   说明两项默认 0 = 与 M4 视觉等价；效果只作用于主脸（主脸 mask × 肤色门限限定作用域，
-   按 5 点关键点做反向 warp，最后照常磨皮），背景、头发、衣服与眼镜框不动。
+   侧栏会自动滚到底部；把「瘦脸 / Face slim」与「大眼 / Eye enlarge」两个 0–100 滑杆
+   分别拖到 100 再归零。
+   说明两项默认 0 = 与 M4 视觉等价；效果只作用于主脸（作用域是主脸框的圆角 mask，
+   瘦脸把下半脸沿轮廓整体内收、大眼以双眼关键点为心做椭圆放大，最后照常磨皮），
+   背景、头发、衣服基本不动。
 8. **检测保持（M5）**：说明美颜不再闪烁——检测约 10 Hz 一次，无脸帧默认沿用上次人脸与
    关键点 `detection.hold_ms=600`，超时才透传；01 近景素材实测「检测空档导致的美颜闪断」
    从 6 次降为 0（`hold_ms=0` 可现场复现旧的 6 次）。
@@ -78,12 +80,12 @@ export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 GST_GL_PLATFORM=
 python3 docs/demo-video/record_video.py \
     --config docs/demo-video/configs/video_beauty.json \
     --out rec3/02_beauty.mp4 --seconds 9.2 --start-at 2 \
-    /home/tris/demo-footage/07_wechat_selfie_h265.mp4
+    /home/tris/demo-footage/selfie-demo-1080p30-h265.mp4
 # 实验滑杆 ramp：--ramp-slim 0:100 / --ramp-eye 0:100（默认录制后 1.0s 起，seconds-0.5 止）
 python3 docs/demo-video/record_video.py \
     --config docs/demo-video/configs/video_experimental.json \
     --out rec4/07_slim.mp4 --seconds 5.2 --start-at 24 --ramp-slim 0:100 \
-    /home/tris/demo-footage/07_wechat_selfie_h265.mp4
+    /home/tris/demo-footage/selfie-demo-1080p30-h265.mp4
 
 # 带 UI 的现场录像（--record，1280×800@30 H.264；R 键交互 / 定时收尾）
 python3 -m video_player --demo --record /tmp/demo.mp4 /path/to/video.mp4
@@ -93,8 +95,8 @@ python3 -m video_player --demo --record /tmp/demo.mp4 --record-duration 12 --con
 - `--record` 录制时 GPU 交给录制器，DSI 屏的视频区会变黑，属预期；录制文件本身正常（侧栏、信息行、人脸框都在画面里）。录制第一帧后约 2 秒内会自动预热画布；前 2.5 秒可能出现 mixer 未出帧的空画面，后期剪掉即可（`docs/demo-video/build_video.sh` 里 `TRIM=2.5` 就是为此）。
 - `--record` 会旁路显示分支（`display_bypass=True`），播放/美颜逻辑与性能不变，实测录制时 fps 稳定 30.0、CPU 184–205%。
 - 纯视频录制的文件保留源 display matrix（`ffprobe` 可见 `rotation=-180`），播放器按元数据校正；后期 ffmpeg 默认 autorotate 解码成 1080p 正立中间层，最终成片**不带**旋转元数据。
-- **M5 成片（当前）**：`docs/demo-video/out/video-player-m5-demo-v3.mp4`，52.03 s / 1920×1080@30 / H.264 yuv420p / CRF21 / **35.5 MB** / 无音轨 / `+faststart`；12 段结构为 原图 → 一键开关 1.4× 放大交替 → 分屏 → 磨皮 ramp → 瘦脸 ramp → 大眼 ramp → 全开 → 分屏前后对比 → 收尾（H.265 方向校正）。
-- 成片自检：`framemd5` 1561 帧、相邻重复帧 **0**（<2%）；纹理回弹/闪烁检测超阈值连续段 **0**（中位数 588 / 阈值 1059）；抽帧目视画面正立、无闪烁、字幕与角标不遮挡人脸。
+- **M5 成片（当前，2026-11-19 warp 重做后重剪）**：`docs/demo-video/out/video-player-m5-demo-v3.mp4`，52.10 s / 1920×1080@30 / H.264 yuv420p / CRF21 / **35.4 MB**（35,433,497 B）/ 无音轨 / `+faststart`；12 段结构为 原图 → 一键开关 1.4× 放大交替 → 分屏 → 磨皮 ramp → 瘦脸 ramp → 大眼 ramp → 全开 → 分屏前后对比 → 收尾（H.265 方向校正）。
+- 成片自检：`framemd5` 1563 帧、相邻重复帧 **0**（<2%）；纹理回弹/闪烁检测超阈值连续段 **0**（中位数 1456 / 阈值 2621）；抽帧目视画面正立、无闪烁、字幕与角标不遮挡人脸，瘦脸为整体收窄、大眼温和自然。
 - 演示成片与拍摄脚本放在内部目录 `docs/demo-video/`（不随公开仓库导出）：`build_video_v3.sh`（12 段 cut → concat → ass 烧字幕 → final encode）、`subtitles_v3.ass`（中英双语 + 左上角角标）、`record_video.py`、`configs/`；M3 首版 61.8 s 与 v2 49.8 s 成片仅作历史。
 
 ## 4. 讲解要点
@@ -107,9 +109,9 @@ python3 -m video_player --demo --record /tmp/demo.mp4 --record-duration 12 --con
 - 自动美颜的边界：先检测再处理，检测按帧间隔降低开销；检测空档由
   `detection.hold_ms=600` 保持上次人脸与关键点（5 点 EMA），超时才整条链路透传——
   这是 M5 消除美颜闪烁的做法，近景素材上闪断从 6 次降为 0。
-- 瘦脸/大眼 = 关键点驱动的**反向 warp**：先用主脸 mask × 肤色门限限定作用域，
-  再按 5 点关键点偏移采样坐标（warp 采样），最后照常磨皮；两项默认 0（与 M4 视觉等价），
-  只加约 0.1 ms/帧。
+- 瘦脸/大眼 = 几何**反向 warp**：作用域是主脸框（不再乘肤色门限，避免逐像素斑驳）；
+  瘦脸在下半脸沿轮廓左右整体内收（眼线以上不动），大眼以双眼中点为心做椭圆各向异性
+  放大（中心约 1.28×）；最后照常磨皮。两项默认 0（与 M4 视觉等价），只加约 0.1 ms/帧。
 - 效果与性能的折中：磨皮/美白强度、检测间隔、处理分辨率都是可调参数，
   演示时可以指出当前档位与实测 fps。
 
@@ -131,8 +133,8 @@ python3 -m video_player --demo --record /tmp/demo.mp4 --record-duration 12 --con
 - [x] 主窗口截图 → `docs/images/main-window.png`（2026-11-14，取自 `docs/evidence/m1-ui-gl.png`）
 - [x] 美颜前后对比截图 → `docs/images/beauty-compare.png`（A/B 近景对比，取自 `docs/evidence/m3-beauty-ab.png`）；主窗口分屏 → `docs/images/beauty-split.png`（`m3-split-demo.png`）；同帧近景 → `docs/evidence/m3-split-closeup.png`
 - [x] 板端环境自检输出（`--markdown`）→ 回填 [BOARD.md](BOARD.md)（2026-11-14 已回填；2026-11-18 补 `install.sh` 部署项）
-- [x] 演示视频（当前 v3：52.03s、1920×1080@30、35.5MB、中英双语硬字幕）→ `docs/demo-video/out/video-player-m5-demo-v3.mp4`（内部，不导出；制作流程见 `docs/demo-video/README.md`、[DELIVERY.md](DELIVERY.md) §6）；M3 的 61.8s 与 v2 的 49.8s 成片为历史
-- [x] M5 实测数据：检测保持「空档」6→0（01 近景素材，`hold_ms=600`；`hold_ms=0` 复现 6 次）；美颜+检测 30.0 fps、`beauty_ms` 0.86–0.87，warp=100 时 0.86–0.96（增量 ≤0.1 ms）；v3 成片自检（1561 帧、相邻重复帧 0、闪烁段 0）→ 原始记录见 `.cache/qc/M5_FACTS.md`（内部）
+- [x] 演示视频（当前 v3：52.10s、1920×1080@30、35.4MB、中英双语硬字幕；2026-11-19 warp 重做后重剪）→ `docs/demo-video/out/video-player-m5-demo-v3.mp4`（内部，不导出；制作流程见 `docs/demo-video/README.md`、[DELIVERY.md](DELIVERY.md) §6）；M3 的 61.8s 与 v2 的 49.8s 成片为历史
+- [x] M5 实测数据：检测保持「空档」6→0（01 近景素材，`hold_ms=600`；`hold_ms=0` 复现 6 次）；美颜+检测 30.0 fps、`beauty_ms` 0.86–0.87，warp=100 时 0.86–0.96（增量 ≤0.1 ms）；v3 成片自检（1563 帧、相邻重复帧 0、闪烁段 0）→ 原始记录见 `.cache/qc/M5_FACTS.md`（内部）
 - [x] 录制模式证据 → `docs/evidence/m4-record-split.png`（分屏+面板+信息行）、`docs/evidence/m4-record-selfie-rot180.png`（rotate-180 自拍素材正立录制）
 - [x] 验收 A1–A5 的逐条证据（A6 延期）：
   A1 `docs/evidence/m3-h265-selfie-demo.png`、A2 `m3-beauty-on/off.png` + `m3-beauty-ab.png`、

@@ -60,11 +60,11 @@ TEXT: dict[str, tuple[str, str]] = {
     "face_slim": ("瘦脸", "Face slim"),
     "eye_enlarge": ("大眼", "Eye enlarge"),
     "experimental_note": (
-        "五点关键点驱动的局部几何形变，只作用于主脸；瘦脸收窄下颌线，"
-        "大眼放大眼睛。移动端 GPU 上属于实验特性。",
-        "Local geometric warp driven by the five face landmarks; applies to "
-        "the primary face only. Slim narrows the jawline, enlarge magnifies "
-        "the eyes. Experimental on the mobile GPU.",
+        "几何形变只作用于主脸：瘦脸把下半脸沿轮廓整体收窄，"
+        "大眼以双眼关键点为心做椭圆放大。移动端 GPU 上属于实验特性。",
+        "Geometric warp on the primary face only: slim narrows the whole lower "
+        "face along its contour, enlarge magnifies an elliptical region around "
+        "the eye centres. Experimental on the mobile GPU.",
     ),
     "play_pause": ("播放 / 暂停（空格）", "Play / pause (space)"),
     "previous": ("上一项（P）", "Previous item (p)"),

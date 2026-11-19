@@ -221,10 +221,11 @@ def test_primary_face_is_first_for_the_shader(harness: _Harness) -> None:
     assert values["u_face0_w"] == pytest.approx(526.0 / 1920.0)
     assert values["u_face1_w"] == pytest.approx(120.0 / 1920.0)
     assert values["u_warp_ready"] == 1.0
-    # Warp centre is the big face's centre, not the first detector box.
-    assert values["u_warp_cx"] == pytest.approx(
-        1.0 - (600.0 + 526.0 / 2.0) / 1920.0
-    )
+    # Warp centre is the big face's centre, not the first detector box, and it
+    # is normalised in *display* space (the shader rotates the texture itself).
+    assert values["u_warp_cx"] == pytest.approx((600.0 + 526.0 / 2.0) / 1920.0)
+    assert values["u_warp_cy"] == pytest.approx((250.0 + 599.0 / 2.0) / 1080.0)
+    assert values["u_warp_rot"] == pytest.approx(180.0)
 
 
 def test_no_landmarks_means_no_warp(harness: _Harness) -> None:

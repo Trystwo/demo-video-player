@@ -80,25 +80,23 @@ uniform float u_face2_y;
 uniform float u_face2_w;
 uniform float u_face2_h;
 // Experimental warp (M5): normalised 0-1 strengths and the primary face's
-// five YuNet landmarks mapped into texture space.  All positions are UVs, so
-// the warp is resolution independent (the UI texture and the recorded texture
-// have different pixel sizes but the same UVs).
+// geometry.  Every position below is normalised in *display* UV space (the
+// upright frame); the shader rotates the texture UV into display space itself,
+// so the maths is independent of the stream's display rotation.  The warp is
+// resolution independent (the UI texture and the recorded texture have
+// different pixel sizes but the same UVs).
 uniform float u_slim;
 uniform float u_eyes;
 uniform float u_warp_ready;
 uniform float u_warp_cx;
 uniform float u_warp_cy;
+uniform float u_warp_face_w;
+uniform float u_warp_face_h;
 uniform float u_warp_lx0;
 uniform float u_warp_ly0;
 uniform float u_warp_lx1;
 uniform float u_warp_ly1;
-uniform float u_warp_jx0;
-uniform float u_warp_jy0;
-uniform float u_warp_jx1;
-uniform float u_warp_jy1;
-uniform float u_warp_eye_r;
-uniform float u_warp_slim_r;
-uniform float u_warp_face_w;
+uniform float u_warp_rot;
 
 // Signed distance to a rounded box centred on the origin (negative inside).
 float rounded_box(vec2 p, vec2 half_size, float radius) {
@@ -169,55 +167,109 @@ vec3 whiten(vec3 rgb, float amount) {
 }
 
 // --- M5 experimental warp -------------------------------------------------
-// Backwards warps: the shader samples *elsewhere* for the output pixel, so a
-// sample taken further out at the jaw makes the face edge move inwards (slim),
-// and a sample taken closer to the eye centre makes the eye bigger.
+// Both effects are backwards warps evaluated in *display* space: texture UV ->
+// display UV, move the sample point, then map back.  Display space keeps the
+// geometry independent of the stream's rotation metadata (the stored texture
+// may be upside down or sideways) and lets the centroid/landmark maths use the
+// upright coordinates the detector produced.
 //
-// Falloff is 1 at the control point and 0 at `radius` (the spec's
-// smoothstep(radius, 0, dist) spelled explicitly).
-float warp_falloff(vec2 delta, float radius) {
-    return 1.0 - smoothstep(0.0, max(radius, 0.0001), length(delta));
-}
-
-vec2 eye_offset(vec2 uv, vec2 eye) {
-    vec2 delta = uv - eye;
-    return -delta * (0.40 * u_eyes * warp_falloff(delta, u_warp_eye_r));
-}
-
-vec2 slim_offset(vec2 uv, vec2 jaw, vec2 centre) {
-    vec2 delta = uv - jaw;
-    float side = jaw.x < centre.x ? -1.0 : 1.0;
-    return vec2(side, 0.0)
-        * (0.065 * u_warp_face_w * u_slim * warp_falloff(delta, u_warp_slim_r));
-}
-
-// Main-face mask (box 0 only): the warp must never touch the background or a
-// second face.  The skin gate keeps hair/glasses inside the box still.
-float warp_gate(vec2 px, vec3 rgb) {
-    float mask = face_mask(px, vec4(u_face0_x, u_face0_y, u_face0_w, u_face0_h));
-    return mask * mix(1.0, skin_gate(rgb), u_skin);
-}
-
-vec2 warp_uv(vec2 uv) {
-    if (u_warp_ready < 0.5) {
-        return uv;
+// Face slim compresses the outer part of the lower face towards the vertical
+// centre line, so the whole jawline moves inwards smoothly.  (A local push
+// around a jaw control point only dents the cheek: M5 review feedback.)
+// Eye enlarge is a mild anisotropic magnification centred on each eye with a
+// wide falloff, so the eyelid/brow boundary blends into untouched pixels.
+vec2 tex_to_display(vec2 uv) {
+    float r = u_warp_rot;
+    if (r > 45.0 && r < 135.0) {
+        return vec2(1.0 - uv.y, uv.x);
     }
-    vec2 px = uv * vec2(u_full_w, u_full_h);
-    float gate = warp_gate(px, texture2D(tex, uv).rgb);
+    if (r > 135.0 && r < 225.0) {
+        return vec2(1.0 - uv.x, 1.0 - uv.y);
+    }
+    if (r > 225.0 && r < 315.0) {
+        return vec2(uv.y, 1.0 - uv.x);
+    }
+    return uv;
+}
+
+vec2 display_to_tex(vec2 uv) {
+    float r = u_warp_rot;
+    if (r > 45.0 && r < 135.0) {
+        return vec2(uv.y, 1.0 - uv.x);
+    }
+    if (r > 135.0 && r < 225.0) {
+        return vec2(1.0 - uv.x, 1.0 - uv.y);
+    }
+    if (r > 225.0 && r < 315.0) {
+        return vec2(1.0 - uv.y, uv.x);
+    }
+    return uv;
+}
+
+// Gate for the warp: 1 inside the primary face box, 0 outside it.  The box is
+// deliberately *not* expanded (u_expand widens only the smoothing mask): the
+// warp must not drag ears, hair or the background along the silhouette.
+float warp_gate(vec2 px, vec4 box) {
+    if (box.z <= 0.0 || box.w <= 0.0) {
+        return 0.0;
+    }
+    vec2 size = vec2(u_full_w, u_full_h);
+    vec2 centre = (box.xy + box.zw * 0.5) * size;
+    vec2 half_size = max(box.zw * 0.5 * size, vec2(1.0));
+    float radius = min(half_size.x, half_size.y) * 0.45;
+    float dist = rounded_box(px - centre, half_size, radius);
+    return 1.0 - smoothstep(-2.0, 6.0, dist);
+}
+
+// Display-space horizontal compression of the lower face.  ``rel`` is measured
+// in half face-box units, so +-1 is the box edge: the centre column and
+// everything above the eyes stay put while the outer cheeks and the jawline
+// are sampled further out (which makes the visible face narrower).
+vec2 face_slim_offset(vec2 disp) {
+    vec2 half_size = max(vec2(u_warp_face_w, u_warp_face_h) * 0.5, vec2(0.0001));
+    vec2 rel = (disp - vec2(u_warp_cx, u_warp_cy)) / half_size;
+    float vertical = smoothstep(-0.05, 0.30, rel.y);
+    float horizontal = smoothstep(0.15, 0.95, abs(rel.x));
+    return vec2(
+        (disp.x - u_warp_cx) * (u_slim * 0.16 * vertical * horizontal),
+        0.0
+    );
+}
+
+// Mild anisotropic magnification around one eye centre.  The falloff reaches 0
+// at the ellipse edge (0.72 aspect: wider than tall) so the eyelid and brow
+// pixels blend into the surrounding skin without shearing.
+vec2 eye_enlarge_offset(vec2 disp, vec2 eye) {
+    vec2 delta = disp - eye;
+    vec2 radii = max(
+        vec2(0.16 * u_warp_face_w, 0.16 * u_warp_face_w * 0.72),
+        vec2(0.0001)
+    );
+    float radius = length(delta / radii);
+    float falloff = 1.0 - smoothstep(0.20, 1.0, radius);
+    return -delta * (0.22 * u_eyes * falloff);
+}
+
+vec2 warp_uv(vec2 texcoord) {
+    if (u_warp_ready < 0.5 || (u_slim <= 0.001 && u_eyes <= 0.001)) {
+        return texcoord;
+    }
+    vec2 px = texcoord * vec2(u_full_w, u_full_h);
+    float gate = warp_gate(px, vec4(u_face0_x, u_face0_y, u_face0_w, u_face0_h));
     if (gate <= 0.001) {
-        return uv;
+        return texcoord;
     }
-    vec2 centre = vec2(u_warp_cx, u_warp_cy);
+    vec2 disp = tex_to_display(texcoord);
     vec2 offset = vec2(0.0);
-    if (u_eyes > 0.001) {
-        offset += eye_offset(uv, vec2(u_warp_lx0, u_warp_ly0));
-        offset += eye_offset(uv, vec2(u_warp_lx1, u_warp_ly1));
-    }
     if (u_slim > 0.001) {
-        offset += slim_offset(uv, vec2(u_warp_jx0, u_warp_jy0), centre);
-        offset += slim_offset(uv, vec2(u_warp_jx1, u_warp_jy1), centre);
+        offset += face_slim_offset(disp);
     }
-    return clamp(uv + offset * gate, vec2(0.0), vec2(1.0));
+    if (u_eyes > 0.001) {
+        offset += eye_enlarge_offset(disp, vec2(u_warp_lx0, u_warp_ly0));
+        offset += eye_enlarge_offset(disp, vec2(u_warp_lx1, u_warp_ly1));
+    }
+    vec2 warped = clamp(disp + offset * gate, vec2(0.0), vec2(1.0));
+    return clamp(display_to_tex(warped), vec2(0.0), vec2(1.0));
 }
 
 void main() {
@@ -325,8 +377,8 @@ class BeautyParams:
                 landmarks belong to it (``normalise_face_boxes`` keeps the order).
             landmarks: five YuNet points of the primary face, in display
                 coordinates.  Defaults to ``faces[0].landmarks`` when omitted.
-            face_box: primary face box; defaults to ``faces[0]``.  Only used to
-                place the jaw control points.
+            face_box: primary face box; defaults to ``faces[0]``.  Its centre and
+                size drive the slim warp region.
             rotation: clockwise display rotation applied to the decoded frame
                 before it reaches the screen (the detector rotates by the same
                 amount, so boxes must be mapped back for the shader).
@@ -421,22 +473,19 @@ LANDMARK_MOUTH_RIGHT = 3
 LANDMARK_MOUTH_LEFT = 4
 
 #: Warp uniforms written by :func:`warp_uniforms` (every key always present so
-#: the shader's uniform set never changes at runtime).
+#: the shader's uniform set never changes at runtime).  All values are in
+#: display space: the geometry is upright, whatever the stream rotation is.
 WARP_UNIFORM_KEYS = (
     "u_warp_ready",
     "u_warp_cx",
     "u_warp_cy",
+    "u_warp_face_w",
+    "u_warp_face_h",
     "u_warp_lx0",
     "u_warp_ly0",
     "u_warp_lx1",
     "u_warp_ly1",
-    "u_warp_jx0",
-    "u_warp_jy0",
-    "u_warp_jx1",
-    "u_warp_jy1",
-    "u_warp_eye_r",
-    "u_warp_slim_r",
-    "u_warp_face_w",
+    "u_warp_rot",
 )
 
 
@@ -473,16 +522,18 @@ def warp_uniforms(
     frame_size: tuple[int, int],
     rotation: int = 0,
 ) -> dict[str, float]:
-    """Geometry for the M5 face warp in texture UV space.
+    """Geometry for the M5 face warp, normalised in display UV space.
 
     Args:
         landmarks: the primary face's five YuNet points in display coordinates
             (right eye, left eye, nose, right mouth corner, left mouth corner).
-        face_box: primary face box in display coordinates; the jaw control
-            points are placed relative to it.
+        face_box: primary face box in display coordinates; its centre and size
+            define the region the slim warp compresses (the jawline follows the
+            box edge, the interior stays put).
         frame_size: *displayed* frame size (the landmarks' coordinate space).
-        rotation: display rotation applied after decoding (see
-            :func:`point_to_texture`).
+        rotation: clockwise display rotation applied to the decoded texture.
+            The shader rotates texture UVs back into display space, so every
+            value returned here stays upright for any stream rotation.
 
     Returns:
         A dict with every :data:`WARP_UNIFORM_KEYS` entry.  ``u_warp_ready`` is
@@ -510,54 +561,25 @@ def warp_uniforms(
     if box_w <= 0.0 or box_h <= 0.0:
         return values
 
-    centre_x = box_x + box_w * 0.5
-    centre_y = box_y + box_h * 0.5
-
-    def jaw_point(eye: int, mouth: int) -> tuple[float, float]:
-        """Midpoint of eye and mouth corner, pushed outwards and downwards.
-
-        ``outwards`` is derived from the midpoint's own side of the face centre
-        so the rule works for any head pose and display rotation instead of
-        assuming which image side landmark 0 happens to be on.
-        """
-        midpoint_x = (points[eye][0] + points[mouth][0]) * 0.5
-        midpoint_y = (points[eye][1] + points[mouth][1]) * 0.5
-        outwards = 1.0 if midpoint_x >= centre_x else -1.0
-        return (
-            midpoint_x + outwards * 0.18 * box_w,
-            midpoint_y + 0.30 * box_h,
-        )
-
-    jaw_right = jaw_point(LANDMARK_RIGHT_EYE, LANDMARK_MOUTH_RIGHT)
-    jaw_left = jaw_point(LANDMARK_LEFT_EYE, LANDMARK_MOUTH_LEFT)
-
     def uv(point: tuple[float, float]) -> tuple[float, float]:
-        u, v = point_to_texture(point[0], point[1], frame_w, frame_h, rotation)
-        return (_clamp01(u), _clamp01(v))
+        return (_clamp01(point[0] / frame_w), _clamp01(point[1] / frame_h))
 
-    centre = uv((centre_x, centre_y))
+    centre = uv((box_x + box_w * 0.5, box_y + box_h * 0.5))
     right_eye = uv(points[LANDMARK_RIGHT_EYE])
     left_eye = uv(points[LANDMARK_LEFT_EYE])
-    right_jaw = uv(jaw_right)
-    left_jaw = uv(jaw_left)
-    face_w_uv = _clamp01(box_w / float(frame_w))
 
     values.update(
         {
             "u_warp_ready": 1.0,
             "u_warp_cx": centre[0],
             "u_warp_cy": centre[1],
+            "u_warp_face_w": _clamp01(box_w / float(frame_w)),
+            "u_warp_face_h": _clamp01(box_h / float(frame_h)),
             "u_warp_lx0": right_eye[0],
             "u_warp_ly0": right_eye[1],
             "u_warp_lx1": left_eye[0],
             "u_warp_ly1": left_eye[1],
-            "u_warp_jx0": right_jaw[0],
-            "u_warp_jy0": right_jaw[1],
-            "u_warp_jx1": left_jaw[0],
-            "u_warp_jy1": left_jaw[1],
-            "u_warp_eye_r": _clamp01(0.16 * face_w_uv),
-            "u_warp_slim_r": _clamp01(0.26 * face_w_uv),
-            "u_warp_face_w": face_w_uv,
+            "u_warp_rot": float(rotation % 360),
         }
     )
     return values

@@ -57,8 +57,8 @@ filesrc → qtdemux/matroskademux/tsdemux
   `a_position`/`a_texcoord`/`u_matrix`（已板端验证，无需自写顶点 shader）；
   片元阶段是 `beauty.BEAUTY_FRAGMENT_SHADER`。
 - **不需要第二张蒙版纹理**：所有参数（最多 3 组人脸框、磨皮/美白强度、羽化像素、
-  向外扩张比例、肤色门限、分屏位置、调试开关，以及 M5 的主脸中心/双眼/下颌
-  控制点与 warp 强度）都以 scalar `G_TYPE_FLOAT` uniform 传入，遮罩在片元里由
+  向外扩张比例、肤色门限、分屏位置、调试开关，以及 M5 的主脸中心/脸宽脸高/
+  双眼中心/旋转角与 warp 强度）都以 scalar `G_TYPE_FLOAT` uniform 传入，遮罩在片元里由
   「圆角矩形 SDF + `smoothstep` 羽化」光栅化，再乘 YCbCr 肤色权重，避免把 CPU
   生成的 mask 位图上传成纹理（也规避了 `glshader` 只有一个采样器输入的约束）。
   uniform 清单：
@@ -75,12 +75,12 @@ filesrc → qtdemux/matroskademux/tsdemux
   | `u_debug` | 输出遮罩灰度预览 |
   | `u_active` | 美颜关闭或参数为恒等时置 0，片元直接透传，不采样邻域 |
   | `u_slim`, `u_eyes` | M5 实验性瘦脸/大眼强度 0–1（0 = 关闭，与 M4 等价） |
-  | `u_warp_ready`, `u_warp_cx/cy` | M5 主脸 warp 开关、主脸中心（纹理 UV） |
-  | `u_warp_lx0/ly0/lx1/ly1` | M5 双眼中心（纹理 UV，大眼向眼心采样） |
-  | `u_warp_jx0/jy0/jx1/jy1` | M5 左右下颌控制点（纹理 UV，瘦脸向脸外采样） |
-  | `u_warp_eye_r`, `u_warp_slim_r`, `u_warp_face_w` | M5 大眼/瘦脸作用半径与主脸脸宽（归一化 UV） |
+  | `u_warp_ready`, `u_warp_cx/cy` | M5 主脸 warp 开关、主脸中心（显示归一化坐标 0–1） |
+  | `u_warp_face_w/h` | M5 主脸脸宽/脸高（显示归一化），驱动瘦脸作用区 |
+  | `u_warp_lx0/ly0/lx1/ly1` | M5 双眼中心（显示归一化，大眼向眼心采样） |
+  | `u_warp_rot` | M5 纹理→显示旋转角（0/90/180/270），shader 内换回纹理坐标 |
 
-  以上 scalar uniform 共 **41 个 `G_TYPE_FLOAT`**（M3 的 25 个 + M5 新增 16 个；
+  以上 scalar uniform 共 **37 个 `G_TYPE_FLOAT`**（M3 的 25 个 + M5 新增 12 个；
   `tex` 是采样器，不计入）。
 
 - 磨皮是 8 邻域双边近似（9 tap）：空间权重随 `u_smoothing` 放大半径
@@ -200,39 +200,47 @@ mp4mux → filesink`，队列 `leaky=0` / `max-size-buffers=8`（宁可阻塞也
 并被写进录制文件（`ffprobe` 可见 `rotation=-180`），所以纯视频录制**不能再对像素
 做翻转**——否则播放器会把矩阵和像素各转一次，录制文件看起来上下颠倒。
 
-### 2.5 实验性美颜：瘦脸 / 大眼（关键点 warp，M5）
+### 2.5 实验性美颜：瘦脸 / 大眼（几何 warp，M5）
 
-M5 在 M3 颜色美颜（磨皮/美白）之外加了一组**几何形变**：瘦脸收窄下颌线、大眼放大
-眼睛。两者共用 YuNet 的 5 点关键点，默认 `face_slim=0`、`eye_enlarge=0`，即默认与
-M4 完全等价，只有把滑杆调离 0 才启用。
+M5 在 M3 颜色美颜（磨皮/美白）之外加了一组**几何形变**：瘦脸把下半脸整体收窄、
+大眼温和放大眼睛。默认 `face_slim=0`、`eye_enlarge=0`，即默认与 M4 完全等价，只有
+把滑杆调离 0 才启用。
 
-- **关键点 → 纹理坐标**：YuNet 输出右眼、左眼、鼻尖、右嘴角、左嘴角 5 点（显示
-  坐标系，检测线程已按 display matrix 旋正）。`beauty.point_to_texture()` 按
-  0/90/180/270 做与 `face_rect_to_texture()` 一致的逆映射，把点换算到 shader 的
-  纹理 UV，四个方向均有单测。
-- **几何注入**：`beauty.warp_uniforms()` 由 5 点 + 主脸框生成 16 个 warp uniform：
-  主脸中心、双眼中心、左右下颌控制点、大眼/瘦脸作用半径与脸宽。下颌控制点取
-  「眼中心与同侧嘴角中点，沿远离脸中心方向外移 0.18×脸宽、下移 0.30×脸高」；
-  半径 `eye_r = 0.16×脸宽`、`slim_r = 0.26×脸宽`；所有值 clamp 到 [0,1]。5 点缺失、
-  点数≠5 或框退化时 `u_warp_ready=0` 且全部归零——不做半套 warp，避免关键点补齐
-  时跳变。
-- **shader 反向 warp**：片元按输出像素的 UV 反算采样点——大眼在眼心附近把采样点
-  向眼心收（`-delta × 0.40 × u_eyes`，眼睛内容被放大），瘦脸在下颌把采样点向脸外
-  推（`+side × 0.065 × 脸宽 × u_slim`，轮廓内容向内收）。衰减为
-  `falloff = 1 - smoothstep(0, radius, |delta|)`；总位移再乘
-  `warp_gate = 主脸 mask × 肤色门限`，因此背景、头发、衣服与眼镜框不动；最终
+- **显示空间几何**：所有 warp 都在显示（upright）归一化坐标里计算，
+  `beauty.warp_uniforms()` 由主脸框 + 5 点关键点生成 12 个 uniform：主脸中心、脸宽/
+  脸高、双眼中心与旋转角。shader 用 `tex_to_display()` / `display_to_tex()`
+  与纹理坐标互换（0/90/180/270 四向互逆，单测覆盖）。5 点缺失、点数≠5 或框退化时
+  `u_warp_ready=0` 且全部归零——不做半套 warp，避免关键点补齐时跳变。
+- **瘦脸 = 下半脸整体收窄**：片元在脸框局部坐标
+  `rel = (disp - centre) / (face_w/2, face_h/2)` 上，纵向
+  `smoothstep(-0.05, 0.30, rel.y)`（眼线以上不动）、横向
+  `smoothstep(0.15, 0.95, |rel.x|)`（中线不动、轮廓处最大），把采样点沿 x 向轮廓外
+  拉 `(disp.x - cx) × 0.16 × u_slim`（常量 `SLIM_STRENGTH=0.16`）——下半脸左右一起
+  内收，是整体收窄而不是某几个控制点的局部凹陷。
+- **大眼 = 眼睛区域各向异性放大**：以双眼中点为心、椭圆半径
+  `(0.16×脸宽, 0.16×脸宽×0.72)`，采样点向眼心收
+  `-delta × 0.22 × u_eyes × (1 - smoothstep(0.20, 1.0, |delta/radii|))`
+  （常量 `EYE_MAGNIFY=0.22`、`EYE_RADIUS=0.16`、`EYE_ASPECT=0.72`）→ 眼心放大率约
+  1.28×，温和不凸眼；椭圆略高于宽，只覆盖眼周、不拽动整个眼眶。
+- **作用域**：位移乘 `warp_gate` = 未外扩主脸框的圆角矩形 SDF（羽化
+  `1-smoothstep(-2, 6, dist)` px），**不再乘肤色门限**（旧实现逐像素肤色权重会让
+  位移随皮肤纹理斑驳、边界出现断裂/凹陷）；框外背景、头发、衣服不动。最终
   `clamp(uv, 0, 1)` 防越界采样。
-- **执行顺序**：先用 warp 后的 UV 采样 base，遮罩/肤色仍用未 warp 的像素坐标计算，
-  磨皮在 warp 后的采样上做；分屏对比（F9）左半依然输出未 warp 的原图。
+- **执行顺序**：先用 warp 后的 UV 采样 base（瘦脸与两只眼睛的位移相加后乘 gate），
+  遮罩/磨皮仍用未 warp 的像素坐标计算，磨皮在 warp 后的采样上做；分屏对比（F9）
+  左半依然输出未 warp 的原图。
 - **UI / 配置 / 演示约束**：侧栏「实验性 / Experimental」折叠面板（默认折叠）内是
   两个 0–100 滑杆，实时生效；配置项 `beauty.face_slim`、`beauty.eye_enlarge`
-  （float，默认 0）。演示配置必须 `detection.max_faces=1`：素材背景里还有第二张
-  脸，多脸时背景人脸也会被磨皮遮罩覆盖。warp 只作用主脸——backend 用
-  `face.primary_face()` 按面积取最大者并排到 `u_face0`，不依赖检测器返回顺序。
-- **常量与调参**：大眼位移常量 `EYE_MAGNIFY=0.40`、瘦脸 `SLIM_PUSH=0.065`
-  （shader 内联，NumPy 参考实现 `tests/test_beauty_warp.py` 使用同名常量）。初版
-  取 0.35 / 0.05 时，同源 A/B 帧差 YAVG=1.59、PSNR 35.3 dB，用户级不可辨；上调后
-  成片中瘦脸与大眼可辨，未观察到背景/头发位移或眼镜框变形。
+  （float，默认 0）。侧栏整体放在 `Gtk.ScrolledWindow` 中，展开「实验性」后自动滚到
+  底部，避免 1280x800 板屏下窗口被撑出屏幕。演示配置必须 `detection.max_faces=1`：
+  素材背景里还有第二张脸，多脸时背景人脸也会被磨皮遮罩覆盖。warp 只作用主脸——
+  backend 用 `face.primary_face()` 按面积取最大者并排到 `u_face0`，不依赖检测器
+  返回顺序。
+- **演进（v1.1.1，2026-11-19）**：M5 初版用「左右下颌控制点 + 局部水平位移 +
+  肤色门限」，用户反馈瘦脸像「脸凹进去一块」、大眼不自然（径向放大 1.67×）；
+  因此重做为上述整体收窄 + 椭圆温和放大，并去掉 warp 里的肤色门限。改后 CPU 复算
+  最大瘦脸位移约 0.08×脸宽（526 px 脸约 42 px，沿轮廓平滑过渡），大眼中心放大
+  1.28×；板端 A/B（同源常量片段）与 v3 成片抽帧目视均自然。
 - **性能**：warp 只改采样坐标、不增加采样次数；美颜+检测时 `beauty_ms`
   0.86–0.87 → 0.86–0.96（瘦脸/大眼=100），增量 ≤0.1 ms，fps 仍 30.0（见 §7）。
 
@@ -250,9 +258,10 @@ M4 完全等价，只有把滑杆调离 0 才启用。
 | `src/video_player/face_yunet.py` | YuNet 后处理：按 stride 解码、NMS、映射回帧坐标 | M2 已实现（单测覆盖） |
 | `src/video_player/rknn_runtime.py` | `librknnrt.so` 的最小 ctypes 封装（init/query/inputs/run/outputs/release） | M2 已实现 |
 | `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程、NPU 起播预热（在 pipeline PLAYING 前、主线程执行） | M2 已实现；M3 加真实尺寸预热；2026-11-18 从 `start()` 移到 `prepare()`，避免 streaming thread 上 RKNN `std::bad_alloc` |
-| `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖）；M5 加 16 个 warp uniform、`point_to_texture`、`warp_uniforms` 与实验性瘦脸/大眼（单测覆盖） |
-| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、中英文切换、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志 | M1–M3 已接线（板端验证）；中英文切换已板端点击验证；M5 加「实验性」折叠面板（瘦脸/大眼滑杆） |
+| `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版 | M3 已实现（单测覆盖）；M5 加 12 个 warp uniform、`point_to_texture`、`warp_uniforms` 与实验性瘦脸/大眼（单测覆盖） |
+| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、控制条、播放列表、美颜/对比面板、中英文切换、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志、滚轮事件路由与操作日志 | M1–M3 已接线（板端验证）；中英文切换已板端点击验证；M5 加「实验性」折叠面板（瘦脸/大眼滑杆）；2026-11-19 侧栏滚轮改为滚动整页，关键操作写入 `actions.log` |
 | `src/video_player/i18n.py` | 中英文文案表、`--lang`/按钮切换、XDG 语言偏好持久化（默认中文，按钮显示目标语言） | 新增；单测覆盖，板端已验证 |
+| `src/video_player/diagnostics.py` | 崩溃与操作诊断：`faulthandler` 写 `crash.log`、关键 UI 操作追加 `actions.log`（XDG cache，失败静默） | 新增；单测覆盖，板端验证 `crash.log` 可捕获 SIGSEGV |
 | `src/video_player/ui/capture.py` | 逐 widget 快照（`Gtk.WidgetPaintable`→`render_texture`→pixbuf）与 `CanvasBuilder` 画布合成（缓存 base、分层刷新、人脸框） | M3 收尾新增（录制用） |
 | `src/video_player/recording.py` | 录制分支：`glvideomixer` 合成视频 + UI 画布（`--record`），以及演示素材用的纯视频模式（`video_only=True`，无合成器）；`mpph264enc`/`mp4mux` 输出，EOS 收尾与统计 | M3 收尾新增，M4 收尾加纯视频模式（板端 30 fps 验证） |
 | `scripts/launch_player.py` | 桌面入口包装脚本（原样透传参数） | 可用（M3 修复 `--snapshot` 被吞） |
@@ -261,7 +270,7 @@ M4 完全等价，只有把滑杆调离 0 才启用。
 | `scripts/convert_yunet.py` | x86 侧 ONNX→RKNN 转换（rk3576，fp16，mean 0/std 1） | 可用（1,084,515B 模型） |
 | `scripts/measure_tap.py` | 板端 headless 检测吞吐测量（`fakesink sync=true`） | 可用（M2 实测工具） |
 | `scripts/probe_board.py` | 环境报告导出（文本/JSON/Markdown） | 可用 |
-| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制/中英文/检测保持/warp 单测 | 149 passed, 15 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 44 passed） |
+| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制/中英文/检测保持/warp/诊断单测 | 164 passed, 15 skipped（无 numpy/GL/板卡项跳过；`test_recording.py` 在带 numpy 的环境单独跑 44 passed） |
 
 ## 4. 线程模型
 
@@ -399,7 +408,7 @@ M4 实测（板端 2026-11-18）：
 `glvideomixer`(2 pad) → `GL RGBA` → 读回 → 编码 36 fps。因此录制链故意保留 RGBA 到
 `gldownload`，由 `mpph264enc` 直接吃 RGBA（NV12 的 GL 转换是主要慢点）。
 
-M5 实测（板端 2026-11-18，同一台板卡；素材 `07_wechat_selfie_h265.mp4`，HEVC
+M5 实测（板端 2026-11-18，同一台板卡；素材 `selfie-demo-1080p30-h265.mp4`，HEVC
 1920×1080@30、37.65 s；`perfdbg.py` patch `start_recording` 后采样
 `measured_fps()` / `beauty_ms`）：
 

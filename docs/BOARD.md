@@ -149,9 +149,11 @@ bash scripts/bench_board.sh
 | 2026-11-18 | M4 A5 1 h 长跑 | 板端 pid 42428：`--config /tmp/cfg_faceon.json /home/tris/soak_1h.mp4`（1080p30 循环播放 60 min，检测+美颜开），PERF 每秒 + 每分钟 RSS/线程/fd 采样；脚本 `.cache/a5/analyze.py` | ✅ 3549 个样本：t≥300 s 共 3250 个，均值 **30.06 fps**（min 24.5 / max 30.7），仅 7 个 <29.5、2 个 <25，且全部落在 t=1165–1170 s —— 当时我在板端并行部署/构建成片（NPU 同步飙到 117 ms）的外部负载窗口；最后 600 s 全部 ≥30.0 fps（均值 30.07）。RSS 330,664→335,548 kB（+4.8 MB/h）、threads 29–32、fds 74–79 无增长，播放结束自动退出（`app exited at t=3600s`） | A5 通过：无帧率衰减、无内存/句柄泄漏 |
 | 2026-11-18 | M4 A4 正脸/侧脸/多人检出 | 固定素材逐条：单人 `docs/evidence/m2-ui-detect.png`、双人 `m2-ui-two-faces.png`、三人素材（Pexels 帧合成的 1080p30 8 s 片段：青年正脸 + 银发女士近景 + 访谈男子微侧）`/home/tris/demo-footage/06_three_faces.mp4`，demo 运行 `faces=3`、NPU 39.8–41.5 ms、fps 30.0 | ✅ A4 通过（1/2/3 脸 + 微侧脸），证据 `docs/evidence/a4-three-faces.png`、`a4-three-masks.png`（三脸遮罩预览） |
 | 2026-11-18 | M5 检测保持（`detection.hold_ms`） | 01 近景 1080p H.264（复现 v2 闪烁）：`hold_ms=600` 时 129 次检测中 raw=0 共 12 次、美颜空档 **0** 次；`hold_ms=0` 时同样 raw=0 12 次 → 空档 **6** 次。07 微信自拍（v3 唯一源）`hold=600`：167 次检测、raw=0 **0**、空档 **0**。病态素材 03 空档 15→6 | 空档=相邻两次检测结果之间 faces 为空的次数；v2 闪烁根因是空档帧 `u_active=0` 整段透传；>600 ms 无脸的极差素材仍会残留空档（已知限制） |
-| 2026-11-18 | M5 实验性 warp 性能（瘦脸/大眼） | 美颜+检测：30.0 fps / beauty 0.86–0.87 ms；美颜无检测：30.0 fps / 0.64–1.20 ms；美颜关：30.0 fps / 0.87–1.77 ms；美颜+检测+瘦脸/大眼=100：30.0 fps / 0.86–0.96 ms（warp 增量 ≤0.1 ms） | 单个 `glshader` pass 内完成反向 warp（新增 16 个 scalar uniform，共 41 个 float）；「美颜关」行的 0.87–1.77 ms 是透传元素开销 |
+| 2026-11-18 | M5 实验性 warp 性能（瘦脸/大眼） | 美颜+检测：30.0 fps / beauty 0.86–0.87 ms；美颜无检测：30.0 fps / 0.64–1.20 ms；美颜关：30.0 fps / 0.87–1.77 ms；美颜+检测+瘦脸/大眼=100：30.0 fps / 0.86–0.96 ms（warp 增量 ≤0.1 ms） | 单个 `glshader` pass 内完成反向 warp（新增 12 个 scalar uniform，共 37 个 float；2026-11-19 几何重做后 uniform 从 16 减到 12）；「美颜关」行的 0.87–1.77 ms 是透传元素开销 |
 | 2026-11-18 | M5 纯视频录制吞吐 | 07 微信自拍 HEVC 1080p30 源：`Recorder(video_only=True)` + `mpph264enc` RGBA 直编稳态 ≈30 fps（wall 与内容时长一致），9 段主录制 `r_frame_rate` 均 `30/1` | `docs/demo-video/record_video.py`；另 1 段 `10_split_warp` 为 QC/成片补拍 |
-| 2026-11-18 | M5 成片 v3 自检 | `video-player-m5-demo-v3.mp4`：52.03 s / 1920×1080@30 / H.264 yuv420p / CRF21 / 35.5 MB / 无音轨 / 无 rotation side data / faststart；`framemd5` 1561 帧相邻重复帧 0（要求 <2%）；闪烁/纹理回弹检测 0 段（480×270 灰度中央人脸区 Laplacian 方差：中位数 588、阈值 1059、最大 879） | 抽帧目视（t=3/7.5/9.5/15/25/32/36/41/44/48 s）画面正立、无闪烁、字幕不遮脸、瘦脸/大眼可辨；构建脚本 `docs/demo-video/build_video_v3.sh` |
+| 2026-11-19 | M5 实验面板滚动回归 | 1280x800 板屏下展开「实验性」后旧代码把窗口撑到 1280x913，底部大眼滑杆点不到 | 侧栏套外层 `Gtk.ScrolledWindow`、playlist 固定 160 px、展开后 150 ms 自动滚底；复测窗口 1280x768，瘦脸/大眼均可见；`GLib.idle_add` 版本 exit 139，timeout 版本 exit 0 |
+| 2026-11-19 | M5 成片 v3 自检（warp 重做后重剪） | `video-player-m5-demo-v3.mp4`：52.10 s / 1920×1080@30 / H.264 yuv420p / CRF21 / 35,433,497 B（5.44 Mbps）/ 无音轨 / 无 rotation side data / faststart（moov 在 mdat 前）/ sha256 `ca6b23b1…`；`framemd5` 1563 帧相邻重复帧 0（要求 <2%）；闪烁/纹理回弹检测 0 段（480×270 灰度中央人脸区 Laplacian 方差：中位数 1455.9、阈值 2620.6、最大 2156.8） | 抽帧目视（t=3/7.5/9.5/15/25/29/31.5/33.5/35.8/37.8/40.5/42/44.5/48.5 s）画面正立、无闪烁、字幕不遮脸、瘦脸为整体收窄且自然、大眼温和可辨；构建脚本 `docs/demo-video/build_video_v3.sh`（07/08/09/10 段来自 rec6） |
+| 2026-11-19 | M5 warp 几何重做（用户反馈驱动） | 旧实现（下颌控制点局部位移 0.065×脸宽 + 圆形径向放大 0.40）用户反馈「瘦脸像脸凹进去一块、大眼不自然」；改为显示空间下半脸整体收窄（`SLIM_STRENGTH=0.16`）+ 眼周椭圆各向异性放大（`EYE_MAGNIFY=0.22`、半径 0.16×脸宽、纵横比 0.72），`warp_gate` 去掉肤色门限；CPU `cv2.remap` 参数网格 + 板端 A/B（slim0/slim100/eyes100/all100）+ v3 抽帧目视通过，warp 开销仍 ≤0.1 ms | 旧参数只调大小方向无法消除「局部凹陷/凸眼」，属于几何模型问题而非强度问题；A/B 需注意两次录制内容不同步（见 `docs/PITFALLS.md` 录制节） |
 
 ## 6. 已知环境限制与复现命令
 
@@ -208,3 +210,24 @@ bash scripts/bench_board.sh
 
 > 回填方式：`python3 scripts/probe_board.py --markdown` 的输出可直接贴入本文件
 > 对应小节，并保留命令与日期，保证可复现。
+
+## 2026-11-19 侧栏滚轮、操作/崩溃诊断（板端验证）
+
+- 板端屏 `1280x800`，播放器窗口 1280x768。侧栏外层滚动区（`_sidebar_scroll`）建立后，
+  鼠标滚轮在磨皮/美白/分割/瘦脸/大眼 5 个 `Gtk.Scale` 上默认只改滑杆数值，不能滚动页面。
+- 修复：每个 scale 装 `Gtk.EventControllerScroll`（VERTICAL，CAPTURE 阶段），回调把
+  `dy * 48` 加到 `_sidebar_scroll` 的 vadjustment；页内容不超高时返回 False 放行。
+- 板端 handler 级验证：展开「实验性」后 `upper=726 page=721`；5 个 scale 各 2 个 scroll
+  controller；`_on_page_wheel_scroll(None,0,3)` 返回 True，value 0→5（clamp 到
+  `upper-page`），`dy=-100` 回 0，`dy=0` 返回 False。
+- 新增 `src/video_player/diagnostics.py`：启动时把 `faulthandler` 输出写到
+  `$XDG_CACHE_HOME/video-player-demo/crash.log`（默认 `~/.cache/video-player-demo/`），
+  关键 UI 操作写到同目录 `actions.log`。板端用 `ctypes.string_at(0)` 验证 crash.log
+  捕获 SIGSEGV 栈；用安装后的 `/home/tris/.local/bin/video-player-demo --snapshot`
+  验证 actions.log 记录 `window_open`/`play_path`/`playback_state`/`window_close`。
+- 用户报告的“视频放着闪退”无法用脚本复现：正常关窗 exit 0；warp=100 30s、30 轮
+  展开/收起+滑杆+对比+语言、fullscreen 20 次均 exit 0。桌面启动实例日志仍无栈；
+  已部署诊断日志等待下一次复现。桌面 at-spi 注册失败是**全系统**现象
+  （gnome-shell/DING 都报 `AT-SPI: Could not obtain desktop path or name`），不单独归因于播放器。
+- 部署：`window.py` md5 `6d95fe5f7fa959203ea4000c34a86f9b`，`diagnostics.py`
+  `96ac58d1fd05ed2d72ec3478eeee43ff`；`--check` 17 ok / 0 warn / 0 fail。
