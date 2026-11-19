@@ -24,6 +24,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 from ..backend import PlaybackBackend, PlaybackError  # noqa: E402
 from ..beauty import BeautyParams  # noqa: E402
 from ..config import Config  # noqa: E402
+from ..diagnostics import install_crash_logging, log_action  # noqa: E402
 from ..face import DetectionResult, Face  # noqa: E402
 from ..i18n import Translator, save_language  # noqa: E402
 from ..pipeline import VIDEO_SUFFIXES  # noqa: E402
@@ -241,6 +242,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         else:
             self._set_hint_key("hint_open")
         self._apply_language()
+        log_action(
+            "window_open",
+            media=len(media),
+            demo=demo,
+            fullscreen=fullscreen,
+            language=self._t.language,
+            record=str(record) if record is not None else "",
+        )
 
     # -- layout ---------------------------------------------------------
 
@@ -350,7 +359,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._playlist_list.set_activate_on_single_click(True)
         self._playlist_list.connect("row-activated", self._on_row_activated)
         scrolled = Gtk.ScrolledWindow()
-        scrolled.set_vexpand(True)
+        scrolled.set_vexpand(False)
+        scrolled.set_size_request(-1, 160)
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_child(self._playlist_list)
         panel.append(scrolled)
@@ -422,6 +432,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         # stable M3 beauty controls stay the default path.
         self._experimental_expander = Gtk.Expander()
         self._experimental_expander.set_expanded(False)
+        self._experimental_expander.connect(
+            "notify::expanded", self._on_experimental_expanded
+        )
         warp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         warp_box.set_margin_top(6)
         warp_box.set_margin_start(8)
@@ -454,8 +467,87 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._experimental_expander.set_child(warp_box)
         panel.append(self._experimental_expander)
 
-        self._sidebar_panel = panel
-        return panel
+        # Wheel events over a Gtk.Scale adjust that scale by default. On the
+        # board panel users expect the wheel to scroll the whole sidebar, so
+        # intercept vertical wheel events on every sidebar scale and move the
+        # sidebar adjustment instead. The playlist keeps its own scroll.
+        for scale in (
+            self._smoothing,
+            self._whitening,
+            self._split,
+            self._face_slim,
+            self._eye_enlarge,
+        ):
+            self._install_page_wheel_scroll(scale)
+
+        # Keep the controls reachable on the 1280x800 board panel: the sidebar
+        # itself scrolls, so expanding "Experimental" never grows the window
+        # beyond the screen.
+        sidebar_scroll = Gtk.ScrolledWindow()
+        sidebar_scroll.set_vexpand(True)
+        sidebar_scroll.set_hexpand(False)
+        sidebar_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sidebar_scroll.set_child(panel)
+        self._sidebar_scroll = sidebar_scroll
+        return sidebar_scroll
+
+    def _on_experimental_expanded(
+        self, expander: Gtk.Expander, _pspec: object
+    ) -> None:
+        log_action("experimental", expanded=expander.get_expanded())
+        if not expander.get_expanded():
+            return
+        # The expander is at the bottom of the sidebar; once it opens, scroll
+        # to the new bottom so both sliders are immediately reachable.
+        # Defer one layout tick: changing the adjustment from this notify
+        # handler (or from an idle callback) can crash GTK 4.18 on the board.
+        def scroll_to_bottom() -> bool:
+            if self._closed:
+                return GLib.SOURCE_REMOVE
+            adjustment = self._sidebar_scroll.get_vadjustment()
+            if adjustment is not None:
+                adjustment.set_value(
+                    max(
+                        adjustment.get_lower(),
+                        adjustment.get_upper() - adjustment.get_page_size(),
+                    )
+                )
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add(150, scroll_to_bottom)
+
+    def _install_page_wheel_scroll(self, scale: Gtk.Scale) -> None:
+        """Make the wheel over a sidebar scale scroll the sidebar page."""
+        controller = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        # Capture before GtkScale's own bubble-phase scroll handler.
+        controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        controller.connect("scroll", self._on_page_wheel_scroll)
+        scale.add_controller(controller)
+
+    def _on_page_wheel_scroll(
+        self,
+        _controller: Gtk.EventControllerScroll,
+        _dx: float,
+        dy: float,
+    ) -> bool:
+        if dy == 0.0:
+            return False
+        sidebar_scroll = getattr(self, "_sidebar_scroll", None)
+        if sidebar_scroll is None:
+            return False
+        adjustment = sidebar_scroll.get_vadjustment()
+        if adjustment is None:
+            return False
+        upper = adjustment.get_upper()
+        page_size = adjustment.get_page_size()
+        if upper <= page_size:
+            return False
+        lower = adjustment.get_lower()
+        value = adjustment.get_value() + dy * 48.0
+        adjustment.set_value(max(lower, min(value, upper - page_size)))
+        return True
 
     # -- language -------------------------------------------------------
 
@@ -513,6 +605,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
             # A read-only home directory must not break the switch.
             pass
         self._apply_language()
+        log_action("language", lang=self._t.language)
 
     # -- playback -------------------------------------------------------
 
@@ -537,6 +630,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return False
 
     def _play_path(self, path: Path) -> None:
+        log_action("play_path", path=path)
         if not path.exists():
             self._show_error(self._t("media_file_not_found", path=path))
             return
@@ -547,6 +641,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         except PlaybackError as exc:
             self._show_error(str(exc))
             return
+        log_action("play_path_ok", path=path)
         self._fps = 0.0
         self._faces = ()
         self._detection_ms = 0.0
@@ -571,6 +666,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return
         self.backend.toggle_play()
         self._update_play_icon(self.backend.is_playing)
+        log_action("play_toggle", playing=self.backend.is_playing)
 
     def _on_previous_clicked(self, _button: Gtk.Button) -> None:
         if not self.backend.has_media:
@@ -580,6 +676,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if target is None:
             self._set_hint_key("hint_first")
             return
+        log_action("previous")
         self._play_path(target)
 
     def _on_next_clicked(self, _button: Gtk.Button) -> None:
@@ -590,6 +687,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if target is None:
             self._set_hint_key("hint_last")
             return
+        log_action("next")
         self._play_path(target)
 
     def _on_seek_changed(self, scale: Gtk.Scale) -> None:
@@ -610,10 +708,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _on_fullscreen_clicked(self, _button: Gtk.Button) -> None:
         if self.is_fullscreen():
             self.unfullscreen()
+            log_action("fullscreen", on=False)
         else:
             self.fullscreen()
+            log_action("fullscreen", on=True)
 
     def _on_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        log_action("playlist_row", index=row.get_index())
         self._start_index(row.get_index())
 
     # -- beauty panel (M3: live shader uniforms) ------------------------
@@ -621,26 +722,32 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _on_smoothing_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.smoothing = int(round(scale.get_value()))
         self._refresh_beauty()
+        log_action("smoothing", value=self.config.beauty.smoothing)
 
     def _on_whitening_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.whitening = int(round(scale.get_value()))
         self._refresh_beauty()
+        log_action("whitening", value=self.config.beauty.whitening)
 
     def _on_split_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.split = round(scale.get_value(), 3)
         self._refresh_beauty()
+        log_action("split", value=self.config.beauty.split)
 
     def _on_face_slim_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.face_slim = round(scale.get_value(), 1)
         self._refresh_beauty()
+        log_action("face_slim", value=self.config.beauty.face_slim)
 
     def _on_eye_enlarge_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.eye_enlarge = round(scale.get_value(), 1)
         self._refresh_beauty()
+        log_action("eye_enlarge", value=self.config.beauty.eye_enlarge)
 
     def _on_beauty_toggled(self, switch: Gtk.Switch, _param: object) -> None:
         self.config.beauty.enabled = switch.get_active()
         self._refresh_beauty()
+        log_action("beauty", enabled=self.config.beauty.enabled)
 
     def _on_compare_toggled(self, button: Gtk.ToggleButton) -> None:
         self.config.beauty.compare_mode = button.get_active()
@@ -651,6 +758,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.config.beauty.compare_mode = switch.get_active()
         self._compare_button.set_active(switch.get_active())
         self._refresh_beauty()
+        log_action("compare", enabled=self.config.beauty.compare_mode)
 
     def _toggle_beauty(self) -> None:
         self._beauty_switch.set_active(not self._beauty_switch.get_active())
@@ -661,6 +769,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _toggle_debug_mask(self) -> None:
         self.config.beauty.debug_mask = not self.config.beauty.debug_mask
         self._refresh_beauty()
+        log_action("debug_mask", enabled=self.config.beauty.debug_mask)
 
     def _refresh_beauty(self) -> None:
         """Apply the current beauty config to the running shader immediately."""
@@ -701,6 +810,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def _on_beauty_error(self, message: str) -> None:
+        log_action("beauty_error", message=message)
         self._beauty_error = message
         self._beauty_switch.set_sensitive(False)
         self._beauty_switch.set_active(False)
@@ -714,6 +824,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _on_state_changed(self, state: str) -> None:
         self._update_play_icon(state == "playing")
+        log_action("playback_state", state=state)
 
     def _on_video_info(self, info: dict[str, object]) -> None:
         # The beauty element exists only once the video branch is built, so the
@@ -747,9 +858,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._detection_error = message
         self._set_hint_key("face_detection_disabled", message=message)
         self._update_info_label()
+        log_action("detection_error", message=message)
 
     def _on_show_faces_toggled(self, switch: Gtk.Switch, _param: object) -> None:
         self._show_faces = switch.get_active()
+        log_action("show_faces", enabled=self._show_faces)
         if not self._show_faces:
             self._face_overlay.set_faces((), 0.0, 0.0)
         elif self._faces:
@@ -758,15 +871,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._face_overlay.set_faces(self._faces, width, height)
 
     def _on_eos(self) -> None:
+        log_action("eos")
         self._update_play_icon(False)
         if self.playlist.has_next():
             target = self.playlist.next()
             if target is not None:
+                log_action("eos_advance")
                 self._play_path(target)
                 return
         self._set_hint_key("hint_finished")
 
     def _show_error(self, message: str) -> None:
+        log_action("playback_error", message=message)
         self._set_hint_key("playback_error", message=message)
         self._hint_label.add_css_class("error-hint")
         self._update_play_icon(False)
@@ -896,6 +1012,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def _on_open_clicked(self, _button: Gtk.Button) -> None:
+        log_action("open_dialog")
         dialog = Gtk.FileDialog(title=self._t("open_video"))
         file_filter = Gtk.FileFilter()
         file_filter.set_name(self._t("video_files"))
@@ -910,12 +1027,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _on_open_finished(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
         try:
             gfile = dialog.open_finish(result)
-        except GLib.Error:
+        except GLib.Error as exc:
+            log_action("open_cancelled", error=str(exc))
             return
         if gfile is None:
+            log_action("open_cancelled")
             return
         path_text = gfile.get_path()
         if path_text:
+            log_action("open_selected", path=path_text)
             self._play_path(Path(path_text))
 
     def _on_key_pressed(
@@ -926,6 +1046,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         _state: Gdk.ModifierType,
     ) -> bool:
         name = Gdk.keyval_name(keyval)
+        if name in {
+            "space", "Left", "Right", "f", "F", "Escape", "n", "N",
+            "p", "P", "b", "B", "c", "C", "m", "M", "r", "R", "o", "O",
+        }:
+            log_action("key", name=name)
         if name == "space":
             self._on_play_clicked(None)
             return True
@@ -998,7 +1123,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         from .capture import CanvasBuilder
 
         builder = CanvasBuilder(self)
-        builder.add_layer("sidebar", self._sidebar_panel)
+        builder.add_layer("sidebar", self._sidebar_scroll)
         builder.add_layer("info", self._info_label)
         builder.add_layer("controls", self._controls_bar)
         builder.add_layer("hint", self._hint_label)
@@ -1167,12 +1292,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._record_done = False
         if self._recorder is not None:
             path = self._recorder.path
+            log_action("recording_stop", path=path)
             self._stop_recording()
             self._set_hint_key("recording_saved", path=path)
             return
         if self._record_path is None:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             self._record_path = Path.cwd() / f"player-{stamp}.mp4"
+        log_action("recording_start", path=self._record_path)
         self._record_error = None
         self._record_attempts = 0
         self._record_failures = 0
@@ -1181,6 +1308,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _on_recording_error(self, message: str) -> None:
         self._record_error = message
+        log_action("recording_error", message=message)
         self._set_hint_key("recording_stopped", message=message)
         GLib.idle_add(self._stop_recording)
 
@@ -1211,6 +1339,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return bool(texture.save_to_png(str(target)))
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
+        log_action("window_close")
         if self._closed:
             return False
         self._closed = True
@@ -1321,6 +1450,16 @@ def run_window(
     language: str | None = None,
 ) -> int:  # pragma: no cover - needs a display
     """Open the GTK window and block until it closes; returns the exit code."""
+    install_crash_logging()
+    log_action(
+        "run_window",
+        media=len(media),
+        demo=demo,
+        fullscreen=fullscreen,
+        snapshot=str(snapshot) if snapshot is not None else "",
+        record=str(record) if record is not None else "",
+        language=language or "",
+    )
     # The detection worker runs numpy/OpenCV decoding in a Python thread; a
     # short switch interval keeps the GTK main loop rendering at 30 fps instead
     # of waiting for the worker's GIL slices.
@@ -1339,6 +1478,7 @@ def run_window(
     code = application.run([])
     sys.stdout.flush()
     sys.stderr.flush()
+    log_action("run_window_return", code=code)
     # PyGObject finalisation of the GStreamer/GTK objects segfaults on the
     # RK3576 (mpp/GL teardown order). GTK is already shut down at this point,
     # so exit the process directly instead of letting the interpreter run the
