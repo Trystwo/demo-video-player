@@ -36,3 +36,6 @@ Thumbs.db
 
 # local test media (Pexels/Mixkit clips, not for the public repository)
 test-media/
+
+# 本地部署/临时工作目录
+.tmp_*/

@@ -95,6 +95,10 @@ class PlayerConfig:
     volume: int = 80
     speed: float = 1.0
     resume: bool = True
+    #: Remember recently opened files for the sidebar history.  Kept
+    #: separate from ``resume``: the history is useful even when the
+    #: auto-seek is turned off, and vice versa.
+    recent_files: bool = True
 
     def validate(self) -> None:
         self.hw_decode = _as_bool(self.hw_decode, name="player.hw_decode")
@@ -120,6 +124,9 @@ class PlayerConfig:
         )
         self.speed = round(_clamp(_as_float(self.speed, name="player.speed"), 0.5, 2.0), 2)
         self.resume = _as_bool(self.resume, name="player.resume")
+        self.recent_files = _as_bool(
+            self.recent_files, name="player.recent_files"
+        )
 
 
 @dataclass

@@ -170,9 +170,11 @@ def test_face_mask_is_full_inside_and_feathered_at_edges() -> None:
     assert float(mask[31, 31]) == 0.0
     # Two pixels inside the border the feather ramp is around 0.5.
     assert float(mask[10, 16]) == pytest.approx(0.5, abs=0.1)
-    # The mask is monotonic towards the centre along a row.
-    row = mask[16, 8:24]
-    assert np.all(np.diff(row) >= -1e-6)
+    # The mask is monotonic towards the centre along a row: the feather ramps
+    # up on the left border and down on the right one (the mask is symmetric
+    # about the face centre, so a single left-to-right sweep is not monotonic).
+    assert np.all(np.diff(mask[16, 8:17]) >= -1e-6)
+    assert np.all(np.diff(mask[16, 16:24]) <= 1e-6)
 
 
 def test_face_mask_accepts_plain_tuples_and_clips_to_frame() -> None:

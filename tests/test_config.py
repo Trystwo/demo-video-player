@@ -136,3 +136,14 @@ def test_experimental_beauty_rounds_to_one_decimal() -> None:
 def test_hold_ms_must_be_a_number() -> None:
     with pytest.raises(ConfigError, match="hold_ms"):
         Config.from_dict({"detection": {"hold_ms": "soon"}})
+
+
+def test_recent_files_is_a_known_player_key() -> None:
+    """The new key must validate instead of tripping the unknown-key check."""
+    assert Config.from_dict({"player": {"recent_files": False}}).player.recent_files is False
+    assert Config.from_dict({"player": {"recent_files": "true"}}).player.recent_files is True
+
+
+def test_recent_files_must_be_boolean_like() -> None:
+    with pytest.raises(ConfigError, match="recent_files"):
+        Config.from_dict({"player": {"recent_files": "maybe"}})

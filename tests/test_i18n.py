@@ -94,3 +94,14 @@ def test_dynamic_strings_are_formatted() -> None:
         )
         == "1280×720   h264   decode: mppvideodec   fps: 30.0   NPU: off   beauty: off"
     )
+
+
+def test_playback_status_recovery_actions_are_localized() -> None:
+    chinese = Translator("zh")
+    english = Translator("en")
+    assert chinese("status_loading_title") == "正在读取视频"
+    assert english("status_loading_title") == "Loading video"
+    assert chinese("return_to_playlist") == "返回列表"
+    assert english("return_to_playlist") == "Back to playlist"
+    assert chinese("replay_video") == "重新播放"
+    assert english("replay_video") == "Replay"

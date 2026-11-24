@@ -207,6 +207,10 @@ class CanvasBuilder:
             rect = widget_bounds(self._window, layer.widget)
             image = capture_widget(layer.widget)
             if rect is None or image is None:
+                if layer.rect is not None or layer.image is not None:
+                    layer.rect = None
+                    layer.image = None
+                    changed = True
                 continue
             if (
                 layer.rect == rect

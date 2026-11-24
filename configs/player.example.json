@@ -7,7 +7,8 @@
     "texture_max_dimension": 1280,
     "volume": 80,
     "speed": 1.0,
-    "resume": true
+    "resume": true,
+    "recent_files": true
   },
   "beauty": {
     "enabled": true,

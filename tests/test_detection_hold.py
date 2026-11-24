@@ -234,3 +234,31 @@ def test_no_landmarks_means_no_warp(harness: _Harness) -> None:
     values = harness.backend._beauty_values()
 
     assert values["u_warp_ready"] == 0.0
+
+
+def test_implausible_landmarks_are_held_then_dropped(harness: _Harness) -> None:
+    """P1: a single rejected fit does not blink the face mask off."""
+    bad = (
+        (1229.5, 330.1),
+        (1238.3, 340.1),
+        (1199.2, 397.5),
+        (1230.4, 477.8),
+        (1233.1, 485.3),
+    )
+    harness.detect(_face())
+    good = harness.backend._beauty_values()
+    assert good["u_shape_ready"] == 1.0
+
+    harness.detect(_face(landmarks=bad))
+    held = harness.backend._beauty_values()
+    assert held["u_shape_ready"] == 1.0
+    assert held["u_shape_cx"] == pytest.approx(good["u_shape_cx"])
+    # Mask only: the warp must not follow the rejected points.
+    assert held["u_warp_ready"] == 0.0
+
+    for _ in range(3):
+        harness.clock.advance(0.1)
+        harness.detect(_face(landmarks=bad))
+        dropped = harness.backend._beauty_values()
+    assert dropped["u_shape_ready"] == 0.0
+    assert dropped["u_face0_w"] == 0.0

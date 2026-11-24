@@ -226,7 +226,7 @@ def test_warp_shader_only_gates_on_the_primary_face() -> None:
     assert "u_face1_x" not in block
     assert "u_face2_x" not in block
     # The per-pixel skin gate made the displacement blotchy (M5 review v2):
-    # the warp gate must be the face box only.
+    # the warp gate must depend on face geometry, not pixel colour or mask expansion.
     assert "skin_gate" not in block
     warp_gate = re.search(
         r"float warp_gate\(.*?\n\}", BEAUTY_FRAGMENT_SHADER, re.DOTALL
@@ -248,9 +248,14 @@ def test_warp_shader_contract() -> None:
     # The warp is evaluated in display space and clamped at both ends.
     assert "vec2 disp = tex_to_display(texcoord);" in BEAUTY_FRAGMENT_SHADER
     assert (
-        "vec2 warped = clamp(disp + offset * gate, vec2(0.0), vec2(1.0));"
+        "vec2 warped = clamp(disp + offset, vec2(0.0), vec2(1.0));"
         in BEAUTY_FRAGMENT_SHADER
     )
+    # Eye offsets carry their own face gate; the slim field has a separate
+    # exterior support band and must not be multiplied back to zero at the jaw.
+    assert "float slim_gate =" in BEAUTY_FRAGMENT_SHADER
+    assert "offset += face_slim_offset(disp_px) / disp_size * slim_gate;" in BEAUTY_FRAGMENT_SHADER
+    assert "offset * gate" not in BEAUTY_FRAGMENT_SHADER
     assert (
         "return clamp(display_to_tex(warped), vec2(0.0), vec2(1.0));"
         in BEAUTY_FRAGMENT_SHADER

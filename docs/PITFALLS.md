@@ -15,6 +15,7 @@
 | `Gst.Bus.add_watch` 参数错误 | PyGObject 签名是 `add_watch(self, priority:int, func:Gst.BusFunc, user_data=None)`，与 C API 不同 | 复用 backend 已装的 `add_signal_watch()`，改用 `bus.connect("message::eos"/"message::error", ...)` |
 | 录制分支压慢整条链（显示掉帧） | tee 的回收分支 queue 满会反压解码/显示 | 录制队列用 `leaky=downstream`（**但会丢帧，仅用于可接受丢帧的场景**）；要高质量录制就换更轻的路径（见 §3） |
 | 显示掉的帧计数正常但「看起来卡」 | `fpsdisplaysink` 的 `average_fps` 是终身平均，起播丢帧后会长期偏低；用它做指标会误判 | 用 `measured_fps()`（1.5 s 滑窗）或读 `fps`（瞬时）作为显示/日志指标 |
+| 双音轨素材两种语言同时播放（像混响） | `_on_demux_pad_added` 对**每个** audio pad 都建了一条完整解码分支，两路都接到同一个 sink | 只建一条音频分支、只 link 选中的 pad（M6，`backend._build_audio_branch` / `set_audio_track`）；切轨后必须 seek 回当前位置，否则新音轨从 00:00 开始 |
 
 ## 2. GPU / GTK4 显示
 
@@ -51,17 +52,23 @@
 |---|---|---|
 | 美颜/人脸框周期性闪断（v2 成片闪烁根因） | 检测结果里 `faces` 为空的帧把 `u_active` 置 0 并清空人脸 uniform，整段透传 → 美颜与框消失 100–600 ms，下一帧又恢复 | 已修（M5）：`detection.hold_ms`（默认 600 ms，钳制 0–5000）——窗口内沿用上次人脸/5 点关键点并标 `held=True`（UI 人脸框同样保持），关键点 EMA（`alpha=0.35`，脸中心跳变 >0.3 脸宽视为换人重置），超时才清空（架构见 `docs/ARCHITECTURE.md` §2.1）。验证：板端 monkeypatch `_on_detection_result` 统计 raw=0 与空档次数，01 近景素材空档 6→0（`docs/BOARD.md` §5.2）；素材检测极差（>600 ms 无脸）时仍可能残留空档 |
 | 蒙版边界「呼吸/抖动」 | 检测 10 Hz 更新且无时间平滑/插值；框每次更新跳 10–20 px，与 24 源像素羽化同量级 | 时间滤波（EMA/one-euro）+ 帧间插值；或降低检测间隔（代价是 CPU/NPU） |
-| 美颜「没覆盖全脸」 | 蒙版是「检测框外扩 12% 的圆角矩形」+ 肤色门限；YuNet 框是内脸框，不含额头/发际/耳/下颌缘；镜框/眉毛/眼白会被肤色门限压低 | 用 5 点关键点拟合椭圆蒙版、加大 `expand`/`feather`；演示镜头避免极端角度 |
+| 美颜「没覆盖全脸」 | 蒙版是「检测框外扩 12% 的圆角矩形」+ 肤色门限；YuNet 框是内脸框，不含额头/发际/耳/下颌缘；镜框/眉毛/眼白会被肤色门限压低 | 已修（M5.2）：`fit_face_shape()` 用 5 点关键点拟合椭圆（上缘发际线、下缘下巴）+ 颈部补丁，见 `docs/ARCHITECTURE.md` §2.6 |
 | 实时播放有周期性顿挫（平均 fps 30 但体感卡） | 检测在**解码线程**里同步 `extract_dup()` 整帧 NV12（1920×1080 ≈ 3.2 MB，17–33 ms），每 3 帧堵一次，随后积压帧连发 | 已规划：取样移到独立线程 / 用 RGA 先缩放到 640×640；临时可加大 `detection.interval_frames` |
 | 背景里路人也被磨皮 / 蒙版在背景闪 | 检测返回多张脸（含远处小脸），`max_faces` 默认 3 | 演示/单人场景把 `detection.max_faces` 设为 1（只保留分数最高的人脸） |
 | 瘦脸/大眼 warp 作用到背景路人，或人脸框与关键点对不上 | warp 几何必须来自**主脸**（框面积最大，`face.primary_face()` 把它排到 `faces[0]`，shader 的 `warp_gate` 只认 `u_face0`）；大眼用主脸 5 点关键点、瘦脸用主脸框，背景有第二张脸时若 `max_faces>1`，主脸排序可能对应到错误人脸 | 演示素材背景有第二张脸时必须 `detection.max_faces=1`（`docs/demo-video/configs/video_*.json` 已统一）；多脸场景开实验 warp 前先确认 `faces[0]` 是最大脸；`tests/test_detection_hold.py` 覆盖主脸排第一与无 landmarks 时不启用 warp |
 | 自拍/手机素材检测分数贴阈值（0.5–0.6）易丢 | 特写人脸过大（占画面 1600×950 px），YuNet 在 640×640 输入上偏弱 | 演示素材选中等景别；必要时降低 `min_score` 或依赖 `detection.hold_ms` 保持 |
+| 板端 720p 素材**完全检测不到人脸**（`NPU: --`，美颜/瘦脸全无效果），同一片 1080p 正常 | `nv12_to_bgr()` 只用 GstBuffer 大小反推 stride。1280×720 的 mppvideodec 缓冲是 1,589,760 B，既能被 `1472×720`（真实布局，行宽 64 B 对齐）整除，也能被 `1440×736`（16 B 对齐 + 8 行高填充）整除；旧实现按「stride 余量最小」排序选中 1440，解码图像被横向剪切错位 → YuNet 一张脸都找不到。1080p 缓冲 3,237,888 B 只有 `1984×1088` 一种解，所以一直正常 | 已修：候选排序优先选 **stride 是 64 的倍数**（RK3576 行对齐 64 B），没有 64 对齐候选才退回 16 对齐（`src/video_player/detection.py`）。回归用例 `tests/test_detection_nv12.py::test_rockchip_720p_rows_use_64_byte_alignment` 用 1,589,760 B 的合成缓冲锁住这个歧义。板端实测该片 229/229 个采样帧全部检出、0 漏检；排查时注意 `GstVideo.VideoInfo` 在 DMABuf 缓冲上报的 stride/offset 也可能与实际内存布局不符（本例报 1280/921600，按它转换同样是乱码），要看真实布局请用相邻行相关性扫描 |
+| 美颜「头发发白 / 镜框被抹平 / 痕迹明显」（M5.1 用户反馈） | 框内蒙版有 **10 % 保底**（`mask *= mix(1.0, 0.10+0.90*skin_gate, u_skin)`），框里每像素至少拿 10 % 磨皮+美白；而 YCbCr 肤色门限会把深色头发判成 0.64 的「肤色」，于是头发/镜框/耳机线也被磨 | 已修（M5.2）：sRGB→线性→CIELAB，用 `a*`/`b*`（头发 `a*≈0`，皮肤 `a*≈8`）两级门限分别给磨皮/美白，**去掉保底**；磨皮与美白各用各的蒙版（高光/唇色不再被提亮）。判据不合时注意：`a*`/`b*` 是 0 为中心的色度，不是 0–100 的 LCh 色相 |
+| 瘦脸「下巴有一部分没瘦到 / 画面有断层」或「五官挤了但轮廓没变窄」 | M5.1 检测框位移把框内背景拖 42 px；M5.2 让轮廓处 `gate(r)=0`，脸缘不动只有内部压缩；旧轮廓场又按每行半宽 `a_y` 归一化，位移在尖端逐行骤降（实测 `max|∂dx/∂y|≈5.5 px/px`）→ 横向剪切读作断层，且近水平的下巴底缘纯水平位移根本推不动 | 已改为横纵分离场：水平量只依赖 `rel_x`（`∂dx/∂y≈0`，消除逐行剪切），下巴底缘由纵向 `lift`（0.85 峰值）上提；去掉 `min(requested_amount, 0.35·a_y)` 与 `jaw_taper` 的尖点切断，外部由 `slim_support_gate`（`max(3×峰值, 24 px)`）平滑衰减并乘进位移，带外背景不动。单测锁住：轮廓 gate=1/带中点半强度/带端 0、两颊对称、下巴上提、网格单射（det>0.2）、小脸不折叠、逐像素跳变 <1.2（`tests/test_beauty_shape.py`） |
+| 加了 Lab 之后帧率/`beauty_ms` 反而变差 | `rgb_to_lab()` 每像素 3 次 `pow`；若无条件调用会多出 ~0.9 Mpx 的 pow | shader 里 Lab 只在 `mask > 0.004` 的像素（椭圆内，约 8–13 %）+ 分支里算；新增 uniform 一律 `G_TYPE_FLOAT`（`gdouble` 会被 glshader 静默丢弃，值恒为 0） |
+| 想在本机验证 GLSL 但与板端行为不一致 | 桌面无 `/dev/dri`，但 Mesa 的 EGL 可用于 llvmpipe：`GST_GL_PLATFORM=egl GST_GL_API=gles2` | 用 `filesrc ! pngdec ! videoconvert ! glupload ! glshader(fragment=…, uniforms=…) ! gldownload ! videoconvert ! pngenc` 真编译 shader；`u_debug=1` 可直接取 GPU 算出的蒙版。注意 `.venv` 无 `gi`、系统 `python3` 无 numpy —— 渲染用系统 python，比对用 `.venv`（`.cache/qc/m51/glsl_check.py`） |
+| 只靠 numpy 复刻就下结论 | CPU 复刻与真 shader 的采样/取整不同（`texture2D` 双线性 vs `cv2.remap` INTER_LINEAR、8 bit 舍入） | 移植后必须用真 shader 复算一帧对齐：M5.2 实测整帧 mean 0.071/255、p99=2、脸外 0.0106/255（`.cache/qc/m51/README.md` §7）；脸内个位数像素可有 ~30 差值，集中在镜框/睫毛 1 px 高对比处 |
 
 ## 5. 测试 / 本机环境
 
 | 现象 | 原因 | 规避 |
 |---|---|---|
-| `pytest` 报 `ModuleNotFoundError: gi` / numpy 缺失 | 系统 `python3` 有 `gi` 无 numpy；`.venv/bin/python` 有 numpy 无 gi（用 `PYTHONPATH=/usr/lib/python3/dist-packages` 可补） | 常规单测用系统 `python3 -m pytest tests -q`（M5 收尾：164 passed / 15 skipped）；需要 numpy 的测试用 `.venv/bin/python` 并补 `PYTHONPATH` |
+| `pytest` 报 `ModuleNotFoundError: gi` / numpy 缺失 | 系统 `python3` 有 `gi` 无 numpy；`.venv/bin/python` 有 numpy 无 gi（用 `PYTHONPATH=/usr/lib/python3/dist-packages` 可补；`.venv` 下 `pytest tests` 会在收集期 7 个 gi 测试上直接报错而不是 skip） | 常规单测用系统 `python3 -m pytest tests -q`（M5.2 收尾：185 passed / 15 skipped）；需要 numpy 的测试用 `.venv/bin/python` 并补 `PYTHONPATH` |
 | `.venv` 下 3 个测试失败 | numpy 1.26 与测试断言的历史差异（beauty mask 羽化、NV12 跨步转换、YuNet NMS 数量），M3 前代码同样失败（M5 收尾复测 211 passed / 3 failed，仍为同样 3 个） | 非回归；以系统 python（无 numpy）结果为准 |
 | 板端 `pytest` 不存在 | 板端未装 pytest | 板端用脚本/应用实测验证；单测在本机跑 |
 
@@ -69,6 +76,7 @@
 
 | 现象 | 原因 | 规避 |
 |---|---|---|
+| `scp`/`rsync` 传到板端的 `.py` 变成乱码，Python 报 `source code string cannot contain null bytes` | 开发机装了 **E-SafeNet 透明加密**：受信任进程（编辑器 / Python）读到明文，`scp.exe` 读到的却是密文（文件头 `E-SafeNet LOCK`），大小相同、md5 不同；编辑器 / Read 工具也会把这类文件判成 binary | 用 Python 读明文 → base64 写成 `.b64`（不在加密策略内）→ `scp` 传 `.b64` → 板端 `base64 -d` 还原，再用 `md5sum` 对比本地明文值；不要直接 scp 源码文件 |
 | 误把内部文件推到公开仓库 | 仓库里同时有公开与内部资料 | 发布走 `.cache/export_publish.py`（已排除 `AGENTS.md`、`docs/DELIVERY.md`、`docs/TEST_MEDIA.md`、板端连接文档、`docs/demo-video/`、`test-media/`、`*.mp4`、`models/*.rknn`、`.cache/`）；提交前 `git status` 复核 |
 | 飞书 `<ol seq>` 编号不生效 | 该 API 不支持 `seq` 属性（`degrade_code=5002`） | 需要编号用普通段落手写 `1.` `2.` `3.`；或 `docs +update --command block_replace` 局部替换 |
 | `docs +create` 后标题重复 | 工具会自动在正文前插入 `<title>` | 正文 XML 不要自带 title |
@@ -78,6 +86,7 @@
 ## 7. 复现入口
 
 - 板端命令、性能实测表、长跑与降级记录：`docs/BOARD.md` §5.2、§6。
-- 线程模型、uniforms 契约、录制架构、检测保持与实验 warp：`docs/ARCHITECTURE.md` §2.1–§2.5、§4。
+- 线程模型、uniforms 契约、录制架构、检测保持、实验 warp 与 M5.2 自然化：`docs/ARCHITECTURE.md` §2.1–§2.6、§4。
+- M5.2 的三档对照图、量化表与「真 shader vs numpy」复核：`.cache/qc/m51/README.md`（图在 `out/`）。
 - 演示视频制作（纯视频录制、剪接、字幕）：`docs/demo-video/README.md`。
 - 演示流程与话术：`docs/DEMO_GUIDE.md`。

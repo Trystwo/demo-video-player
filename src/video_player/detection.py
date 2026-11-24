@@ -84,7 +84,14 @@ def nv12_to_bgr(
     # The RK3576 decoder pads both the row stride (e.g. 1920 -> 1984) and the
     # frame height (e.g. 1080 -> 1088).  caps only carry width/height, so infer
     # the padded height by looking for the (h * 1.5) divisor of the buffer size.
-    candidates: list[tuple[int, int, int]] = []  # (stride pad, height pad, stride)
+    # The buffer size alone is ambiguous: 1589760 bytes for 1280x720 is both
+    # 1472x720 (what the decoder actually emits: 64-byte aligned rows) and
+    # 1440x736 (rows aligned to 16, frame padded to 8 lines).  Picking the
+    # wrong one shears the picture and the detector then finds no face at all,
+    # which is exactly what happened on 720p footage.  Prefer 64-byte row
+    # alignment (the Rockchip decoder's own alignment) and only fall back to
+    # 16 when nothing else fits.
+    candidates: list[tuple[int, int, int, int]] = []  # (align rank, pad, height pad, stride)
     for candidate_height in range(height, height + 33, 2):
         plane = candidate_height * 3 // 2
         if size % plane:
@@ -97,12 +104,15 @@ def nv12_to_bgr(
             continue
         if candidate_stride - width > 256:
             continue
-        candidates.append((candidate_stride - width, candidate_height - height, candidate_stride))
+        align_rank = 0 if candidate_stride % 64 == 0 else 1
+        candidates.append(
+            (align_rank, candidate_stride - width, candidate_height - height, candidate_stride)
+        )
     if not candidates:
         raise ValueError(
             f"unexpected NV12 buffer layout: {size} bytes for {width}x{height}"
         )
-    _, height_padding, stride = min(candidates)
+    _, _, height_padding, stride = min(candidates)
     padded_height = height + height_padding
     array = np.frombuffer(data, dtype=np.uint8)
     y_plane = array[: stride * padded_height].reshape(padded_height, stride)[:height, :width]
