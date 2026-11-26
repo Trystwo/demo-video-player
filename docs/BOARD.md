@@ -21,7 +21,8 @@
 | 显示 | DSI 1280×800 已连接；HDMI 未连接 |
 | NPU | librknnrt 2.3.2，驱动 0.9.8；MobileNetV1 推理 2.15ms（约 465fps）；运行时 `/usr/lib/librknnrt.so`，Python `rknnlite` 未安装（M2 需 pip 装 rknn-toolkit-lite2 或 ctypes 调用） |
 | 视频编码 | GStreamer `mpph264enc`/`mpph265enc` 1080p30 ≥47fps |
-| 视频解码 | `mppvideodec` 硬件解码可用 |
+| 视频解码 | `mppvideodec` 硬件解码可用；4K60 H.264/H.265 裸解 186–187 fps（≈3.1× 实时）；8K（7680×4320）裸解 **44.7 fps（8K30 H.265）/ 47.8 fps（8K60 H.264，不足实时）**（2026-11-24） |
+| 视频编码（8K） | 实测 `mpph265enc` **可硬编 8K30 H.265**（7680×4320@30，日志 `h265e_proc_prep_cfg w:h [7680:4320]`），超出 datasheet 的 4K60 编码上限；但该片播放路径不稳定（见 §5.2） |
 | 2D 加速 | `librga 2.2.0` 已安装；GStreamer 侧无 `rga`/`rgaconvert` 元素（M2 走 librga C API 或自定义元素） |
 | 软件编码参考 | x264 1080p 仅约 16fps |
 | 媒体工具 | ffmpeg 7.1（无 rkmpp，媒体链路以 GStreamer 为准） |
@@ -36,7 +37,7 @@
 |---|----------|----------|------|------------------|
 | 1 | `mppvideodec` 可硬解 1080p30 H.264 | `scripts/bench_board.sh` / `scripts/perf_probe.py` | 稳定 30fps，单核 CPU 占用低 | ✅ 2026-11-14：12s/360 帧全解 0.80s（≈15× 实时）；GPU 转换路径播放窗口 30fps、进程 CPU 16–17%（A1 达标；证据 `docs/evidence/m1-ui-gl.png`） |
 | 2 | `mppvideodec` 可硬解 1080p30 H.265 | 同上，换 `h265parse` + H.265 素材 | 稳定 30fps | **已实测（2026-11-18）**：`user-selfie-1080p30.mp4`（HEVC 1080p30、rotate-180）demo 全开 30.0fps，快照 `docs/evidence/m3-h265-selfie-demo.png` |
-| 3 | 4K30 H.265 解码能力 | 4K H.265 素材 + `fpsdisplaysink` | 连续播放不卡顿（A1 可选加分项） | 可选；4K 不作硬指标（P4），待素材 |
+| 3 | 4K30/4K60 H.264/H.265 解码能力 | 4K 素材 + `fpsdisplaysink` / `scripts/bench_4k60.sh` | 连续播放不卡顿（A1 可选加分项） | ✅ 2026-11-24 实测（超出预期）：**4K60 H.264/H.265 均稳定 60.0 fps**（3840×2160@60 素材，默认 `texture_max_dimension=1280`；H.264 CPU 39–50%/beauty 2.0–2.7 ms，H.265 CPU 29–38%/beauty 1.5–1.8 ms）；VPU 裸解吞吐 **186–187 fps（≈3.1× 实时）**。瓶颈只有 NPU 检测（开启后 20.7–60 抖动）。证据 `docs/evidence/4k60/`，细节见 §5.2 |
 | 4 | `waylandsink` 可用 | `gst-inspect-1.0 waylandsink` + 最小播放管线 | 窗口正常出画 | 2026-11-14 元素存在；M1 用 `gtk4paintablesink` 内嵌，`waylandsink` 留作降级未出画 |
 | 5 | `gtk4paintablesink` 是否可用 | `gst-inspect-1.0 gtk4paintablesink` | 决定 F9 内嵌方案 | ✅ 2026-11-14 可用且已验证：`gst-plugin-gtk4 0.13.5`；`Gtk.Picture` + `paintable` 播放窗口 30fps |
 | 6 | Mali GPU 上 `glshader` 可用 | `gst-inspect-1.0 glshader` + 简单 fragment shader 管线 | 可在播放链路中插入 | ✅ 2026-11-17：headless（`GST_GL_PLATFORM=egl GST_GL_WINDOW=surfaceless`）下 shader 编译/渲染可用；约束：片元 shader 必须自带 `precision highp float;`、uniform 必须 `G_TYPE_FLOAT`（见 §5.2）；已用于美颜 |
@@ -53,6 +54,7 @@
 | 17 | `mpph264enc` 编码器输入/参数 | `gst-inspect-1.0 mpph264enc` + RGBA/NV12 路径基准 | 码率参数可用、可吃 RGBA | ✅ 2026-11-18：**没有 `bitrate` 属性**，码率写 `bps`；sink caps 接受 RGBA/NV12 等；`GL RGBA→gldownload→编码` 90 fps vs `GL NV12→gldownload→编码` 20 fps（NV12 转换慢 4 倍） |
 | 18 | 用户级部署契约（install.sh） | `./install.sh --require-board` 部署启动器 + 桌面入口 | 输出 `Deployment complete.`，`desktop-file-validate` 通过 | ✅ 2026-11-18：板端实测 16 ok / 1 warn / 0 fail；`~/.local/bin/video-player-demo` + `~/.local/share/applications/video-player-demo.desktop`；启动器 `--version` 输出 `video_player 0.1.0` |
 | 19 | 网络流 | HLS 样本 + 局域网 RTSP 摄像头 | 可播放（A6） | 移出本期（2026-11-14），不验收 |
+| 20 | 8K（7680×4320）解码与播放 | 8K 素材 + `docs/evidence/8k/README.md` 复现命令 | 能出画面、可评估 | ⚠️ 2026-11-24：**能解能播但渲染不稳，不作交付项**。8K30 H.264 稳 30.0 fps（CPU 21%）、8K60 H.264 标称 59.9 fps（裸解仅 47.8 fps，实际丢帧）；8K30 H.265 出图后 SIGSEGV；`texture_max_dimension=0` SIGSEGV；根因 GPU BO `PANFROST_CREATE_BO err=12`。详见 §5.2 与 `docs/evidence/8k/` |
 
 ## 3. 模型与素材清单
 
@@ -62,7 +64,8 @@
 | 人脸检测模型 | `models/scrfd_500m.rknn`（备选） | 同上，速度优先 | 未使用 |
 | 测试视频（正脸） | 1080p30 H.264 人像，≥1 人 | 用户自备（公司自有版权） | 待提供 |
 | 测试视频（多人/侧脸） | 1080p30，≥3 人，含 ≤45° 侧脸 | 用户自备（公司自有版权） | 待提供 |
-| 测试视频（4K） | 4K30 H.265，可选 | 用户自备（公司自有版权） | 选配；4K 不作硬指标 |
+| 测试视频（4K） | 4K60 H.264/H.265，可选 | 板端合成 + 1080p30 人像上采样（`/tmp/4k60/`，不入库） | ✅ 2026-11-24 已用于 4K60 实测（见 §5.2 与 `docs/evidence/4k60/`） |
+| 测试视频（8K） | 8K H.264/H.265，能力探测用 | 公开免费样本（thetestdata / ai2done）+ 板端硬解→硬编转码（`/home/tris/demo-8k/`，不入库） | ✅ 2026-11-24 已用于 8K 探测（见 §5.2 与 `docs/evidence/8k/`） |
 | 测试流 | 局域网 RTSP + 公网 HLS 样本 | 公开样本/公司搭建 | 本期不做（随 F2 移出） |
 
 版权要求：演示与验收素材必须使用公司自有或已授权素材，禁止把下载的影视片段
@@ -91,6 +94,14 @@ python3 scripts/perf_probe.py
 
 # 色彩转换路径 wall-time 基准矩阵
 bash scripts/bench_board.sh
+```
+
+离线安装（板端无网络/无 git）用单文件安装器；它内嵌的源码包是生成物，发布前必须与工作区一致：
+
+```bash
+# 本机：重新生成内嵌源码包（改了任何随包发布的文件都要跑）
+python3 scripts/build_board_install.py
+python3 scripts/build_board_install.py --check    # 过期会非零退出并列出差异文件
 ```
 
 `install.sh --require-board` 会把板级项（`mppvideodec`、`mpph264enc`、`waylandsink`、
@@ -154,9 +165,21 @@ bash scripts/bench_board.sh
 | 2026-11-19 | M5 实验面板滚动回归 | 1280x800 板屏下展开「实验性」后旧代码把窗口撑到 1280x913，底部大眼滑杆点不到 | 侧栏套外层 `Gtk.ScrolledWindow`、playlist 固定 160 px、展开后 150 ms 自动滚底；复测窗口 1280x768，瘦脸/大眼均可见；`GLib.idle_add` 版本 exit 139，timeout 版本 exit 0 |
 | 2026-11-19 | M5 成片 v3 自检（warp 重做后重剪） | `video-player-m5-demo-v3.mp4`：52.10 s / 1920×1080@30 / H.264 yuv420p / CRF21 / 35,433,497 B（5.44 Mbps）/ 无音轨 / 无 rotation side data / faststart（moov 在 mdat 前）/ sha256 `ca6b23b1…`；`framemd5` 1563 帧相邻重复帧 0（要求 <2%）；闪烁/纹理回弹检测 0 段（480×270 灰度中央人脸区 Laplacian 方差：中位数 1455.9、阈值 2620.6、最大 2156.8） | 抽帧目视（t=3/7.5/9.5/15/25/29/31.5/33.5/35.8/37.8/40.5/42/44.5/48.5 s）画面正立、无闪烁、字幕不遮脸、瘦脸为整体收窄且自然、大眼温和可辨；构建脚本 `docs/demo-video/build_video_v3.sh`（07/08/09/10 段来自 rec6） |
 | 2026-11-19 | M5 warp 几何重做（用户反馈驱动） | 旧实现（下颌控制点局部位移 0.065×脸宽 + 圆形径向放大 0.40）用户反馈「瘦脸像脸凹进去一块、大眼不自然」；改为显示空间下半脸整体收窄（`SLIM_STRENGTH=0.16`）+ 眼周椭圆各向异性放大（`EYE_MAGNIFY=0.22`、半径 0.16×脸宽、纵横比 0.72），`warp_gate` 去掉肤色门限；CPU `cv2.remap` 参数网格 + 板端 A/B（slim0/slim100/eyes100/all100）+ v3 抽帧目视通过，warp 开销仍 ≤0.1 ms | 旧参数只调大小方向无法消除「局部凹陷/凸眼」，属于几何模型问题而非强度问题；A/B 需注意两次录制内容不同步（见 `docs/PITFALLS.md` 录制节） |
+| 2026-11-24 | **M6 4K60 硬解与播放（本轮）** | 板端 `/tmp/4k60/` 三段 3840×2160@60/8 s/480 帧素材（H.264 测试卡、H.265 测试卡、1080p30 人像 bicubic 上采样 + 60fps）；`--demo` 全屏 + `VIDEO_PLAYER_PERF_LOG=1` + `--snapshot --snapshot-delay 12` | **H.264 稳态 60.0 fps、CPU 39–50%、beauty 2.0–2.7 ms；H.265 稳态 60.0 fps、CPU 29–38%、beauty 1.5–1.8 ms**（默认 `texture_max_dimension=1280`）；headless VPU 裸解 **186–187 fps**（480 帧 2.57–2.59 s，≈3.1× 实时），全部 `rc=0` | 证据 `docs/evidence/4k60/`（4 张快照 + 全套 PERF）；信息栏读数 `3840×2160 / X-H264 / mppvideodec / fps 60.0` |
+| 2026-11-24 | 4K 纹理预缩 vs 全帧（`texture_max_dimension` 1280→0） | 同素材同配置，仅改 `texture_max_dimension` | 1280 预缩：稳态 60.0 fps；**0（全 4K 进 GTK）：稳态 58.0 fps，起播 1 s 掉到 8.0 fps，beauty 8–10 ms（约 4 倍）**，CPU 反而更低（8–15%，缩放转由 GPU 承担） | `perf_B_full4k_nodetect.log`；证明 `texture_max_dimension=1280` 是 4K60 稳 60 的关键设置 |
+| 2026-11-24 | 4K60 + NPU 人脸检测 | 同素材，`detection.enabled=true`、`interval_frames=3` | **fps 在 20.7–60.0 间抖动（均值≈35）、单帧 NPU 54–90 ms、CPU 182–289%**；检测是唯一把 4K60 拉离 60 fps 的因素 | `perf_C_1280_detect.log`、`shot_C_1280_detect.png`（人脸框正常）；1080p30 下 NPU 37–44 ms 本可摊薄，帧预算从 33 ms 收紧到 16.7 ms 后暴露 |
+| 2026-11-24 | **8K 解码与播放（本轮）** | 板端 `/home/tris/demo-8k/videos/`：8K60 H.264 实拍（7680×4320 59.94fps / 16.1 Mbps / 24.9 s）、8K30 H.264 实拍（2.6 Mbps / 27 s）、8K30 H.265 硬解→硬编转码（8.4 Mbps / 6.1 s，真实风景）；`--demo` + `demo_playback.json` + `VIDEO_PLAYER_PERF_LOG=1` + `--snapshot-delay 3` | **能解能播**：8K30 H.264 **30.0 fps 稳定**（CPU 21%）；8K60 H.264 **59.9 fps**（CPU 40–56%，片尾掉 17.5）；headless VPU 裸解 8K30 H.265 **44.7 fps**、8K60 H.264 **47.8 fps**（均 rc=0） | 信息栏读数 `7680×4320 / X-H264 / mppvideodec / 帧率 30.0`；证据 `docs/evidence/8k/`（4 张快照 + 4 轮执行输出 + README） |
+| 2026-11-24 | 8K 渲染稳定性（关键边界） | 同 8K 素材，改 `texture_max_dimension` 与编码 | ❌ **8K30 H.265 出图后 SIGSEGV（rc=-11）**；**`texture_max_dimension=0`（全 8K 进 GTK）直接 SIGSEGV**；8K H.265 硬编彩条 GPU BO `PANFROST_CREATE_BO err=12`（ENOMEM）、18.7 fps / 60 s 超时；首轮 8K 播放把 GNOME shell 拖崩（`GDK_IS_DISPLAY` 断言），gdm 自动重启后恢复 | 结论：**8K 可探测、不可交付**；4K60 仍是可靠上限（预缩 1280 是 4K 保命设置，8K 下也救不了） |
+| 2026-11-24 | 8K 硬编与软编对照 | `mpph265enc` 8K30 彩条 vs `libx265` 8K30 2 s | ✅ 硬编 rc=0（68.8 KB / 60 帧，`w:h [7680:4320]`）；❌ 软编 `libx265` 被 OOM killer 杀（rc=-9，3.8 GB RAM 不足） | 硬编 8K 超出 datasheet 的 4K60 上限，属实测超水平；软编路线在板端不可行 |
 
 ## 6. 已知环境限制与复现命令
 
+- **8K 会击穿渲染管线**：8K 进 GTK 后触发 `MESA: DRM_IOCTL_PANFROST_CREATE_BO failed (err=12)`
+  （GPU BO/显存分配失败，ENOMEM），随后 `mppvideodec` 分支正常但 UI 进程 SIGSEGV；
+  严重时连 GNOME shell 一起崩，`/run/user/1000/wayland-0` 短时不可用、GUI 报
+  `gtk_icon_theme_get_for_display: assertion 'GDK_IS_DISPLAY (display)' failed`。
+  gdm 约 1 分钟内自动重启 shell（`pgrep -a gnome-shell` 可确认），恢复后可继续；
+  **跑 8K 前先确认没有演示在用板子**。8K 素材与复现命令见 `docs/evidence/8k/README.md`。
 - 板端图形会话依赖物理登录：GNOME/gdm 未配置自动登录
   （`/etc/gdm3/daemon.conf` → `AutomaticLoginEnable=false`）。2026-11-17 上午
   连续多轮 1080p 全屏播放/截图期间触发 OOM（journal 记录
@@ -231,3 +254,343 @@ bash scripts/bench_board.sh
   （gnome-shell/DING 都报 `AT-SPI: Could not obtain desktop path or name`），不单独归因于播放器。
 - 部署：`window.py` md5 `6d95fe5f7fa959203ea4000c34a86f9b`，`diagnostics.py`
   `96ac58d1fd05ed2d72ec3478eeee43ff`；`--check` 17 ok / 0 warn / 0 fail。
+
+## 2026-11-24 UI 重排 + 全屏沉浸 HUD（板端验证）
+
+- 控制条改两行：`.seek-row`（进度 + 时间码）在上，`.button-row` 在下；顺序
+  `上一 / 播放 / 下一 ┊ 停止（ghost）┊ 倍速 ┊ 解码三段 / 弹性空白 / 音量 / CC / 全屏`。
+  解码三段（自动 / 硬解 / 软解）从侧栏搬到控制条，全屏时也能切。
+- 配色改中性石墨（底 `#0D0F11`、面板 `#15181B`、文字 `#E7E4DF`、钢蓝强调 `#7EA8C4`），
+  避免装饰色污染肤色参照；语义色只留给解路径与故障（琥珀 = 硬解降级，红 = 失败）。
+- 全屏沉浸：信息行 / 控制条 / 提示重挂进 `Gtk.Overlay` 上的浮动 dock
+  （2.5 s 静止淡出、底部 160 px 内视为悬停、暂停常显、字幕 `margin_bottom` 抬到 150 px）。
+  `--record` 时不进沉浸，避免录制画布缺块。
+- 板端实测（1280x768 窗口 / 1280x800 全屏，`03_selfie` 与 `01_closeup`）：
+  窗口态 30.0 fps、NPU 39–41 ms、美颜 1.1–2.7 ms；全屏 HUD 显示 → 8 s 时已淡出，
+  只剩画面 + 人脸框。证据 `docs/evidence/m7-ui-window.png`、`m7-ui-fullscreen.png`、
+  `m7-demo-hud.png`、`m7-demo-immersive.png`。
+- 修掉三个只有板端才暴露的样式/计时问题（详见 `docs/PITFALLS.md` §2）：
+  `Gtk.MenuButton` 的 CSS 节点是 `menubutton`（CC 一直白底）；`Gtk.Box` 默认
+  `valign=FILL` 把播放键拉成椭圆；Wayland 对静止指针持续投递 `motion`，把 dock
+  淡出截止时间一直推后。
+- 部署：24 个文件（`src/` 22 + `configs/` 2）经 paramiko SFTP 明文写入
+  `/home/tris/video-player-demo`，逐个 md5 校验一致；备份
+  `/home/tris/video-player-demo.bak-ui20261124-164847`；`--check --require-board`
+  17 ok / 0 warn / 0 fail。M7 的 `window.py` md5 `f39ec6a1dd8b97465de5cf06dd4e818e`。
+
+## 2026-11-24 M7.1 版面对齐效果图（板端验证）
+
+用户反馈「左下角小字不要了、界面填满到底、和效果图不一致」。对照 `mockups/g-1.png` 改了四处：
+
+- **删掉控制条下方的常驻提示行**：它占 18 px，窗口看起来像没到底。提示改成画面上方的
+  `Gtk.Revealer` toast（CROSSFADE 180 ms，6 s 后自动淡出），解码降级/续播/到头等提示都还在，
+  但不再占布局高度。全屏 dock 里因此只搬信息行与控制条。
+- **顶栏改两行标题**：`Gtk.HeaderBar.set_title_widget()` 放文件名 + `时长 · 分辨率 · 编码 · fps`
+  副标题；「打开」改成图标 + 文字（`document-open-symbolic`）；右侧顺序改为 对比 → 语言 → ☰。
+- **信息行精简**：`1920×1080 · H.264 · mppvideodec · 30.0 fps · NPU 1 张脸 41 ms · 美颜 1.6 毫秒`，
+  去掉「解码：/帧率：/NPU：/美颜：」标签，改成中点分隔，字号 9pt、固定 30 px 高。
+- **按钮回到 44 px**（播放键仍 48 px 圆形），与效果图的 `tb 44 / play 48` 一致；顺带修掉
+  `scale:focus` 的白色焦点框、可选中 Label 的 caret 竖线。
+
+板端实测（1280×768 窗口 / 1280×800 全屏）：控制条贴底、无空白行；30–31 fps、NPU 40 ms 量级、
+美颜 1.6 ms。证据 `docs/evidence/m7-ui-window.png`、`m7-ui-fullscreen.png`。
+本轮同样是全量部署：`deploy.py --apply` 后 `--dry-run` 显示 `local files: 24  remote known: 24  to upload: 0`，即板端与本地零差异；板端 `--check --require-board` 17 ok / 0 warn / 0 fail，安装入口 `~/.local/bin/video-player-demo --version` 正常。
+`window.py` md5（Python 明文）`c74effcd8cf125ed2ff700c95d0e1e0c`（上一节 `f39ec6a1…` 为 M7 版本）。
+
+## 2026-11-24 M7.2 全屏 dock 紧凑化（板端验证）
+
+用户反馈「全屏之后，显示的进度条等信息，占的屏幕面积太大了」。板端实测旧 dock
+**190 px / 800 = 23.8%**，改后 **120 px = 15.0%**（省 37%）。
+
+- 改动全部限定在 `.transport-dock` 作用域，窗口态仍是 44 px 触控尺寸：
+  dock `padding 4 10 6 10`、`radius 12`、`margin 12`、内部 `spacing 2`；
+  信息行 `7.5 pt / 18 px`；seek 行高 18、槽 4 px、滑块 12 px、时间码 8.5 pt；
+  按钮 38 px（播放 44 圆形）、倍速 38、解码段 30/46、分隔线 `margin 4 2`。
+- 常量随实测修正：`DOCK_HOVER_BAND 160 → 140`、`DOCK_SUBTITLE_CLEARANCE 150 → 140`
+  （120 dock + 12 底距 + 8 余量）。按原先的 110 会把字幕压在 dock 下面。
+- `tests/test_fullscreen_dock.py` 改为读真实常量（`CLEARANCE`），不再硬编码 150。
+- 板端：24 文件零差异，`--check --require-board` 17 ok / 0 warn / 0 fail；
+  备份 `/home/tris/video-player-demo.bak-ui20261124-190800`。
+  证据 `docs/evidence/m7-ui-fullscreen-compact.png`，
+  `window.py` md5 `5de37acc7b8bf5a92d826fadbd713158`。
+- 比例沟通用设计稿 `mockups/g-fullscreen-compact.html` → `mockups/g-3.png`（同尺寸，98 px）。
+
+## 2026-11-24 M7.3 美颜默认关闭（板端验证）
+
+用户要求「把美颜效果设为默认关闭」。先定位真源：`Config.load()` 在没有 `--config`
+时读 `configs/player.example.json`，所以真正的默认值是那个 JSON，不是 dataclass
+默认值——两处必须同时改，否则缺文件与有文件两种启动会不一致。
+
+- `configs/player.example.json`：`beauty.enabled` `true → false`（只改这一行，保持最小 diff）。
+- `src/video_player/config.py`：`BeautyConfig.enabled: bool = False`，
+  维持 `Config() == Config.load()` 不变式；`tests/test_config.py` 断言同步，
+  并补一条 `example.beauty.enabled is False`。
+- `_apply_demo_mode()` 显式开启（`enabled = True` + switch `set_active(True)`）：
+  shader 在 `u_active <= 0.5` 时直接返回原图，F9 对比分割线也在 active 分支里，
+  不在 demo 里 opt-in 的话 `--demo` 会退化成一张普通全屏画面。
+- 桌面入口 `Exec=$LAUNCHER %f` 不带 `--demo`，所以从菜单/启动器打开即为关闭状态；
+  `B` 键或侧栏「美颜（次要功能）」随时可开。
+- 板端：4 文件更新（config JSON + app.py + config.py + window.py），md5 4/4 校验通过；
+  备份 `/home/tris/video-player-demo.bak-ui20261124-191922`；
+  `--check --require-board` 17 ok / 0 warn / 0 fail。
+- 证据：`docs/evidence/m7-beauty-default-off.png`（信息行 `美颜 关`、无分割线）、
+  `docs/evidence/m7-demo-beauty-on.png`（`--demo` 仍分屏，`美颜 2.9 毫秒`）。
+  md5：`window.py 6460e58f24a625d6913db118c2fbe84e`、
+  `config.py 89d819e6c4639de57bcb2681eddc6951`、`app.py a9cc8776a54bf619dfa3405cc7141c54`、
+  `configs/player.example.json 21c64c87dd3972851600291987f355d9`。
+
+## 2026-11-24 M7.4 人脸检测默认关闭（板端验证）
+
+用户反馈「点击视频后不立即播放，要等一会」。诊断结论：`FaceDetectionTap.prepare()`
+在 `backend.open()` 里**同步**预热 NPU（模型 66 ms + 1080p 全零帧 1761 ms），占住
+GTK 主线程；`close()` 每次释放 RKNN context，所以每切一片都重来。用户选方案 1：
+默认关检测。
+
+- 默认值：`configs/player.example.json` `detection.enabled=false`、
+  `DetectionConfig.enabled=False`、`tests/test_config.py` 断言同步。
+- `window.py`：`_show_faces` 默认 False；新增 `_detection_opted_in`（自定义 `--config`
+  显式 true 时始终开）；`_sync_detection_need()` 只在 `backend.open()` 前解析
+  `demo || beauty.enabled || _show_faces || opt-in`；**UI v4（2026-11-26）起**播放中拨
+  开美颜/人脸框不再只提示「切换视频后生效」，而是记住当前播放位置、在信号返回后
+  `GLib.idle_add` 自动重开当前视频并 toast「正在启用人脸检测（约2秒）」
+  （`_on_detection_dependency_toggled` → `_reopen_for_detection`）；`--demo` 显式开启
+  （美颜 oval mask 依赖 NPU 框，无框时 `face_mask` 返回 0，效果会整片消失）。
+- 顺手修：`_on_detection()` 不再因 `_show_faces=False` 提前 return —— 关掉人脸框后
+  信息行原本恒显示 `NPU —`，即使美颜还在用这些框。
+- 板端实测 `play_path → play_path_ok`：
+
+| 启动方式 | 耗时 | 说明 |
+|---|---|---|
+| 默认配置 | **36–38 ms** | 原 3132 ms，点击即播 |
+| `--demo` | 3132 ms | 检测 + 美颜 + 分屏，一次预热 |
+| 临时配置 `beauty.enabled=true`（detection 留 false） | 3073 ms | 联动拉起检测，信息行 `NPU 1 张脸 41.0 毫秒` |
+
+**运行中开美颜自动重开实测（2026-11-26，UI v4 修复）**：普通启动
+`python3 -m video_player` + 30 s 1080p30 H.264 素材，真实 `Gtk.Switch` 信号路径，
+探针 `.cache/qc/detection-restart/verify_detection_restart.py`（板端
+`/home/tris/detection-restart-accept/`，原始 JSON 同名 `.json`）：
+
+| 场景 | 开关后 | 结果 |
+|---|---|---|
+| 播放到 3.05 s，开美颜 | 立即：hint「正在启用人脸检测（约2秒）」、`reopen_id` 已排队、`detection.enabled=False`、shader `u_active=1.0` 但无 `u_face0`（= 画面无变化，即用户报的「开了没效果」） | **3.48–3.58 s** 后人脸进入着色器：`faces 1–2`、`u_face0_w≈0.279`、NPU 42–75 ms、位置 3.19 s（未回到 0） |
+| 同上，稳定 1.5 s 后 | 位置 4.69 s、`faces 3`、`NPU 42.4 ms`、`beauty 2.06 ms`、`u_face0_w 0.245` | 美颜持续生效 |
+| 播放到 3.06 s，先开人脸框 | 立即 hint + 重开队列（192 ms 内无重复重开） | **3.51 s** 后 `faces 1`、overlay 画 1 个 L 框、`NPU 38.7 ms`；随后再开美颜 `reopen_id=0`、`u_active=1`、`u_face0_w 0.246` |
+| 开关重复拨动 | 第二次拨动取消旧 idle、只保留一个重开；关掉最后一个依赖项则取消重开并撤掉 toast | 单元测试覆盖（`tests/test_detection_restart.py` 12 项） |
+
+板端 `--check --require-board`：**17 ok / 0 warn / 0 fail**；部署哈希
+`window.py 15636bb8…`、`i18n.py 07633c9a…`（与本地逐字节一致）。
+
+- 部署：首次 5 文件 + 读数修复 1 文件，md5 全部校验；`--check --require-board`
+  17 ok / 0 warn / 0 fail；备份 `video-player-demo.bak-ui20261125-091526`、
+  `...091909`。
+- 证据：`m7-detection-default-off.png`、`m7-demo-detection-on.png`、
+  `m7-beauty-requests-detection.png`。md5：`window.py
+  f5760dd01129c5560b3d55ce4dd06d6d`、`config.py a99da031cf515351547e72efa7ede8b5`、
+  `app.py 4c8714c866bc1b713bc7bc8b00cb4c48`、`i18n.py 7696056e243ca8b4093b7dd6d9d22a5c`、
+  `player.example.json 02e739081506c23ececbb8d2547a4f9f`。
+
+## 2026-11-25 M7.5 解码三段按钮切换修复（板端验证）
+
+用户反馈控制条的「自动 / 硬解 / 软解」点一次后就不再生效。根因是 `_on_decode_toggled()`
+对 GTK 互斥组里**被取消**的按钮执行 `set_active(True)` 强制回写：GTK 切换时先给旧按钮发
+`toggled(False)`，回调把它重新点亮，又按组规则压回新按钮，两个按钮互相触发信号，按钮状态
+与 `config.player.decode_mode` 脱节，第一次之后就被 `mode == config` 的提前 return 吞掉。
+
+- `window.py`：
+  - 收到取消通知直接 `return`，不再回写；互斥组本身保证恰好一个 active。
+  - 新增 `_sync_decode_buttons()`：用 `_updating_decode` 包住程序化 `set_active()`，每次用户
+    切换后把按钮状态重新对齐 config；初始化也走这条路径。
+  - `_apply_decode_mode()` 改为 `GLib.idle_add(self._reopen_for_decode_mode, ...)`，把管线
+    重建推迟到 `toggled` 信号返回之后；快速连点时先 `source_remove` 旧 idle，只保留最新一次；
+    `close-request` 里清理 pending idle。
+- 回归测试：`tests/test_decode_segments.py`（9 个用例，AST 抽方法 + 复刻 GTK「先取消旧按钮、
+  再激活新按钮」的派发顺序），覆盖连续三次切换、取消通知不回写、防重入同步、idle 防抖、
+  关窗后不重建、无媒体只提示。
+- 板端实测：
+  - `python3 -m py_compile` 通过；`--check --require-board` 17 ok / 0 warn / 0 fail。
+  - 9 个逻辑用例全过；再用**真实 `Gtk.ToggleButton` 互斥组**连续切换
+    `hw → sw → auto → hw` 四次，四次都触发重建，且每次组内只有一个 active。
+  - 启动实拍 `docs/evidence/m75-decode-switch.png`：三段按钮只有「自动」高亮，信息行
+    `mppvieodec · 30.0 fps · 美颜 关`，无报错。
+- 部署：备份 `video-player-demo.bak-ui20261125-094447`，上传 1 文件、md5 校验 1/1。
+  md5：`window.py 73f2fd1203145d335c268406c92342dc`、`test_decode_segments.py
+  dc13c74f5c563c8cb4d3498cdf90c208`。
+
+
+## 2026-11-26 UI v3 全量改造（板端验收）
+
+按 `mockups/ui-v3` 改造播放器 UI，范围：空态拖放区、带标签信息行与 `H.264/H.265`
+归一、44 px 两行控制条、侧栏顶部美颜面板、不透明全屏 dock + 美颜/对比 pill、
+淡出后常驻遥测与 2 px 进度线、分屏「原图/美颜」标签、四角 L 形人脸框。
+只改 UI/文案层，`backend.py`、`beauty.py`、`recording.py`、`pipeline.py`、
+`config.py`、`ui/capture.py` 均未改动。
+
+**部署与自检**
+
+- 板端项目 `/home/tris/video-player-demo`，完整同步 `src/` 23 个 `.py`（含新增
+  `ui/chrome.py`）；旧源码备份
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261126-115030-ui-v3-src`。
+- 部署后哈希：`window.py dd16d0cd…`、`ui/chrome.py ad3fc983…`、`i18n.py 58257216…`；
+  本机与板端逐一相同。
+- `PYTHONPATH=src python3 -m video_player --check --require-board`：
+  **17 ok / 0 warn / 0 fail / 0 skip**。
+- 验收素材：`/home/tris/demo-footage/ui-v3-accept-1080p30-h264.mp4`
+  （H.264 1920×1080@30，8.0 s，5,102,988 B，sha256 `f32297fa…9cb9`），
+  从本地自拍素材截取；只用于本次 UI 验收，不进入发布物料。
+
+**实测读数（板端快照 + 临时采集脚本）**
+
+| 项目 | 实测 |
+|---|---|
+| 窗口内容尺寸 | 1280×768（GNOME 顶栏占 32 px）；全屏 1280×800 |
+| 控制条（窗口态） | `prev/play = 44×44`，`seek = 30 px`，整条 `108 px` 高；两行布局 |
+| 控制条（全屏 dock） | `prev/play = 44×44`，`seek = 22 px`，dock `98 px` 高；不透明面板 |
+| 侧栏 | 视口 709 px；快捷键提示 `y=650 / h=15`，底部完整可见（最近播放固定 128 px） |
+| 信息行 | `分辨率 1920×1080 · 编码 H.264 · 解码 硬解 · 帧率 30.0`；`● 人脸 2 · 41 ms · 美颜 开 · 1.4 ms` |
+| 全屏遥测 | `1920×1080 · H.264 · 硬解 · 30.0 fps ● 人脸 1 · 43 ms · 美颜 开 · 1.5 ms` |
+| 淡出后 | dock 隐藏，遥测降到 62% 仍可见，底边 2 px 进度线常驻 |
+| 人脸框 | 四角 L 形 + 置信度 `人脸 0.91` / `人脸 0.54`；无整框、无 5 点圆点绘制 |
+| 语言 | 采集脚本显式 `language="zh"`；英文字符串也已在本地/此前板端截图中走通 |
+
+**证据**（`docs/evidence/`）
+
+| 文件 | 场景 |
+|---|---|
+| `ui-v3-01-empty.png` | 无片空态：传输栏与信息行隐藏，视频区为拖放区 + 主/次 CTA + 能力 chip |
+| `ui-v3-02-window.png` | 窗口态播放：带标签信息行、44 px 控制条、顶部美颜面板、两脸 L 框 |
+| `ui-v3-03-fullscreen-controls.png` | 全屏唤出：不透明 dock、美颜/对比 pill、左上单行遥测 |
+| `ui-v3-04-fullscreen-idle.png` | 全屏淡出：dock 隐藏，62% 遥测 + 底部 2 px 进度线保留 |
+| `ui-v3-05-fullscreen-compare.png` | 全屏分屏：原图/美颜标签 + 参数行，dock「对比」激活 |
+
+**未验证 / 已知限制**
+
+- 真实触摸拖放、`Gtk.FileDialog` 选文件夹未做人工点击验收；本次只验证程序化截图与
+  空态/播放态切换。拖放代码路径为 `Gtk.DropTarget(Gdk.FileList)` +
+  `expand_media_args()`，需要后续触摸屏实测。
+- `--record` 未重录/未做质量门；本次未改录制编排，录制画布仍按窗口态控件合成。
+  新增的分屏标签与全屏遥测不进入录制画布；如果后续要重录演示片，需要另开任务决定
+  是否把这两层纳入 capture 画布。
+- `--snapshot` 在本轮多次采集中偶发一次 `ok=False`（重跑成功），属既有
+  `Gtk.WidgetPaintable.to_node()` 首帧/时序问题，不是 UI v3 引入。
+
+## 2026-11-26 ui-v5 P1/P2 本机实现（当晚已部署到板端）
+
+P1（琥珀 token 化）与 P2（左导航 + 片库 / 空态）先在本机验证，随后于 20:33 整组部署到
+`/home/tris/video-player-demo`（9 文件、哈希对账、原子替换；旧模块缺失时只覆盖
+`window.py` 会 ImportError，所以 4 个新模块必须一起上），21:28 热修排序菜单后重部署。
+板端实测：`--check --require-board` **17 ok / 0 fail**、GTK 4.18 CSS **0 errors / 23,346 B /
+25 token**、片库 / 空态 / 播放三张 1280×768 截图验收；实例 PID 561659。部署明细与哈希在
+内部 `STATE.md` §43/§44。
+
+本机验证（部署前）：
+
+本机实测（GTK 4.14.5 / GStreamer 1.24.2，X11 `:10.0`，无 NPU、无 H.264 软解）：
+
+- 真实 `PlayerWindow` 启动落点：无参数 → browse；`--demo` → player；`--record` → player。
+- 内容区 1280×709（窗口 1280×768，headerbar 58）：rail 87、页面 1140×687、
+  卡片 273×173、12 张卡三行、`vadjustment.upper == page_size`，页脚完整可见。
+- 片库素材为 12 条本地 VP9 片段（本机可软解）；元数据探测与海报取帧均走真实
+  `probe.py` 路径，缩略图缓存命中后不再解码。
+- 交互探针 58 项全过（含筛选为空时保留网格与提示）：chip / rail 筛选、三种排序、目录增删、语言切换、卡片进播放页、
+  返回箭头与 `Esc`、播放后最近观看计数刷新。
+- 截图与探针留在内部 `.cache/qc/ui-v5-p2/`（不发布）。
+
+板端仍待人工验证：H.265/VP9/AV1 文件的探测耗时、`mppvideodec` 海报取帧与播放互斥、
+触摸点按 chip / 卡片 / 目录选择、真实触摸拖放、排序 popover 的实际点按（§44 只在本机截过）。
+
+## 2026-11-26 ui-v5 P3 首页 + 详情：本机实现（当晚已部署到板端）
+
+P3 新增首页（hero + 继续观看 + 最近添加）与详情页（背景板 + 选集 + 文件参数 + 同目录），
+并把左导航抽出成四项（首页 / 片库 / 最近 / 设置）。本机验证后已于当晚 22:16 整组部署到
+`/home/tris/video-player-demo`（10 文件；旧板端是 P1+P2，6 个新模块缺失，只覆盖 `window.py`
+会 ImportError）。板端实测见本节末尾。
+
+本机实测（GTK 4.14.5 / GStreamer 1.24.2，X11 `:10.0`，无 NPU、无 H.264 软解、
+VP9 软解；真实 `PlayerWindow`，探针 `.cache/qc/ui-v5-p3/probe.py`）：
+
+- **窗口尺寸**：1280×768 固定不被内容撑大（内容 709 px）。home 内容 697 px
+  （`6 + hero 225 + 10 + 228 + 10 + 224 + 6`）；hero 是弹性带（min 170），
+  详情页 `268 + 12 + 414` 正好一屏。
+- **首页**：hero = 最近观看（60 s 长片，`继续观看 00:20`），两行各 4 张真卡片；
+  hero 大图 1140 px（`BackdropCache` 单 worker 串行解码，缓存按 size+mtime+width）；
+  空片库 → 整页首启空态（取景框 + 选择目录/打开文件/前往片库）。
+- **详情页**：4 chips、7 行参数（VP9 / 1280×720 / 25.000 fps / 01:00 / 9.6 MB / 1.3 Mbps /
+  软件解码）、12 条选集（当前条琥珀描边 + `正在播放` + 自动滚入）、同目录 3 行；
+  参数卡高度压到 408 px 后才落进 414 px 内容区。
+- **真实续播**：seed `recent.json` + `resume.json`（60 s 长片、位置 00:20）→
+  详情 CTA「从 00:20 继续」，播放后 `position_ns ≥ 19 s`；「重新播放」后 `< 1.5 s`。
+- **交互**：93 项断言全过（80 full + 13 empty）——启动落点、卡片→详情、详情→播放→返回、
+  首页卡片直接播放、两处「全部」、中英切换、同目录切集（header 跟随）、拖放规则、
+  空态 CTA、`Esc` 回上一级、browse 页快捷键失效。
+- pytest **531 passed / 15 skipped / 0 failed**（P2 基线 474/15；新增 `test_board_install.py` 10 项、`test_recording_layers.py` 2 项）；
+  CSS 27,954 B / 25 token、GTK 4.14.5 解析 0 errors。
+- 截图与探针留在内部 `.cache/qc/ui-v5-p3/`（不发布）。
+
+### 板端部署与验收（2026-11-26 22:16–22:19，明细见内部 `STATE.md` §46）
+
+- 10 文件整组替换（6 新增 + library_page/window/style/i18n），备份哈希、暂存哈希、部署后哈希
+  三方一致；`--check --require-board` **17 ok / 0 fail**（重启前后各一次）。
+- GTK 4.18.6：`style.CSS` **27,954 B / 25 token / 0 errors**；headerbar 实际 **58 px**，
+  内容区 1280×709，窗口 1280×768。
+- 首页 / 详情 / 片库 / 空态四张 1280×768 截图（单进程串行、各一次快照）与 54 项断言全过：
+  首页 hero 设备行 `硬解`、详情参数行 `VPU 硬解`（琥珀 `is-accent`）、选集 6 / 同目录 3、
+  片库 6 卡 4 列不滚动、空态 CTA 与扫描/格式栏完整；海报/背景板取帧日志有 MPP `h264d_api`。
+- 实例 PID 628050（22:18:59，PPID=1，语言 en、无扫描目录 → 首页空态）。
+- 仍未实机验证：触摸点按、真实拖放 / `Gtk.FileDialog`、排序 popover 点按、播放页实际播放 /
+  续播 seek / 自动下一集、`--record`、H.265/VP9/AV1；首页/详情历史为隔离 state 预置。
+
+### 离线安装包板端验证（2026-11-26 23:43–23:52，明细见内部 `STATE.md` §48）
+
+- `bash board-install.sh /home/tris/ui-v5-offline-test/app --no-desktop`：解包 **68 文件**，
+  `--require-board` **16 ok / 1 warn / 0 fail**（warn = 无 `models/*.rknn`），退出码 0；
+  `--no-desktop` 不动用户既有启动器/桌面入口。
+- 板端逐文件 `sha256sum -c` **68/68 一致**；脚本 sha256 与本地相同（`022d6384…`）。
+- 从解包目录启动一次（PID 747601）：`actions.log` 记 `window_open` + `library_scan`，
+  RSS ≈ 161 MiB，日志只有既有的 ZINK / GDBus 非致命两行；验证后退出，常驻实例 628050 未受影响。
+- 真窗口探针从解包目录导入：**15/15 断言**，CSS 27,954 B、窗口 1280×768、ui-v5 P3 首页完整
+  （hero 可续播、两行各 4 卡，海报/背景板取帧日志有 MPP `h264d_api`），截图 sha256 `e28fa798…`。
+- 未覆盖：启动器/桌面入口/DING 安装、播放页 / 续播 / 录制、触摸、模型检测。
+
+### 播放页板端回归（2026-11-26 23:55–2026-11-27 00:03，明细见内部 `STATE.md` §49）
+
+覆盖 ui-v5 P3 播放页：详情续播 seek、EOS 自动下一集、`--record` 30 s。探针为一次性进程 + 一次快照，
+每次用隔离 XDG state；测试期间停掉常驻实例，结束后恢复。
+
+- **续播 seek（17/17）**：详情 CTA `从 00:20 继续` → 点击后起播 **20.050 s**；1.2 s 后 21.257 s；
+  UI 时间码 `00:21`、toast `已从 00:20 继续播放`；`mppvideodec`、1920×1080、24 fps、`解码 硬解`。
+- **EOS 自动下一集（12/12）**：8 s 短片播到尾部 → playlist **4 → 5**，下一集
+  `ui-v3-demo-30s-h264.mp4` 在 **0.277 s** 起播，无错误卡，header/侧栏同步。
+- **`--record` 30 s**：退出码 0，产物 `record-30s.mp4` 26,928,659 B / **927 帧 / 30.9 s /
+  1280×768@30 / H.264 / 6.97 Mbps（无音频）**；视频 ROI 连续重复 54/897（**6.0%**）≈
+  **28.2 unique fps**（旧 UI 同链短测为 34.29% / 19.86 fps，本次未改录制代码，差异来自 P3 布局）。
+  抽帧确认视频 + 侧栏 + 控制条都入片。
+- **两条观察（未改代码）**：① 录制画布不含 headerbar 但保留其高度，成片顶部有约 59 px 空带；
+  ② 成片色彩标签为 `yuvj420p` / `pc` / `gbr` / sRGB，与 4:2:0 H.264 的常规 bt709/tv 不一致，
+  严格按标签转换的链路可能偏色，抽帧目视未见异常。
+- 常驻实例恢复后 PID 765845（语言 en、无扫描目录），uptime 连续未重启。
+
+### 录制画布顶栏修复（2026-11-27 00:29–01:15，明细见内部 `STATE.md` §50）
+
+- **问题**：成片顶部约 59 px 空带——画布只合成 sidebar/info/controls/hint/status + 视频，
+  不含 headerbar，但画布仍取整窗尺寸。
+- **修复**：`window.py` 记住 `_headerbar`，`_recording_layer_specs()` 第一项是
+  `("header", _headerbar)`，每秒刷新组加入 `header`；新增 `tests/test_recording_layers.py`（2 项）。
+- **板端 30 s 重录**（`header-fix-30s.mp4`，同素材/同窗口/隔离 state）：26.99 MB / 30.90 s /
+  927 帧；视频 ROI 重复 **4.9%**、唯一帧 **28.6 fps**（旧成片 6.0% / 28.1 fps，未变慢）；
+  顶部 58 px 从 std 3.4 / 3 色变成 **std 19.5 / 1915 色**，抽帧可见标题与按钮。
+- **色彩标签（2026-11-27 决定：保持现状，不修）**：两版实现都能把成片标签改成
+  `yuv420p / tv / bt709`，但内容质量不达标，均已回退：
+
+  | 实现 | 标签 | moov | ROI 连续重复（跳前 30 帧） | 唯一帧 |
+  |---|---|---|---|---|
+  | 现状：RGBA → `mpph264enc` | `yuvj420p / pc / gbr` | ✅ | 6.0% | 28.1 fps |
+  | RGBA + 仅加 `capsfilter`（对照） | 同现状 | ✅ | 6.3% | 28.0 fps |
+  | CPU `videoconvert` → I420 bt709/tv | `yuv420p / tv / bt709` | ❌ 5/5 失败 | 81% | 5.5 fps |
+  | GL `glcolorconvert` → I420 bt709/tv | `yuv420p / tv / bt709` | ✅（配 pad EOS） | 77% | 6.9 fps |
+  | CPU `videoconvert` → NV12 bt709/tv | — | ❌ | — | — |
+
+  原因：静态 `gst-launch` 能跑 217 fps（I420 编码）/ 102 fps（RGBA→I420），问题只在
+  「动态挂载录制分支 + 并发硬解 + `glvideomixer`」组合下出现——YUV 路径产生背压，视频 queue
+  丢帧、mixer 用重复帧补满 30 fps；YUV 输入还会让 EOS 卡在 mixer 视频入口，muxer 收不到 EOS
+  就没有 moov。**保留现状的 `yuvj420p / pc / gbr` 标签**：严格按标签转换的播放器/转码链可能
+  偏色，`docs/PITFALLS.md` §3 已记录，v1.2.0 发布说明标注为已知风险。
