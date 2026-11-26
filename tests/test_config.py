@@ -22,8 +22,10 @@ def test_defaults_are_valid_and_match_example_file() -> None:
     assert config.player.video_convert == "auto"
     assert config.player.texture_max_dimension == 1280
     assert config.player.volume == 80
-    assert config.beauty.enabled is True
-    assert config.detection.enabled is True
+    # Player first: beauty and the NPU detector are both opt-in, so a click
+    # starts playing immediately (no ~3 s warm-up on the GTK main thread).
+    assert config.beauty.enabled is False
+    assert config.detection.enabled is False
     assert config.detection.core_mask == 0
     assert config.detection.model_path == "models/yunet_rk3576.rknn"
     assert config.detection.interval_frames == 3
@@ -34,6 +36,8 @@ def test_defaults_are_valid_and_match_example_file() -> None:
     # The shipped example file is the documented defaults.
     example = Config.load()
     assert example == config
+    assert example.beauty.enabled is False  # shipped file matches the dataclass
+    assert example.detection.enabled is False
     assert default_config_path().exists()
 
 
@@ -136,3 +140,71 @@ def test_experimental_beauty_rounds_to_one_decimal() -> None:
 def test_hold_ms_must_be_a_number() -> None:
     with pytest.raises(ConfigError, match="hold_ms"):
         Config.from_dict({"detection": {"hold_ms": "soon"}})
+
+
+def test_recent_files_is_a_known_player_key() -> None:
+    """The new key must validate instead of tripping the unknown-key check."""
+    assert Config.from_dict({"player": {"recent_files": False}}).player.recent_files is False
+    assert Config.from_dict({"player": {"recent_files": "true"}}).player.recent_files is True
+
+
+def test_recent_files_must_be_boolean_like() -> None:
+    with pytest.raises(ConfigError, match="recent_files"):
+        Config.from_dict({"player": {"recent_files": "maybe"}})
+
+
+def test_decode_mode_defaults_to_auto_and_accepts_three_values() -> None:
+    assert Config().player.decode_mode == "auto"
+    for mode in ("auto", "hw", "sw"):
+        assert Config.from_dict({"player": {"decode_mode": mode}}).player.decode_mode == mode
+
+
+def test_decode_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ConfigError, match="player.decode_mode"):
+        Config.from_dict({"player": {"decode_mode": "gpu"}})
+
+
+def test_legacy_hw_decode_switch_is_migrated() -> None:
+    # Older files ran the VPU unconditionally: true keeps "hw", false is "sw".
+    assert Config.from_dict({"player": {"hw_decode": True}}).player.decode_mode == "hw"
+    assert Config.from_dict({"player": {"hw_decode": False}}).player.decode_mode == "sw"
+
+
+def test_explicit_decode_mode_wins_over_legacy_switch() -> None:
+    config = Config.from_dict({"player": {"hw_decode": False, "decode_mode": "auto"}})
+    assert config.player.decode_mode == "auto"
+
+
+def test_library_section_defaults_to_no_folders() -> None:
+    config = Config()
+    assert config.library.directories == ()
+    assert config.library.max_items == 500
+    # The shipped example file carries the same empty section.
+    assert Config.load().library == config.library
+
+
+def test_library_directories_are_trimmed_and_order_kept() -> None:
+    config = Config.from_dict(
+        {"library": {"directories": ["  ~/Videos  ", "/srv/demo"], "max_items": 40}}
+    )
+    assert config.library.directories == ("~/Videos", "/srv/demo")
+    assert config.library.max_items == 40
+
+
+def test_library_max_items_is_clamped() -> None:
+    assert Config.from_dict({"library": {"max_items": 99999}}).library.max_items == 5000
+    assert Config.from_dict({"library": {"max_items": 0}}).library.max_items == 1
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"directories": "~/Videos"},
+        {"directories": ["ok", 3]},
+        {"directories": [""]},
+        {"unknown_key": True},
+    ],
+)
+def test_library_section_rejects_bad_values(section: dict) -> None:
+    with pytest.raises(ConfigError):
+        Config.from_dict({"library": section})

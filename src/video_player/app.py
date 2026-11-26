@@ -15,7 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="video_player",
         description=(
-            "GTK4 video player with automatic face beauty for Quectel Pi M2. "
+            "GTK4 video player with opt-in face beauty for Quectel Pi M2. "
             "Positional arguments are local video files or folders; folders are "
             "expanded to a playlist. Playback is hardware decoded on the RK3576 VPU."
         ),
@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="demo mode: fullscreen, autoplay, info panel and compare toggle on",
+        help="demo mode: fullscreen, autoplay, NPU detection + beauty + compare split on",
     )
     parser.add_argument(
         "--fullscreen",

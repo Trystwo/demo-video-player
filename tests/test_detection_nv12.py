@@ -74,6 +74,47 @@ def test_strided_conversion_matches_direct_two_plane_call() -> None:
     assert np.array_equal(out, expected)
 
 
+def _nv12_planes(
+    width: int, height: int, stride: int, padded_height: int
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    cv2 = pytest.importorskip("cv2")
+    rng = np.random.default_rng(7)
+    bgr = rng.integers(0, 256, (height, width, 3), dtype=np.uint8)
+    planar = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)  # (h*1.5, w)
+    y = planar[:height]
+    u = planar[height : height + height // 4].reshape(height // 2, width // 2)
+    v = planar[height + height // 4 :].reshape(height // 2, width // 2)
+    uv = np.empty((height // 2, width), dtype=np.uint8)
+    uv[:, 0::2] = u
+    uv[:, 1::2] = v
+    y_plane = np.zeros((padded_height, stride), dtype=np.uint8)
+    y_plane[:height, :width] = y
+    uv_plane = np.zeros((padded_height // 2, stride), dtype=np.uint8)
+    uv_plane[: height // 2, :width] = uv
+    return y_plane, uv_plane, uv
+
+
+def test_rockchip_720p_rows_use_64_byte_alignment() -> None:
+    """1589760 bytes is ambiguous; the decoder's 1472 stride must win.
+
+    The board emits 1280x720 as 64-byte aligned rows (1472) with no frame
+    padding.  Seeing 1440x736 instead shears the frame and the detector finds
+    no face at all, which broke beauty on 720p footage in the field.
+    """
+    cv2 = pytest.importorskip("cv2")
+    width, height, stride = 1280, 720, 1472
+    y_plane, uv_plane, uv = _nv12_planes(width, height, stride, height)
+    data = y_plane.tobytes() + uv_plane.tobytes()
+    assert len(data) == 1589760  # also divisible as 1440x736
+    out = nv12_to_bgr(data, width, height, len(data))
+    expected = cv2.cvtColorTwoPlane(
+        np.ascontiguousarray(y_plane[:height, :width]),
+        uv.reshape(height // 2, width // 2, 2),
+        cv2.COLOR_YUV2BGR_NV12,
+    )
+    assert np.array_equal(out, expected)
+
+
 def test_rejects_impossible_layout() -> None:
     with pytest.raises(ValueError):
         nv12_to_bgr(b"\x00" * 100, 64, 48, 100)

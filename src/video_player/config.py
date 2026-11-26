@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .pipeline import DECODE_MODES
+
 CONFIG_VERSION = 1
 
 #: Sinks that can be selected for video output.  ``fakesink`` is useful for
@@ -83,7 +85,11 @@ def _as_str(value: Any, *, name: str) -> str:
 class PlayerConfig:
     """Playback settings (decode, output, audio, resume)."""
 
-    hw_decode: bool = True
+    #: Decode strategy: ``auto`` prefers the RK3576 VPU and falls back to the
+    #: CPU decoder when the VPU path is missing or fails; ``hw`` / ``sw`` pin
+    #: the path and fail loudly instead of switching.  Older config files that
+    #: still carry ``hw_decode`` are migrated on load.
+    decode_mode: str = "auto"
     render_sink: str = "gtk4paintablesink"
     video_convert: str = "auto"
     #: Upper bound for the long side of the GL texture handed to GTK.  GTK4/GSK
@@ -95,9 +101,18 @@ class PlayerConfig:
     volume: int = 80
     speed: float = 1.0
     resume: bool = True
+    #: Remember recently opened files for the sidebar history.  Kept
+    #: separate from ``resume``: the history is useful even when the
+    #: auto-seek is turned off, and vice versa.
+    recent_files: bool = True
 
     def validate(self) -> None:
-        self.hw_decode = _as_bool(self.hw_decode, name="player.hw_decode")
+        self.decode_mode = _as_str(self.decode_mode, name="player.decode_mode").lower()
+        if self.decode_mode not in DECODE_MODES:
+            raise ConfigError(
+                f"player.decode_mode must be one of {', '.join(DECODE_MODES)}, "
+                f"got {self.decode_mode!r}"
+            )
         self.render_sink = _as_str(self.render_sink, name="player.render_sink")
         self.video_convert = _as_str(self.video_convert, name="player.video_convert")
         if self.video_convert not in VIDEO_CONVERTS:
@@ -120,13 +135,21 @@ class PlayerConfig:
         )
         self.speed = round(_clamp(_as_float(self.speed, name="player.speed"), 0.5, 2.0), 2)
         self.resume = _as_bool(self.resume, name="player.resume")
+        self.recent_files = _as_bool(
+            self.recent_files, name="player.recent_files"
+        )
 
 
 @dataclass
 class BeautyConfig:
-    """Beauty settings; strengths use a 0-100 user-facing scale."""
+    """Beauty settings; strengths use a 0-100 user-facing scale.
 
-    enabled: bool = True
+    Off by default: this is a video player first, beauty is an opt-in
+    ability (B / sidebar switch / --demo).  Keep in sync with
+    ``configs/player.example.json``.
+    """
+
+    enabled: bool = False
     smoothing: int = 60
     whitening: int = 40
     #: Experimental geometric effects (M5).  Both use the same 0-100 scale as the
@@ -162,9 +185,16 @@ class BeautyConfig:
 
 @dataclass
 class DetectionConfig:
-    """NPU face-detection settings."""
+    """NPU face-detection settings.
 
-    enabled: bool = True
+    Off by default: the one-off ~1.7 s NPU warm-up (model load + a large
+    dummy inference) used to run synchronously in ``PlaybackBackend.open()``
+    on the GTK main thread, so every click on a video froze the UI for ~3 s.
+    Plain playback needs no detector; ``--demo`` and the beauty / face-box
+    switches opt in.  Keep in sync with ``configs/player.example.json``.
+    """
+
+    enabled: bool = False
     model_path: str = "models/yunet_rk3576.rknn"
     interval_frames: int = 3
     max_faces: int = 3
@@ -219,6 +249,56 @@ class DebugConfig:
             )
 
 
+@dataclass
+class LibraryConfig:
+    """Folders the ui-v5 browse shell scans for the library page.
+
+    Empty by default: a fresh install opens on the empty state, and the
+    operator adds folders from the page itself (persisted in the XDG state
+    directory, not here).  ``directories`` exists for demo machines that should
+    come up with a populated library without anyone touching the UI, which is
+    how the 43 demo is usually driven.
+    """
+
+    #: Absolute or ``~``-relative folder paths.  Scanned one level deep.
+    directories: tuple[str, ...] = ()
+    #: Safety valve: a runaway folder must not build a thousand-card grid.
+    max_items: int = 500
+
+    def validate(self) -> None:
+        raw = self.directories
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+            raise ConfigError(
+                f"library.directories must be a list of folder paths, got {type(raw).__name__}"
+            )
+        cleaned: list[str] = []
+        for entry in raw:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ConfigError(
+                    f"library.directories must contain non-empty strings, got {entry!r}"
+                )
+            cleaned.append(entry.strip())
+        self.directories = tuple(cleaned)
+        self.max_items = int(
+            _clamp(_as_int(self.max_items, name="library.max_items"), 1, 5000)
+        )
+
+
+def _migrate_player_section(raw: Any) -> Any:
+    """Fold the two-state ``hw_decode`` switch of older builds into ``decode_mode``.
+
+    Older builds ran the VPU unconditionally, so
+    ``hw_decode: true`` maps to ``"hw"`` (not ``"auto"``) to keep the old
+    behaviour exactly; ``false`` maps to ``"sw"``.
+    """
+    if not isinstance(raw, dict) or "hw_decode" not in raw:
+        return raw
+    migrated = dict(raw)
+    legacy = _as_bool(migrated.pop("hw_decode"), name="player.hw_decode")
+    migrated.setdefault("decode_mode", "hw" if legacy else "sw")
+    return migrated
+
+
 def _build_section(section_cls: type, raw: Any, label: str) -> Any:
     """Instantiate one config section, rejecting unknown keys."""
     if raw is None:
@@ -243,6 +323,7 @@ class Config:
     beauty: BeautyConfig = field(default_factory=BeautyConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    library: LibraryConfig = field(default_factory=LibraryConfig)
     version: int = CONFIG_VERSION
 
     def validate(self) -> None:
@@ -255,6 +336,7 @@ class Config:
         self.beauty.validate()
         self.detection.validate()
         self.debug.validate()
+        self.library.validate()
 
     @classmethod
     def from_dict(cls, data: Any) -> "Config":
@@ -263,16 +345,19 @@ class Config:
             raise ConfigError(
                 f"configuration root must be a JSON object, got {type(data).__name__}"
             )
-        known = {"version", "player", "beauty", "detection", "debug"}
+        known = {"version", "player", "beauty", "detection", "debug", "library"}
         unknown = sorted(set(data) - known)
         if unknown:
             raise ConfigError(f"configuration contains unknown key(s): {', '.join(unknown)}")
 
         config = cls(
-            player=_build_section(PlayerConfig, data.get("player"), "player"),
+            player=_build_section(
+                PlayerConfig, _migrate_player_section(data.get("player")), "player"
+            ),
             beauty=_build_section(BeautyConfig, data.get("beauty"), "beauty"),
             detection=_build_section(DetectionConfig, data.get("detection"), "detection"),
             debug=_build_section(DebugConfig, data.get("debug"), "debug"),
+            library=_build_section(LibraryConfig, data.get("library"), "library"),
             version=_as_int(data.get("version", CONFIG_VERSION), name="version"),
         )
         config.validate()

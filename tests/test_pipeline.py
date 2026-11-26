@@ -11,6 +11,7 @@ from video_player.pipeline import (
     PARSERS,
     SW_DECODERS,
     VIDEO_SUFFIXES,
+    decoder_candidates,
     decoder_for,
     demux_for,
     is_stream_uri,
@@ -42,6 +43,23 @@ def test_demux_for_rejects_unknown_container() -> None:
         demux_for(Path("/tmp/clip.avi"))
     with pytest.raises(ValueError, match="unsupported container"):
         demux_for(Path("/tmp/clip"))
+
+
+def test_demux_for_prefers_real_container_over_suffix(tmp_path: Path) -> None:
+    """A renamed file must not select a demuxer that cannot parse byte 0."""
+    mp4_as_mkv = tmp_path / "renamed.mkv"
+    mp4_as_mkv.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 8)
+    assert demux_for(mp4_as_mkv) == "qtdemux"
+
+    mkv_as_mp4 = tmp_path / "renamed.mp4"
+    mkv_as_mp4.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 12)
+    assert demux_for(mkv_as_mp4) == "matroskademux"
+
+
+def test_demux_for_keeps_suffix_when_content_unavailable() -> None:
+    """Missing / unrecognised files keep the original pure suffix lookup."""
+    assert demux_for(Path("/tmp/no-such-dir/clip.mkv")) == "matroskademux"
+    assert demux_for(Path("/tmp/no-such-dir/clip.ts")) == "tsdemux"
 
 
 def test_video_suffixes_match_demuxer_table() -> None:
@@ -112,3 +130,22 @@ def test_is_stream_uri() -> None:
     assert is_stream_uri("rtsp://camera.local/stream")
     assert is_stream_uri("file:///tmp/clip.mp4") is False
     assert is_stream_uri(Path("/tmp/clip.mp4")) is False
+
+
+def test_decoder_candidates_auto_prefers_hardware_then_software() -> None:
+    assert decoder_candidates("video/x-h264", "auto") == ("mppvideodec", "avdec_h264")
+    assert decoder_candidates("video/x-h265") == ("mppvideodec", "avdec_h265")
+    # VP9 has no VPU decoder, so auto is software-only instead of an error.
+    assert decoder_candidates("video/x-vp9", "auto") == ("vp9dec",)
+
+
+def test_decoder_candidates_forced_modes_offer_a_single_factory() -> None:
+    assert decoder_candidates("video/x-h264", "hw") == ("mppvideodec",)
+    assert decoder_candidates("video/x-h264", "sw") == ("avdec_h264",)
+    with pytest.raises(ValueError, match="unsupported video codec"):
+        decoder_candidates("video/x-vp9", "hw")
+
+
+def test_decoder_candidates_reject_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="unknown decode mode"):
+        decoder_candidates("video/x-h264", "gpu")

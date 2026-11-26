@@ -233,6 +233,41 @@ class TestRecorderTiming:
         recorder._on_video_buffer(None, _ProbeInfo(buffer))
         assert recorder.stats == (0, 0, 1)
 
+    def test_overlay_branch_is_ready_before_first_sync_buffer(self):
+        Gst.init(None)
+        recorder = Recorder(None, None, "/tmp/x.mp4", canvas_size=(4, 4))
+        pushes = []
+        probes_ready = []
+
+        class FakeSrc:
+            def emit(self, name, frame):
+                pushes.append((name, frame.pts, frame.duration))
+                return Gst.FlowReturn.OK
+
+        class FirstBufferDuringSync:
+            def sync_state_with_parent(self):
+                assert probes_ready
+                assert recorder.is_recording
+                assert recorder._canvas is not None
+                assert recorder._canvas.get_size() == 4 * 4 * 4
+                assert (
+                    recorder._canvas.extract_dup(0, 4 * 4 * 4)
+                    == bytes(4 * 4 * 4)
+                )
+                buffer = Gst.Buffer.new_wrapped(b"\x00" * 16)
+                buffer.pts = 123
+                recorder._on_video_buffer(None, _ProbeInfo(buffer))
+
+        recorder._ui_src = FakeSrc()
+        recorder._install_probes = lambda *_args: probes_ready.append(True)
+        recorder._activate_branch(
+            [FirstBufferDuringSync()], None, None, None, overlay=True
+        )
+
+        frame_duration = Gst.util_uint64_scale(1, Gst.SECOND, 30)
+        assert pushes == [("push-buffer", 123, frame_duration)]
+        assert recorder.stats == (0, 1, 1)
+
     def test_canvas_size_is_even(self):
         recorder = Recorder(None, None, "/tmp/x.mp4", canvas_size=(1281, 801))
         assert recorder.canvas_size == (1280, 800)

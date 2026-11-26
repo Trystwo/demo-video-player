@@ -534,39 +534,12 @@ class Recorder:
         self._mixer = mixer
         self._ui_src = ui_src
         self._elements = elements
-        # Follow the already-PLAYING parent state, sinks first so no element
-        # starts pushing into a NULL peer.
-        for element in reversed(elements):
-            element.sync_state_with_parent()
-        probe = video_queue.get_static_pad("sink")
-        if probe is not None:
-            self._probe_id = probe.add_probe(Gst.PadProbeType.BUFFER, self._on_video_buffer)
-        encode_pad = tail.get_static_pad("sink")
-        if encode_pad is not None:
-            self._encode_probe_id = encode_pad.add_probe(
-                Gst.PadProbeType.BUFFER, self._on_encoded_buffer
-            )
-        # mp4mux only has request pads, so watch the parser's static src pad for
-        # the EOS that comes out of the encoder once the branch drained.
-        eos_pad = parser.get_static_pad("src")
-        if eos_pad is not None:
-            self._mux_pad = eos_pad
-            self._eos_probe_id = eos_pad.add_probe(
-                Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_mux_event
-            )
-        # The backend already installed a signal watch on this bus, so plain
-        # signal connections see the messages without a second watch.
-        bus = pipeline.get_bus()
-        self._bus_handlers = [bus.connect("message", self._on_bus)]
-        self._frame_index = 0
+        self._activate_branch(elements, video_queue, tail, parser, overlay=True)
         if _debug():
             print(
                 f"[rec] probes video={self._probe_id} encode={self._encode_probe_id} id={id(self):#x}",
                 flush=True,
             )
-        self._stopping = False
-        self._eos_reached = False
-        self._running = True
 
     def _start_video_only(self) -> None:
         """Record the GPU video branch alone, without the UI compositor.
@@ -624,21 +597,13 @@ class Recorder:
         self._mount_branch(elements, chain)
         self._video_queue = video_queue
         self._elements = elements
-        for element in reversed(elements):
-            element.sync_state_with_parent()
-        self._install_probes(video_queue, download, parser)
+        self._activate_branch(elements, video_queue, download, parser, overlay=False)
         if _debug():
             print(
                 f"[rec] video-only branch attached id={id(self):#x} "
                 f"rotation={self._rotation} elements={[e.get_name() for e in elements]}",
                 flush=True,
             )
-        self._video_buffers = 0
-        self._encoded_frames = 0
-        self._frame_index = 0
-        self._stopping = False
-        self._eos_reached = False
-        self._running = True
 
     def _configure_output(self, encoder: Gst.Element, sink: Gst.Element) -> None:
         """Apply the bitrate and file sink settings shared by both modes."""
@@ -701,6 +666,41 @@ class Recorder:
         # signal connections see the messages without a second watch.
         bus = self._pipeline.get_bus()
         self._bus_handlers = [bus.connect("message", self._on_bus)]
+
+    def _activate_branch(
+        self,
+        elements: Sequence[Gst.Element],
+        video_queue: Gst.Element,
+        tail: Gst.Element,
+        eos_element: Gst.Element,
+        *,
+        overlay: bool,
+    ) -> None:
+        """Prepare probes and timing state before activating a live tee branch.
+
+        The parent pipeline is already PLAYING.  Synchronizing a newly attached
+        branch can deliver a buffer immediately; if the first video buffer
+        reaches ``glvideomixer`` before a matching appsrc frame, its aggregator
+        may stall while waiting for the other pad.  A transparent bootstrap
+        canvas lets the video pad advance until GTK supplies the first UI snapshot.
+        """
+        self._frame_index = 0
+        self._encoded_frames = 0
+        self._ui_pushes = 0
+        self._video_buffers = 0
+        self._stopping = False
+        self._eos_reached = False
+        if overlay and self._canvas is None:
+            size = self._width * self._height * 4
+            self._canvas = Gst.Buffer.new_allocate(None, size, None)
+            self._canvas.memset(0, 0, size)
+            self._canvas.duration = Gst.util_uint64_scale(1, Gst.SECOND, self._fps)
+        self._running = True
+        self._install_probes(video_queue, tail, eos_element)
+        # Follow the already-PLAYING parent state, sinks first so no element
+        # starts pushing into a NULL peer.  Probes and state are ready first.
+        for element in reversed(elements):
+            element.sync_state_with_parent()
 
     def stop(self, *, timeout_ms: int = 1500) -> None:
         """Finish the file: EOS the branch, wait for the muxer, tear down."""

@@ -30,11 +30,11 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import GLib, GObject, Gst  # noqa: E402
 
-from .beauty import BEAUTY_FRAGMENT_SHADER, BeautyParams
+from .beauty import BEAUTY_FRAGMENT_SHADER, BeautyParams, ShapeHold
 from .config import Config
 from .detection import FaceDetectionTap, rotation_from_tag
 from .face import DetectionResult, Face, primary_face, smooth_landmarks
-from .pipeline import decoder_for, demux_for, is_stream_uri, parser_for
+from .pipeline import HW_DECODERS, decoder_candidates, demux_for, is_stream_uri, parser_for
 
 __all__ = ["PlaybackBackend", "PlaybackError"]
 
@@ -135,6 +135,19 @@ class PlaybackBackend:
         self._converter_name: str | None = None
         self._rate = 1.0
         self._playing = False
+        #: True from the bus EOS until the next seek.  A pipeline parked on EOS
+        #: re-posts EOS as soon as it returns to PLAYING, so :meth:`play` has to
+        #: rewind first; this flag is what tells it the stream has finished.
+        self._eos_reached = False
+        #: Decode strategy for this pipeline only; ``None`` follows the config.
+        #: The automatic fallback pins it to ``"sw"`` after a VPU failure.
+        self._decode_override: str | None = None
+        #: Media of the open clip, kept so the automatic fallback can rebuild it.
+        self._media: Path | None = None
+        #: True when the current video branch runs on the VPU decoder.
+        self._using_hw = False
+        #: One automatic fallback per opened file; see _try_software_fallback.
+        self._fallback_done = False
         self._last_fps = 0.0
         self._frame_times: deque[float] = deque(maxlen=240)
         self._tap: FaceDetectionTap | None = None
@@ -143,6 +156,9 @@ class PlaybackBackend:
         self._coded_size: tuple[int, int] = (0, 0)
         self._texture_size: tuple[int, int] = (0, 0)
         self._faces: tuple[Face, ...] = ()
+        #: Per-face temporal hold for the beauty ovals (P1): bridges a single
+        #: rejected landmark fit without letting a profile collapse linger.
+        self._shape_hold = ShapeHold()
         #: Smoothed landmarks of the tracked (largest) face, in display
         #: coordinates; drives the M5 warp.  Kept with :attr:`_faces`.
         self._landmarks: tuple[tuple[float, float], ...] = ()
@@ -160,6 +176,19 @@ class PlaybackBackend:
         self._recorder: object | None = None
         self.video_info: dict[str, object] = {}
         self.uri: str | None = None
+        #: Resume position requested by :meth:`open`, applied once the pipeline
+        #: reaches PLAYING.  A seek before the first preroll is dropped by
+        #: GStreamer (``seek()`` returns False and playback starts at 00:00), so
+        #: the request waits here until a state change proves readiness.
+        self._pending_seek_ns = 0
+        #: Demuxer of the open container (needed for ``current-audio``).
+        self._demux: Gst.Element | None = None
+        #: Every audio pad the container exposes, in stream order.  Only the
+        #: selected one is linked into the single audio branch; see
+        #: :meth:`_build_audio_branch`.
+        self._audio_pads: list[Gst.Pad] = []
+        self._audio_queue: Gst.Element | None = None
+        self._audio_track_index = 0
 
         #: Called with no arguments when the pipeline reaches end of stream.
         self.on_eos: Callable[[], None] | None = None
@@ -177,6 +206,8 @@ class PlaybackBackend:
         self.on_detection_error: Callable[[str], None] | None = None
         #: Called when the GPU beauty pass cannot run (missing element / converter).
         self.on_beauty_error: Callable[[str], None] | None = None
+        #: Called with the original error when ``auto`` dropped to the CPU decoder.
+        self.on_decode_fallback: Callable[[str], None] | None = None
         #: Called with a human-readable message when the recorder fails.
         self.on_recording_error: Callable[[str], None] | None = None
 
@@ -202,6 +233,26 @@ class PlaybackBackend:
     @property
     def has_media(self) -> bool:
         return self._pipeline is not None
+
+    @property
+    def decode_mode(self) -> str:
+        """Decode strategy in force for the open clip (``auto`` / ``hw`` / ``sw``)."""
+        return self._decode_override or self._config.player.decode_mode
+
+    @property
+    def using_hardware_decoder(self) -> bool:
+        """True when the video branch runs on the VPU rather than the CPU."""
+        return self._using_hw
+
+    @property
+    def audio_track_count(self) -> int:
+        """Number of audio pads the container exposes (0 for silent clips)."""
+        return len(self._audio_pads)
+
+    @property
+    def audio_track_index(self) -> int:
+        """Index of the audio pad currently linked into the sink."""
+        return self._audio_track_index
 
     @property
     def beauty_available(self) -> bool:
@@ -336,8 +387,24 @@ class PlaybackBackend:
 
     # -- playback control --------------------------------------------------
 
-    def open(self, media: str | Path, *, autoplay: bool = True) -> None:
+    def open(
+        self,
+        media: str | Path,
+        *,
+        autoplay: bool = True,
+        start_position_ns: int = 0,
+        decode_mode: str | None = None,
+    ) -> None:
         """Open a local media file, replacing any current pipeline.
+
+        Args:
+            media: local file to play (network URIs are rejected).
+            autoplay: start in PLAYING; False leaves the pipeline paused.
+            start_position_ns: resume position applied after preroll.  GStreamer
+                clamps out-of-range seeks, so callers do not need to.
+            decode_mode: override ``player.decode_mode`` for this clip only.
+                ``None`` (the normal case) follows the config; the automatic
+                fallback passes ``"sw"`` to rebuild a file the VPU failed on.
 
         Raises:
             PlaybackError: for missing files, stream URIs or missing elements.
@@ -355,6 +422,9 @@ class PlaybackBackend:
         path = path.resolve()
 
         self.close()
+        self._decode_override = decode_mode
+        self._media = path
+        self._fallback_done = False
         demux_factory = demux_for(path)
         pipeline = Gst.Pipeline.new("player")
         source = _make("filesrc", "source")
@@ -362,6 +432,7 @@ class PlaybackBackend:
         demux = _make(demux_factory, "demux")
         pipeline.add(source)
         pipeline.add(demux)
+        self._demux = demux
         if not source.link(demux):
             raise PlaybackError(f"cannot link filesrc to {demux_factory}")
         demux.connect("pad-added", self._on_demux_pad_added)
@@ -377,26 +448,57 @@ class PlaybackBackend:
 
         self._rate = 1.0
         self._playing = False
+        self._eos_reached = False
         self._rotation = 0
         self._coded_size = (0, 0)
         self._texture_size = (0, 0)
         self._faces = ()
+        self._shape_hold.clear()
         self._landmarks = ()
         self._last_face_seen = 0.0
         self._held_detections = 0
         self.video_info = {}
+        self._pending_seek_ns = max(0, int(start_position_ns))
+        self._audio_pads = []
+        self._audio_track_index = 0
         target = Gst.State.PLAYING if autoplay else Gst.State.PAUSED
         self._pipeline.set_state(target)
+        if not autoplay:
+            # A paused pipeline never emits the PLAYING transition the seek
+            # waits for, so apply it on the next main-loop turn instead.
+            GLib.idle_add(self._apply_pending_seek)
 
     def play(self) -> None:
-        if self._pipeline is not None:
-            self._pipeline.set_state(Gst.State.PLAYING)
-            self._playing = True
+        if self._pipeline is None:
+            return
+        if self._eos_reached:
+            # The pipeline finished and is sitting on its last frame.  Going
+            # straight back to PLAYING would post EOS again instead of replaying,
+            # so rewind to the head first.
+            self._pipeline.set_state(Gst.State.PAUSED)
+            self.seek_ns(0)
+        self._pipeline.set_state(Gst.State.PLAYING)
+        self._playing = True
 
     def pause(self) -> None:
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.PAUSED)
             self._playing = False
+
+    def stop(self) -> None:
+        """Stop playback and rewind to the first frame, keeping the media open.
+
+        Unlike :meth:`close` the pipeline (and with it the beauty and detection
+        branches) stays alive, so pressing play afterwards restarts the same
+        clip immediately instead of rebuilding and re-prerolling it.
+        """
+        if self._pipeline is None:
+            return
+        self._playing = False
+        self._pipeline.set_state(Gst.State.PAUSED)
+        # A flush seek also clears the EOS state, so stop works after the clip
+        # ended on its own as well.
+        self.seek_ns(0)
 
     def toggle_play(self) -> None:
         if not self.is_playing:
@@ -410,6 +512,8 @@ class PlaybackBackend:
             return
         if position_ns < 0:
             position_ns = 0
+        # ``SEEK_FLAGS`` flush, which is also what clears a pending EOS.
+        self._eos_reached = False
         # PyGObject exposes Gst.Element.seek as (rate, format, flags, ...);
         # the C argument order (rate, flags, format, ...) raises a TypeError.
         self._pipeline.seek(
@@ -490,6 +594,7 @@ class PlaybackBackend:
         self._beauty_started = 0.0
         self._beauty_times.clear()
         self._faces = ()
+        self._shape_hold.clear()
         self._landmarks = ()
         self._last_face_seen = 0.0
         self._paintable = None
@@ -503,6 +608,29 @@ class PlaybackBackend:
         self._texture_size = (0, 0)
         self.video_info = {}
         self.uri = None
+        self._pending_seek_ns = 0
+        self._demux = None
+        self._audio_pads = []
+        self._audio_queue = None
+        self._audio_track_index = 0
+
+    def _apply_pending_seek(self) -> bool:
+        """Apply the resume seek once the pipeline can accept one.
+
+        Returns False so the same callable can be used as a ``GLib.idle_add``
+        callback (returning True would reschedule it forever).
+        """
+        pending, self._pending_seek_ns = self._pending_seek_ns, 0
+        if pending <= 0 or self._pipeline is None:
+            return False
+        duration = self.duration_ns()
+        if duration > 0 and pending >= duration - 1_000_000_000:
+            # A stored position at (or past) the end means the file was
+            # replaced or re-timed: starting over is better than seeking to EOS
+            # and bouncing straight into the next playlist entry.
+            return False
+        self.seek_ns(pending)
+        return False
 
     # -- pipeline construction --------------------------------------------
 
@@ -621,6 +749,12 @@ class PlaybackBackend:
         )
         return [scale, caps]
 
+    @staticmethod
+    def _is_gl_upload(element: Gst.Element) -> bool:
+        """True when *element* is the GL uploader (i.e. frames live on the GPU)."""
+        factory = element.get_factory()
+        return factory is not None and factory.get_name() == "glupload"
+
     def _build_beauty_element(self) -> Gst.Element | None:
         """Create the ``glshader`` element that runs the beauty fragment shader.
 
@@ -668,6 +802,7 @@ class PlaybackBackend:
             skin_guard=beauty.skin_guard,
             active=beauty.enabled,
             debug=beauty.debug_mask,
+            shape_hold=self._shape_hold,
         )
 
     def _push_beauty_uniforms(self) -> None:
@@ -721,13 +856,31 @@ class PlaybackBackend:
         elif name.startswith("audio/"):
             self._build_audio_branch(pad)
 
+    def _pick_decoder(self, caps_name: str) -> str:
+        """Return the decoder factory to instantiate for *caps_name*.
+
+        ``auto`` walks the candidate list and keeps the first installed
+        element, so a development host without ``mppvideodec`` plays through
+        the CPU decoder instead of failing.  ``hw`` / ``sw`` have exactly one
+        candidate, so they never switch path behind the user's back.
+        """
+        candidates = decoder_candidates(caps_name, self.decode_mode)
+        for factory in candidates:
+            if Gst.ElementFactory.find(factory) is not None:
+                self._using_hw = factory in HW_DECODERS.values()
+                return factory
+        raise PlaybackError(
+            f"no {self.decode_mode} decoder installed for {caps_name} "
+            f"(tried {', '.join(candidates)})"
+        )
+
     def _build_video_branch(
         self, pad: Gst.Pad, caps_name: str, structure: Gst.Structure
     ) -> None:
         source_size = _structure_frame_size(structure)
         try:
             parser_factory = parser_for(caps_name)
-            decoder_factory = decoder_for(caps_name, self._config.player.hw_decode)
+            decoder_factory = self._pick_decoder(caps_name)
             converters = self._video_converters(source_size)
         except ValueError as exc:
             self._fail(str(exc))
@@ -746,8 +899,10 @@ class PlaybackBackend:
         if pipeline is None:
             return
         # Remember the converter for the info panel before the beauty pass is
-        # appended: ``glupload`` means the GPU path, which is what the shader needs.
-        gl_path = bool(converters) and converters[0].get_name() == "video-upload"
+        # appended.  The check is on the *factory* (``glupload``), not on the
+        # instance name we happen to give it: renaming "video-upload" used to
+        # silently disable the beauty pass because this test compared strings.
+        gl_path = bool(converters) and self._is_gl_upload(converters[0])
         beauty: Gst.Element | None = None
         if gl_path:
             beauty = self._build_beauty_element()
@@ -931,6 +1086,19 @@ class PlaybackBackend:
         self._dispatch(self.on_detection_error, message)
 
     def _build_audio_branch(self, pad: Gst.Pad) -> None:
+        """Attach an audio pad to the single shared audio branch.
+
+        A container can expose several audio pads (dual-language MKV, commentary
+        tracks).  The pre-F5 code built a full decode branch per pad, so a
+        two-language clip played both languages mixed together.  The branch is
+        now created once and only the selected pad is linked; the other pads
+        stay unlinked (the demuxer simply stops pushing them) until
+        :meth:`set_audio_track` swaps the link.
+        """
+        self._audio_pads.append(pad)
+        if self._audio_queue is not None:
+            # Branch already exists: this pad is only remembered for the menu.
+            return
         pipeline = self._pipeline
         if pipeline is None:
             return
@@ -964,14 +1132,64 @@ class PlaybackBackend:
         if convert_pad is None:
             return
         decode.connect("pad-added", self._link_decoded_audio, convert_pad)
-        queue_pad = queue.get_static_pad("sink")
-        if queue_pad is None or pad.link(queue_pad) != Gst.PadLinkReturn.OK:
+        self._audio_queue = queue
+        if not self._link_audio_pad(len(self._audio_pads) - 1):
             self._fail("cannot link audio demuxer pad to audio queue")
+            self._audio_queue = None
             return
         for element in (queue, decode, convert, resample, volume, output):
             # See _build_video_branch: late branches must sync with the parent.
             element.sync_state_with_parent()
         self._volume_element = volume
+
+    def _link_audio_pad(self, index: int) -> bool:
+        """Link audio pad *index* into the branch, replacing the current one."""
+        queue = self._audio_queue
+        if queue is None or not 0 <= index < len(self._audio_pads):
+            return False
+        sink_pad = queue.get_static_pad("sink")
+        if sink_pad is None:
+            return False
+        target = self._audio_pads[index]
+        peer = sink_pad.get_peer()
+        if peer is target:
+            return True
+        if peer is not None:
+            peer.unlink(sink_pad)
+        return target.link(sink_pad) == Gst.PadLinkReturn.OK
+
+    def set_audio_track(self, index: int) -> bool:
+        """Switch to another audio track of the open container.
+
+        The demuxer is told first (``current-audio``, supported by qtdemux) so
+        it starts pushing the chosen pad, then the branch is re-linked and the
+        stream seeks back to the current position: switching track resets the
+        audio decoder, and without the seek the new track would start at 00:00
+        while the picture keeps going.
+
+        Returns False when the container has no audio or the pads refuse the
+        re-link; the previous track then keeps playing.
+        """
+        if not self._audio_pads:
+            return False
+        index = max(0, min(int(index), len(self._audio_pads) - 1))
+        if index == self._audio_track_index:
+            return True
+        position = self.position_ns()
+        demux = self._demux
+        if demux is not None and demux.find_property("current-audio") is not None:
+            try:
+                demux.set_property("current-audio", index)
+            except TypeError:
+                # Some demuxers expose the property but reject the value late;
+                # the re-link below still switches the pad.
+                pass
+        if not self._link_audio_pad(index):
+            return False
+        self._audio_track_index = index
+        if position > 0:
+            self.seek_ns(position)
+        return True
 
     @staticmethod
     def _link_decoded_audio(
@@ -1004,17 +1222,21 @@ class PlaybackBackend:
             self._on_tag_message(message)
         elif message_type == Gst.MessageType.EOS:
             self._playing = False
+            self._eos_reached = True
             self._dispatch(self.on_eos)
         elif message_type == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             detail = f"{error.message}"
             if debug:
                 detail = f"{detail} ({debug.splitlines()[0]})"
+            if self._try_software_fallback(detail):
+                return
             self._dispatch(self.on_error, detail)
         elif message_type == Gst.MessageType.STATE_CHANGED and message.src is self._pipeline:
             _old, new, _pending = message.parse_state_changed()
             if new == Gst.State.PLAYING:
                 self._playing = True
+                self._apply_pending_seek()
                 self._dispatch(self.on_state, "playing")
             elif new == Gst.State.PAUSED:
                 self._playing = False
@@ -1067,6 +1289,41 @@ class PlaybackBackend:
         self._dispatch(self.on_fps, self._last_fps)
 
     # -- helpers -----------------------------------------------------------
+
+    def _try_software_fallback(self, detail: str) -> bool:
+        """Rebuild the clip on the CPU decoder after a VPU failure.
+
+        Only ``auto`` does this, and only once per opened file: a clip that
+        fails for a reason unrelated to decoding (broken container, dead sink)
+        must not loop between the two pipelines.
+        """
+        if (
+            self.decode_mode != "auto"
+            or not self._using_hw
+            or self._fallback_done
+            or self._media is None
+        ):
+            return False
+        media = self._media
+        position = self.position_ns()
+        self._fallback_done = True
+        self._dispatch(self.on_decode_fallback, detail)
+        # Rebuilding destroys the bus this message arrived on, so it has to
+        # happen after the callback returns.
+        GLib.idle_add(self._reopen_with_software, media, position)
+        return True
+
+    def _reopen_with_software(self, media: Path, position: int) -> bool:
+        try:
+            self.open(
+                media,
+                autoplay=True,
+                start_position_ns=position,
+                decode_mode="sw",
+            )
+        except PlaybackError as exc:
+            self._dispatch(self.on_error, str(exc))
+        return GLib.SOURCE_REMOVE
 
     @staticmethod
     def _dispatch(callback: Callable | None, *args: object) -> None:
