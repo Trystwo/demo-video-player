@@ -19,7 +19,16 @@ import gi
 
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import (  # noqa: E402
+    Gdk,
+    Gio,
+    GLib,
+    Gtk,
+    Pango,
+    PangoCairo,
+)
 
 from ..backend import PlaybackBackend, PlaybackError  # noqa: E402
 from ..beauty import BeautyParams  # noqa: E402
@@ -27,8 +36,23 @@ from ..config import Config  # noqa: E402
 from ..diagnostics import install_crash_logging, log_action  # noqa: E402
 from ..face import DetectionResult, Face  # noqa: E402
 from ..i18n import Translator, save_language  # noqa: E402
-from ..pipeline import VIDEO_SUFFIXES  # noqa: E402
-from ..playlist import Playlist  # noqa: E402
+from ..pipeline import DECODE_MODES, VIDEO_SUFFIXES  # noqa: E402
+from ..playlist import Playlist, expand_media_args  # noqa: E402
+from ..recents import RecentItem, RecentsStore  # noqa: E402
+from ..resume import ResumeStore  # noqa: E402
+from ..subtitle import SubtitleTrack, find_sidecar, load_srt  # noqa: E402
+from .chrome import (  # noqa: E402
+    FACE_CORNER_ARM,
+    beauty_page_state,
+    chrome_state,
+    contain_rect,
+    corner_arms,
+    normalise_codec,
+    percent_value_text,
+    slider_value_text,
+)
+from .browse import BrowseShell  # noqa: E402
+from .style import CSS, rgba  # noqa: E402
 
 APP_ID = "io.quectel.pi.VideoPlayer"
 GST_SECOND = 1_000_000_000
@@ -40,12 +64,38 @@ SPEED_VALUES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 #: pipeline is still bringing up its GL context.
 RECORD_START_RETRIES = 10
 
-CSS = b"""
-.video-surface { background-color: #000000; }
-.video-placeholder { color: rgba(255, 255, 255, 0.65); font-size: 13pt; }
-.error-hint { color: #e01b24; }
-.info-line { font-family: monospace; }
-"""
+#: How often the playback position is persisted while playing.  Two seconds is
+#: well below the 10 s minimum the store keeps, and cheap enough to ignore.
+RESUME_SAVE_INTERVAL = 2.0
+
+#: Pointer band at the bottom of the window that counts as "over the dock".
+#: The fullscreen dock measures 120 px on the board (plus a 12 px inset), so
+#: 140 px catches the pointer just before it reaches the controls without
+#: keeping the HUD up from mid-screen.
+DOCK_HOVER_BAND = 140
+
+#: Subtitle lift while the dock is on screen: the dock is an overlay child
+#: added after the subtitle layer, so without this the bar would cover it.
+#: Measured dock height (120 px) + its 12 px bottom inset + 8 px of slack.
+DOCK_SUBTITLE_CLEARANCE = 140
+
+#: Idle seconds before the fullscreen transport fades away.  Long enough to
+#: read the timecode after a seek, short enough that it is gone by the time the
+#: viewer looks back at the picture.
+DOCK_IDLE_SECONDS = 2.5
+
+#: The fullscreen telemetry line stays readable after the dock fades, but it
+#: must not compete with the picture; 62 % matches the v3 mockup.
+TELEMETRY_IDLE_OPACITY = 0.62
+
+#: Sidebar page names, in tab order.  ``playlist`` stays the default page.
+SIDEBAR_PAGES = ("playlist", "beauty")
+
+#: Top-level pages of the ui-v5 shell: the library browser and the player.
+PAGE_NAMES = ("browse", "player")
+
+#: The ui-v5 palette tokens and the widget rules live in
+#: :mod:`video_player.ui.style` (single source for CSS and the Cairo overlays).
 
 
 class _FaceOverlay(Gtk.DrawingArea):
@@ -53,7 +103,9 @@ class _FaceOverlay(Gtk.DrawingArea):
 
     ``Gtk.Picture`` uses :attr:`Gtk.ContentFit.CONTAIN`, so the video is scaled
     down and centred inside the widget allocation; the same transform is
-    applied here to map frame coordinates to widget coordinates.
+    applied here to map frame coordinates to widget coordinates.  The box is a
+    four-corner bracket instead of a full rectangle: it marks the face without
+    drawing over the picture the way a full box did in earlier UIs.
     """
 
     def __init__(self) -> None:
@@ -63,6 +115,7 @@ class _FaceOverlay(Gtk.DrawingArea):
         self._faces: tuple[Face, ...] = ()
         self._frame_width = 0.0
         self._frame_height = 0.0
+        self._caption = "Face"
 
     def set_faces(
         self, faces: tuple[Face, ...], frame_width: float, frame_height: float
@@ -72,33 +125,229 @@ class _FaceOverlay(Gtk.DrawingArea):
         self._frame_height = frame_height
         self.queue_draw()
 
+    def set_caption(self, caption: str) -> None:
+        self._caption = caption
+        self.queue_draw()
+
     def _draw(
         self, _area: Gtk.DrawingArea, cr: object, width: int, height: int
     ) -> None:
         if not self._faces or self._frame_width <= 0 or self._frame_height <= 0:
             return
-        scale = min(width / self._frame_width, height / self._frame_height)
-        offset_x = (width - self._frame_width * scale) / 2.0
-        offset_y = (height - self._frame_height * scale) / 2.0
+        origin_x, origin_y, display_w, display_h = contain_rect(
+            self._frame_width, self._frame_height, float(width), float(height)
+        )
+        scale_x = display_w / self._frame_width
+        scale_y = display_h / self._frame_height
         cr.set_line_width(2.0)  # type: ignore[attr-defined]
-        cr.set_source_rgba(0.18, 0.86, 0.42, 0.95)  # type: ignore[attr-defined]
+        cr.set_line_cap(1)  # type: ignore[attr-defined]  # cairo.LINE_CAP_ROUND
+        # Pale steel blue: an annotation on the picture, not a second accent.
+        cr.set_source_rgba(*rgba("annotation", 0.95))  # type: ignore[attr-defined]
         for face in self._faces:
-            cr.rectangle(  # type: ignore[attr-defined]
-                offset_x + face.x * scale,
-                offset_y + face.y * scale,
-                face.width * scale,
-                face.height * scale,
-            )
-            cr.stroke()  # type: ignore[attr-defined]
-            for landmark_x, landmark_y in face.landmarks:
-                cr.arc(  # type: ignore[attr-defined]
-                    offset_x + landmark_x * scale,
-                    offset_y + landmark_y * scale,
-                    2.0,
-                    0.0,
-                    6.283185307179586,
+            x = origin_x + face.x * scale_x
+            y = origin_y + face.y * scale_y
+            w = face.width * scale_x
+            h = face.height * scale_y
+            for x1, y1, x2, y2 in corner_arms(x, y, w, h, FACE_CORNER_ARM):
+                cr.move_to(x1, y1)  # type: ignore[attr-defined]
+                cr.line_to(x2, y2)  # type: ignore[attr-defined]
+                cr.stroke()  # type: ignore[attr-defined]
+            self._draw_confidence(cr, face, x, y, width, height)
+
+    def _draw_confidence(
+        self,
+        cr: object,
+        face: Face,
+        x: float,
+        y: float,
+        width: int,
+        height: int,
+    ) -> None:
+        text = f"{self._caption} {face.score:.2f}"
+        layout = PangoCairo.create_layout(cr)  # type: ignore[arg-type]
+        layout.set_text(text, -1)
+        layout.set_font_description(Pango.FontDescription("Sans 9"))
+        PangoCairo.update_layout(cr, layout)  # type: ignore[arg-type]
+        text_w, text_h = layout.get_pixel_size()
+        pad_x, pad_y = 6.0, 2.0
+        box_w = text_w + pad_x * 2
+        box_h = text_h + pad_y * 2
+        box_x = max(0.0, min(x, width - box_w))
+        box_y = y - box_h - 4.0
+        if box_y < 0.0:
+            box_y = min(float(height - box_h), y + 4.0)
+        self._rounded_rect(cr, box_x, box_y, box_w, box_h, 5.0)
+        cr.set_source_rgba(*rgba("bg", 0.84))  # type: ignore[attr-defined]
+        cr.fill()  # type: ignore[attr-defined]
+        cr.set_source_rgba(*rgba("annotation", 0.85))  # type: ignore[attr-defined]
+        cr.move_to(box_x + pad_x, box_y + pad_y)  # type: ignore[attr-defined]
+        PangoCairo.show_layout(cr, layout)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _rounded_rect(
+        cr: object, x: float, y: float, width: float, height: float, radius: float
+    ) -> None:
+        radius = max(0.0, min(radius, width / 2.0, height / 2.0))
+        cr.new_sub_path()  # type: ignore[attr-defined]
+        cr.arc(x + width - radius, y + radius, radius, -1.5707963, 0.0)  # type: ignore[attr-defined]
+        cr.arc(x + width - radius, y + height - radius, radius, 0.0, 1.5707963)  # type: ignore[attr-defined]
+        cr.arc(x + radius, y + height - radius, radius, 1.5707963, 3.1415927)  # type: ignore[attr-defined]
+        cr.arc(x + radius, y + radius, radius, 3.1415927, 4.7123890)  # type: ignore[attr-defined]
+        cr.close_path()  # type: ignore[attr-defined]
+
+
+class _CompareOverlay(Gtk.DrawingArea):
+    """Split-view captions: 原图 / 美颜 + the active beauty parameters.
+
+    The shader owns the split line; this layer only annotates it, so the labels
+    follow the same ``u_split`` fraction and the actual letterboxed video
+    rectangle without touching the video pipeline.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_can_target(False)
+        self.set_draw_func(self._draw)
+        self._visible = False
+        self._split = 0.5
+        self._frame_size = (0.0, 0.0)
+        self._labels = ("Original", "Beautified")
+        self._params = ""
+        self.set_visible(False)
+
+    def set_state(
+        self,
+        *,
+        visible: bool,
+        split: float,
+        frame_width: float,
+        frame_height: float,
+        labels: tuple[str, str],
+        params: str,
+    ) -> None:
+        changed = (
+            self._visible != visible
+            or self._split != split
+            or self._frame_size != (frame_width, frame_height)
+            or self._labels != labels
+            or self._params != params
+        )
+        self._visible = visible
+        self._split = max(0.0, min(1.0, split))
+        self._frame_size = (frame_width, frame_height)
+        self._labels = labels
+        self._params = params
+        self.set_visible(visible)
+        if changed:
+            self.queue_draw()
+
+    def _draw(
+        self, _area: Gtk.DrawingArea, cr: object, width: int, height: int
+    ) -> None:
+        if not self._visible or self._frame_size[0] <= 0 or self._frame_size[1] <= 0:
+            return
+        origin_x, origin_y, display_w, display_h = contain_rect(
+            self._frame_size[0],
+            self._frame_size[1],
+            float(width),
+            float(height),
+        )
+        split_x = origin_x + display_w * self._split
+        top = origin_y + 14.0
+        gap = 8.0
+        original = self._labels[0]
+        beautified = self._labels[1]
+        original_w = self._capsule_width(cr, original)
+        beautified_w = self._capsule_width(cr, beautified)
+        left_x = split_x - gap - original_w
+        right_x = split_x + gap
+        left_x = max(origin_x, left_x)
+        right_x = min(origin_x + display_w - beautified_w, right_x)
+        self._draw_capsule(cr, original, left_x, top)
+        self._draw_capsule(cr, beautified, right_x, top)
+        if self._params:
+            layout = PangoCairo.create_layout(cr)  # type: ignore[arg-type]
+            layout.set_text(self._params, -1)
+            layout.set_font_description(Pango.FontDescription("Sans 9"))
+            PangoCairo.update_layout(cr, layout)  # type: ignore[arg-type]
+            text_w, _text_h = layout.get_pixel_size()
+            # Bright content at the split line: a 1 px dark outline keeps the
+            # caption readable without putting another panel on the picture.
+            for dx, dy in ((-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)):
+                cr.set_source_rgba(*rgba("video", 0.72))  # type: ignore[attr-defined]
+                cr.move_to(  # type: ignore[attr-defined]
+                    split_x - text_w / 2.0 + dx, top + 34.0 + dy
                 )
-                cr.fill()  # type: ignore[attr-defined]
+                PangoCairo.show_layout(cr, layout)  # type: ignore[arg-type]
+            cr.set_source_rgba(*rgba("fg", 0.98))  # type: ignore[attr-defined]
+            cr.move_to(split_x - text_w / 2.0, top + 34.0)  # type: ignore[attr-defined]
+            PangoCairo.show_layout(cr, layout)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _capsule_width(cr: object, text: str) -> float:
+        layout = PangoCairo.create_layout(cr)  # type: ignore[arg-type]
+        layout.set_text(text, -1)
+        layout.set_font_description(Pango.FontDescription("Sans 9.5"))
+        PangoCairo.update_layout(cr, layout)  # type: ignore[arg-type]
+        text_w, _ = layout.get_pixel_size()
+        return float(text_w + 24)
+
+    def _draw_capsule(self, cr: object, text: str, x: float, y: float) -> None:
+        layout = PangoCairo.create_layout(cr)  # type: ignore[arg-type]
+        layout.set_text(text, -1)
+        layout.set_font_description(Pango.FontDescription("Sans 9.5"))
+        PangoCairo.update_layout(cr, layout)  # type: ignore[arg-type]
+        text_w, text_h = layout.get_pixel_size()
+        width = text_w + 24
+        height = text_h + 10
+        _FaceOverlay._rounded_rect(cr, x, y, width, height, 10.0)
+        cr.set_source_rgba(*rgba("bg", 0.82))  # type: ignore[attr-defined]
+        cr.fill()  # type: ignore[attr-defined]
+        cr.set_source_rgba(*rgba("play", 0.14))  # type: ignore[attr-defined]
+        cr.set_line_width(1.0)  # type: ignore[attr-defined]
+        _FaceOverlay._rounded_rect(cr, x + 0.5, y + 0.5, width - 1, height - 1, 9.5)
+        cr.stroke()  # type: ignore[attr-defined]
+        cr.set_source_rgba(*rgba("annotation", 0.96))  # type: ignore[attr-defined]
+        cr.move_to(x + 12.0, y + 5.0)  # type: ignore[attr-defined]
+        PangoCairo.show_layout(cr, layout)  # type: ignore[arg-type]
+
+
+class _ProgressLine(Gtk.DrawingArea):
+    """Two-pixel progress hairline that survives the dock fade.
+
+    A plain Gtk.ProgressBar picks up theme min-widths and logs "min width -2"
+    warnings on GTK 4.14; the line is a single rect, so drawing it directly is
+    both exact and quiet.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_can_target(False)
+        self.set_draw_func(self._draw)
+        self.set_size_request(-1, 2)
+        self._fraction = 0.0
+
+    def set_fraction(self, fraction: float) -> None:
+        self._fraction = max(0.0, min(1.0, float(fraction)))
+        self.queue_draw()
+
+    def get_fraction(self) -> float:
+        return self._fraction
+
+    def _draw(
+        self, _area: Gtk.DrawingArea, cr: object, width: int, height: int
+    ) -> None:
+        if width <= 0 or height <= 0:
+            return
+        cr.set_source_rgba(*rgba("play", 0.12))  # type: ignore[attr-defined]
+        cr.rectangle(0, 0, width, height)  # type: ignore[attr-defined]
+        cr.fill()  # type: ignore[attr-defined]
+        filled = width * self._fraction
+        if filled <= 0:
+            return
+        cr.set_source_rgba(*rgba("accent", 0.96))  # type: ignore[attr-defined]
+        cr.rectangle(0, 0, filled, height)  # type: ignore[attr-defined]
+        cr.fill()  # type: ignore[attr-defined]
 
 
 def _format_time(nanoseconds: int) -> str:
@@ -123,10 +372,24 @@ def _labelled_row(label: Gtk.Label, widget: Gtk.Widget) -> Gtk.Widget:
     return row
 
 
-def _labelled_scale(label: Gtk.Label, scale: Gtk.Scale) -> Gtk.Widget:
+def _slider_block(label: Gtk.Label, scale: Gtk.Scale, value: Gtk.Label) -> Gtk.Widget:
+    """Title + value on one line, slider underneath (v4 beauty page).
+
+    ``Gtk.Scale`` draws its own value at the end of the trough, which is a
+    different position on every row; the mockup puts the number on the title
+    line instead, so the scale itself draws nothing and this label carries it.
+    """
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.add_css_class("beauty-slider")
+    top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
     label.set_xalign(0.0)
-    box.append(label)
+    label.set_hexpand(True)
+    label.add_css_class("beauty-slider-label")
+    value.set_xalign(1.0)
+    value.add_css_class("beauty-slider-value")
+    top.append(label)
+    top.append(value)
+    box.append(top)
     box.append(scale)
     return box
 
@@ -147,26 +410,80 @@ class PlayerWindow(Gtk.ApplicationWindow):
         language: str | None = None,
     ) -> None:
         super().__init__(application=application)
+        self.add_css_class("cinema-window")
         self.config = config
         self.demo = demo
+        # An explicit ``detection.enabled=true`` (custom --config) always
+        # wins; only the shipped default may be toggled on demand.
+        self._detection_opted_in = config.detection.enabled
         self._t = Translator(language)
         self.playlist = Playlist(media)
+        # Resume positions describe the viewer's progress, not the demo's tuned
+        # parameters, so they live in XDG state rather than the project config
+        # (``player.resume = false`` disables the feature entirely).
+        self._resume = ResumeStore() if config.player.resume else None
+        self._resume_saved_at = 0.0
+        # History of opened files, separate from the resume positions:
+        # a clip watched to the end leaves the resume map but must stay
+        # in the history (see recents.py).
+        self._recents = (
+            RecentsStore() if config.player.recent_files else None
+        )
+        self._recent_paths: list[Path] = []
+        #: Sidecar subtitles for the current clip (None when there is no .srt).
+        self._subtitles: SubtitleTrack | None = None
+        self._subtitles_enabled = True
+        self._subtitle_path: Path | None = None
+        self._subtitle_text: str | None = None
+        #: Guards the track dropdown while its model is rebuilt, otherwise
+        #: ``set_selected`` would look like a user choice and re-seek.
+        self._updating_audio = False
         # ``--record`` bypasses the on-screen video sink so the recorder
         # owns the GPU and the recorded file stays a smooth 30 fps.
         self.backend = PlaybackBackend(config, display_bypass=record is not None)
         self._fps = 0.0
         self._duration_ns = 0
         self._updating_seek = False
+        self._updating_decode = False
+        # Idle source ids for deferred pipeline rebuilds; 0 when idle.
+        self._decode_reopen_id = 0
+        self._detection_reopen_id = 0
         self._timer_id = 0
         self._faces: tuple[Face, ...] = ()
         self._detection_ms = 0.0
         self._detection_error: str | None = None
         self._beauty_error: str | None = None
-        self._show_faces = True
+        # Player first: face boxes (and the NPU detector behind them) are opt-in.
+        self._show_faces = False
+        # v4: A|B and the boxes are children of the beauty switch.  A config
+        # that still remembers compare_mode while beauty is off must not pop
+        # the split back on when beauty is enabled later; the page notice
+        # promises exactly that.
+        if not config.beauty.enabled:
+            config.beauty.compare_mode = False
+        # Guards the sidebar switch and fullscreen pill from echoing each other.
+        self._updating_toggles = False
+        # v4 sidebar pages: ``playlist`` is the default; ``beauty`` has its own
+        # page instead of the v3 first-level panel that pushed the playlist out.
+        self._sidebar_tab = SIDEBAR_PAGES[0]
+        self._updating_tabs = False
         self._last_detection_label_at = 0.0
         self._current_path: Path | None = None
+        self._playback_path: Path | None = None
+        self._playback_status: str | None = None
+        self._playback_status_message = ""
+        self._playback_started = False
         self._hint_key: str | None = None
         self._hint_values: dict[str, object] = {}
+        # Fullscreen ("immersive") mode re-parents the info line, the transport
+        # and the hint into a floating dock over the picture, which hides
+        # itself after DOCK_IDLE_SECONDS of stillness.  ``--record`` keeps the
+        # windowed layout: the recorder composes its canvas from the widget
+        # allocations, so moving or hiding them would blank the recording.
+        self._immersive = False
+        self._dock_hover = False
+        self._dock_pointer: tuple[float, float] | None = None
+        self._dock_deadline = 0.0
         self._record_path = record
         self._record_duration = record_duration
         self._record_deadline = 0.0
@@ -195,39 +512,125 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.backend.on_detection = self._on_detection
         self.backend.on_detection_error = self._on_detection_error
         self.backend.on_beauty_error = self._on_beauty_error
+        self.backend.on_decode_fallback = self._on_decode_fallback
         self.backend.on_recording_error = self._on_recording_error
 
         self.set_default_size(1280, 800)
 
         header = Gtk.HeaderBar()
+        header.add_css_class("cinema-headerbar")
         self.set_titlebar(header)
+        #: Kept as an attribute so the recording canvas can paint the title bar
+        #: (the window's top band); see :meth:`_recording_layer_specs`.
+        self._headerbar = header
+
+        # Two-line title: clip name over "duration · resolution · codec · fps",
+        # which is how the mockup keeps the header informative without a line
+        # of chrome eating the picture.
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        title_box.set_halign(Gtk.Align.CENTER)
+        self._title_label = Gtk.Label()
+        self._title_label.add_css_class("header-title")
+        self._title_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self._title_label.set_max_width_chars(56)
+        self._header_subtitle_label = Gtk.Label()
+        self._header_subtitle_label.add_css_class("header-subtitle")
+        self._header_subtitle_label.set_visible(False)
+        title_box.append(self._title_label)
+        title_box.append(self._header_subtitle_label)
+        header.set_title_widget(title_box)
+        self._header_subtitle_cache = ""
+        self._hint_timeout = 0
+        self._back_button = Gtk.Button()
+        self._back_button.add_css_class("header-back")
+        back_glyph = Gtk.Label(label="\u2039")
+        back_glyph.add_css_class("header-back-glyph")
+        self._back_button.set_child(back_glyph)
+        self._back_button.connect("clicked", self._on_back_clicked)
+        header.pack_start(self._back_button)
         self._open_button = Gtk.Button()
+        self._open_button.add_css_class("header-ghost")
         self._open_button.connect("clicked", self._on_open_clicked)
+        # Icon + text like the mockup's pill; the board image ships
+        # document-open-symbolic even though it trims most of the theme.
+        open_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        open_icon = Gtk.Image.new_from_icon_name("document-open-symbolic")
+        open_icon.set_pixel_size(15)
+        self._open_label = Gtk.Label()
+        open_box.append(open_icon)
+        open_box.append(self._open_label)
+        self._open_button.set_child(open_box)
         header.pack_start(self._open_button)
 
-        self._compare_button = Gtk.ToggleButton()
-        self._compare_button.set_active(config.beauty.compare_mode)
-        self._compare_button.connect("toggled", self._on_compare_toggled)
-
         self._language_button = Gtk.Button()
+        self._language_button.add_css_class("header-action")
         self._language_button.connect("clicked", self._on_language_clicked)
+        self._sidebar_button = Gtk.ToggleButton()
+        # A text glyph rather than an icon name: the board image ships a
+        # trimmed icon theme and a missing symbolic name renders as a blank
+        # button.
+        self._sidebar_button.set_label("☰")
+        self._sidebar_button.set_active(True)
+        self._sidebar_button.add_css_class("header-action")
+        self._sidebar_button.set_tooltip_text(self._t("toggle_sidebar"))
+        self._sidebar_button.connect("toggled", self._on_sidebar_toggled)
+        # The header keeps window-level actions only.  A|B lives with the
+        # beauty controls in the sidebar (see _build_sidebar); keeping it off
+        # the transport leaves room for "previous" on the 1280 px panel.
         end_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        end_box.append(self._compare_button)
         end_box.append(self._language_button)
+        end_box.append(self._sidebar_button)
         header.pack_end(end_box)
 
         paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        paned.add_css_class("cinema-paned")
         paned.set_position(940)
         paned.set_wide_handle(True)
         paned.set_start_child(self._build_player_area())
         paned.set_end_child(self._build_sidebar())
-        self.set_child(paned)
+        self._paned = paned
+
+        # ui-v5 shell: one stack, both halves built once, only visibility moves.
+        # ``--record`` and ``--demo`` start on the player page (the recorder
+        # composes the windowed player layout); a plain launch with no media
+        # lands on the browse shell's home page.
+        self._browse = BrowseShell(
+            config=config,
+            translator=self._t,
+            recents=self._recents,
+            on_play=self._play_paths,
+            on_open_file=lambda: self._on_open_clicked(self._open_button),
+            on_changed=self._on_library_changed,
+            on_drop_paths=self._on_library_dropped,
+        )
+        #: Alias kept for the QC probes: the library page inside the shell.
+        self._library = self._browse.library
+        self._stack = Gtk.Stack()
+        self._stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self._stack.add_named(paned, "player")
+        self._stack.add_named(self._browse, "browse")
+        self._page = (
+            "player"
+            if (self.playlist or demo or record is not None)
+            else "browse"
+        )
+        self._stack.set_visible_child_name(self._page)
+        self.set_child(self._stack)
 
         self._apply_demo_mode()
 
         controller = Gtk.EventControllerKey()
         controller.connect("key-pressed", self._on_key_pressed)
         self.add_controller(controller)
+
+        # Motion drives the fullscreen HUD; the controller sits on the window
+        # so events over the dock itself (buttons, scales) still reach it.
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_pointer_motion)
+        self.add_controller(motion)
+        # The window manager can go fullscreen on its own (F11, a shell
+        # binding), so the layout follows the property rather than the button.
+        self.connect("notify::fullscreened", self._on_fullscreen_notified)
 
         self._timer_id = GLib.timeout_add(200, self._tick)
         self._closed = False
@@ -237,11 +640,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         if fullscreen or demo:
             self.fullscreen()
+            self._sync_immersive()
         if self.playlist:
             GLib.idle_add(self._start_index, 0)
-        else:
-            self._set_hint_key("hint_open")
         self._apply_language()
+        self._sync_page_chrome()
+        if self._page == "browse":
+            GLib.idle_add(self._refresh_browse)
         log_action(
             "window_open",
             media=len(media),
@@ -255,10 +660,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _build_player_area(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.add_css_class("player-column")
         box.set_margin_top(8)
         box.set_margin_bottom(8)
         box.set_margin_start(8)
         box.set_margin_end(8)
+        self._player_box = box
+        self._player_margin = 8
 
         overlay = Gtk.Overlay()
         overlay.set_hexpand(True)
@@ -272,205 +680,759 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._picture.set_content_fit(Gtk.ContentFit.CONTAIN)
         overlay.set_child(self._picture)
 
+        # Split captions sit above the frame but below the face brackets.
+        self._compare_overlay = _CompareOverlay()
+        self._compare_overlay.set_hexpand(True)
+        self._compare_overlay.set_vexpand(True)
+        overlay.add_overlay(self._compare_overlay)
+
         self._face_overlay = _FaceOverlay()
         self._face_overlay.set_hexpand(True)
         self._face_overlay.set_vexpand(True)
         overlay.add_overlay(self._face_overlay)
 
-        self._placeholder = Gtk.Label()
-        self._placeholder.set_justify(Gtk.Justification.CENTER)
-        self._placeholder.add_css_class("video-placeholder")
-        overlay.add_overlay(self._placeholder)
+        self._empty_state = self._build_empty_state()
+        overlay.add_overlay(self._empty_state)
+        self._build_playback_status(overlay)
+
+        # Subtitles are drawn as a GTK layer, not by a GStreamer textoverlay:
+        # the video path stays untouched (see subtitle.py for the reasoning).
+        self._subtitle_label = Gtk.Label()
+        self._subtitle_label.add_css_class("subtitle-overlay")
+        self._subtitle_label.set_halign(Gtk.Align.CENTER)
+        self._subtitle_label.set_valign(Gtk.Align.END)
+        self._subtitle_label.set_justify(Gtk.Justification.CENTER)
+        self._subtitle_label.set_wrap(True)
+        self._subtitle_label.set_margin_bottom(24)
+        self._subtitle_label.set_margin_start(24)
+        self._subtitle_label.set_margin_end(24)
+        self._subtitle_label.set_can_target(False)
+        self._subtitle_label.set_visible(False)
+        overlay.add_overlay(self._subtitle_label)
+        self._build_transport_dock(overlay)
+        self._build_immersive_chrome(overlay)
+        self._build_hint_toast(overlay)
+
         box.append(overlay)
         self._player_overlay = overlay
 
-        self._info_label = Gtk.Label()
-        self._info_label.set_xalign(0.0)
-        self._info_label.set_selectable(True)
-        self._info_label.add_css_class("info-line")
-        self._info_label.set_visible(self.config.debug.show_info_panel)
-        box.append(self._info_label)
+        # A touch panel produces no pointer motion, so on the board a tap is
+        # the only way to summon the fullscreen HUD.  Tapping never hides it:
+        # a tap that lands on a button must not make the bar disappear.
+        tap = Gtk.GestureClick()
+        tap.connect("pressed", self._on_surface_pressed)
+        overlay.add_controller(tap)
+
+        # Drop a file or folder anywhere on the picture; the empty state makes
+        # that affordance explicit, but it keeps working during playback.
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_files_dropped)
+        drop.connect("enter", self._on_drop_enter)
+        drop.connect("leave", self._on_drop_leave)
+        overlay.add_controller(drop)
+
+        self._info_bar = self._build_info_bar()
+        box.append(self._info_bar)
 
         box.append(self._build_controls())
-
-        self._hint_label = Gtk.Label(label="")
-        self._hint_label.set_xalign(0.0)
-        self._hint_label.set_wrap(True)
-        self._hint_label.add_css_class("dim-label")
-        box.append(self._hint_label)
+        self._sync_chrome_visibility()
         return box
 
+    def _build_info_bar(self) -> Gtk.Widget:
+        """Labelled telemetry row: static left group, live NPU/beauty right.
+
+        The v3 mockup spells the field names out (分辨率/编码/解码/帧率) and
+        gives the two live values their own right-aligned group, so a number
+        that moves always means a live measurement.
+        """
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        bar.add_css_class("info-bar")
+        self._info_labels: dict[str, Gtk.Label] = {}
+        self._info_values: dict[str, Gtk.Label] = {}
+
+        def field(key: str, label_key: str) -> Gtk.Widget:
+            group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            label = Gtk.Label(label=self._t(label_key))
+            label.add_css_class("info-label")
+            label.set_xalign(0.0)
+            value = Gtk.Label(label="—")
+            value.add_css_class("info-value")
+            value.set_xalign(0.0)
+            value.set_selectable(False)
+            self._info_labels[key] = label
+            self._info_values[key] = value
+            group.append(label)
+            group.append(value)
+            return group
+
+        for key, label_key in (
+            ("format", "info_resolution"),
+            ("codec", "info_codec"),
+            ("decode", "info_decode"),
+            ("fps", "info_fps"),
+        ):
+            bar.append(field(key, label_key))
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        bar.append(spacer)
+
+        dot = Gtk.Label(label="●")
+        dot.add_css_class("info-dot")
+        dot.set_valign(Gtk.Align.CENTER)
+        self._info_dot = dot
+        bar.append(dot)
+
+        self._info_face = Gtk.Label(label="—")
+        self._info_face.add_css_class("info-live")
+        self._info_face.set_selectable(False)
+        bar.append(self._info_face)
+
+        self._info_beauty = Gtk.Label(label="—")
+        self._info_beauty.add_css_class("info-live")
+        self._info_beauty.set_selectable(False)
+        bar.append(self._info_beauty)
+
+        bar.set_visible(self.config.debug.show_info_panel)
+        return bar
+
+    def _build_empty_state(self) -> Gtk.Widget:
+        """Full-picture drop zone shown only while no clip is open."""
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.set_hexpand(True)
+        outer.set_vexpand(True)
+        outer.set_can_target(True)
+        outer.add_css_class("empty-state")
+
+        dropzone = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        dropzone.add_css_class("dropzone")
+        dropzone.set_hexpand(True)
+        dropzone.set_vexpand(True)
+        dropzone.set_margin_top(12)
+        dropzone.set_margin_bottom(12)
+        dropzone.set_margin_start(12)
+        dropzone.set_margin_end(12)
+        self._dropzone = dropzone
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        content.set_halign(Gtk.Align.CENTER)
+        content.set_valign(Gtk.Align.CENTER)
+        content.set_vexpand(True)
+
+        icon = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        icon.add_css_class("dropzone-icon")
+        icon.set_halign(Gtk.Align.CENTER)
+        icon_image = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
+        icon_image.set_pixel_size(28)
+        icon.append(icon_image)
+        content.append(icon)
+
+        self._empty_title = Gtk.Label(label=self._t("empty_title"))
+        self._empty_title.add_css_class("dropzone-title")
+        self._empty_title.set_justify(Gtk.Justification.CENTER)
+        content.append(self._empty_title)
+
+        self._empty_subtitle = Gtk.Label(label=self._t("empty_subtitle"))
+        self._empty_subtitle.add_css_class("dropzone-subtitle")
+        self._empty_subtitle.set_justify(Gtk.Justification.CENTER)
+        content.append(self._empty_subtitle)
+
+        cta = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        cta.set_halign(Gtk.Align.CENTER)
+        self._empty_file_button = Gtk.Button(label=self._t("empty_choose_file"))
+        self._empty_file_button.add_css_class("drop-primary")
+        self._empty_file_button.connect("clicked", self._on_open_clicked)
+        self._empty_folder_button = Gtk.Button(label=self._t("empty_choose_folder"))
+        self._empty_folder_button.add_css_class("drop-secondary")
+        self._empty_folder_button.connect("clicked", self._on_open_folder_clicked)
+        cta.append(self._empty_file_button)
+        cta.append(self._empty_folder_button)
+        content.append(cta)
+
+        self._empty_hint = Gtk.Label(label=self._t("empty_drop_hint"))
+        self._empty_hint.add_css_class("dropzone-hint")
+        self._empty_hint.set_justify(Gtk.Justification.CENTER)
+        content.append(self._empty_hint)
+        dropzone.append(content)
+
+        capabilities = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        capabilities.set_halign(Gtk.Align.CENTER)
+        capabilities.set_valign(Gtk.Align.END)
+        capabilities.set_margin_bottom(18)
+        self._capability_labels: list[Gtk.Label] = []
+        for key in ("empty_chip_vpu", "empty_chip_npu", "empty_chip_beauty"):
+            chip = Gtk.Label(label=self._t(key))
+            chip.add_css_class("capability-chip")
+            capabilities.append(chip)
+            self._capability_labels.append(chip)
+        dropzone.append(capabilities)
+        outer.append(dropzone)
+        outer.set_visible(False)
+        return outer
+
+    def _build_playback_status(self, overlay: Gtk.Overlay) -> None:
+        """Build the persistent, video-only status card used by playback states."""
+        self._status_card = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=10
+        )
+        self._status_card.set_halign(Gtk.Align.CENTER)
+        self._status_card.set_valign(Gtk.Align.CENTER)
+        self._status_card.set_hexpand(False)
+        self._status_card.set_vexpand(False)
+        self._status_card.set_visible(False)
+        self._status_card.add_css_class("playback-status-card")
+
+        heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        heading.set_halign(Gtk.Align.CENTER)
+        self._status_spinner = Gtk.Spinner()
+        self._status_spinner.set_size_request(28, 28)
+        self._status_spinner.add_css_class("status-spinner")
+        self._status_icon = Gtk.Image()
+        self._status_icon.set_pixel_size(34)
+        self._status_icon.add_css_class("status-symbol")
+        self._status_title = Gtk.Label()
+        self._status_title.set_xalign(0.0)
+        self._status_title.add_css_class("status-title")
+        heading.append(self._status_spinner)
+        heading.append(self._status_icon)
+        heading.append(self._status_title)
+        self._status_card.append(heading)
+
+        self._status_message = Gtk.Label()
+        self._status_message.set_wrap(True)
+        self._status_message.set_justify(Gtk.Justification.CENTER)
+        self._status_message.set_max_width_chars(48)
+        self._status_message.set_selectable(True)
+        self._status_message.add_css_class("status-message")
+        self._status_card.append(self._status_message)
+
+        self._status_actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8
+        )
+        self._status_actions.set_halign(Gtk.Align.CENTER)
+        self._status_actions.add_css_class("status-actions")
+        self._status_primary_button = Gtk.Button()
+        self._status_primary_button.add_css_class("accent-button")
+        self._status_primary_button.connect(
+            "clicked", self._on_status_primary_clicked
+        )
+        self._status_secondary_button = Gtk.Button()
+        self._status_secondary_button.add_css_class("secondary-action")
+        self._status_secondary_button.connect(
+            "clicked", self._on_status_secondary_clicked
+        )
+        self._status_actions.append(self._status_primary_button)
+        self._status_actions.append(self._status_secondary_button)
+        self._status_card.append(self._status_actions)
+        overlay.add_overlay(self._status_card)
+
+    def _build_transport_dock(self, overlay: Gtk.Overlay) -> None:
+        """Empty floating dock, filled only while the window is fullscreen.
+
+        The dock is a :class:`Gtk.Revealer` so the fade is animated by the
+        toolkit rather than by a manual opacity timeout, and it starts hidden:
+        an overlay child that is visible with no children still takes part in
+        hit testing.  Only the transport moves in; the info row is replaced by
+        the always-on telemetry line in the top-left corner.
+        """
+        self._dock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._dock.add_css_class("transport-dock")
+        self._dock.set_margin_start(20)
+        self._dock.set_margin_end(20)
+        self._dock.set_margin_bottom(12)
+
+        self._dock_revealer = Gtk.Revealer()
+        self._dock_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+        self._dock_revealer.set_transition_duration(220)
+        self._dock_revealer.set_halign(Gtk.Align.FILL)
+        self._dock_revealer.set_valign(Gtk.Align.END)
+        self._dock_revealer.set_child(self._dock)
+        self._dock_revealer.set_reveal_child(False)
+        self._dock_revealer.set_visible(False)
+        overlay.add_overlay(self._dock_revealer)
+
+    def _build_immersive_chrome(self, overlay: Gtk.Overlay) -> None:
+        """Always-on fullscreen telemetry and the bottom progress hairline.
+
+        Both survive the dock fade: the telemetry dims to 62 %, the 2 px
+        progress line stays at the bottom edge, so the viewer keeps a sense of
+        position after the controls disappear.
+        """
+        telemetry = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        telemetry.set_halign(Gtk.Align.START)
+        telemetry.set_valign(Gtk.Align.START)
+        telemetry.set_margin_top(16)
+        telemetry.set_margin_start(20)
+        telemetry.set_can_target(False)
+        telemetry.set_visible(False)
+        self._telemetry_main = Gtk.Label(label="—")
+        self._telemetry_main.add_css_class("fullscreen-telemetry")
+        self._telemetry_main.set_xalign(0.0)
+        self._telemetry_main.set_selectable(False)
+        self._telemetry_live = Gtk.Label(label="")
+        self._telemetry_live.add_css_class("fullscreen-telemetry")
+        self._telemetry_live.add_css_class("fullscreen-telemetry-live")
+        self._telemetry_live.set_xalign(0.0)
+        self._telemetry_live.set_selectable(False)
+        dot = Gtk.Label(label="●")
+        dot.add_css_class("info-dot")
+        dot.set_valign(Gtk.Align.CENTER)
+        self._telemetry_dot = dot
+        telemetry.append(self._telemetry_main)
+        telemetry.append(dot)
+        telemetry.append(self._telemetry_live)
+        self._telemetry_box = telemetry
+        overlay.add_overlay(telemetry)
+
+        self._fullscreen_progress = _ProgressLine()
+        self._fullscreen_progress.set_halign(Gtk.Align.FILL)
+        self._fullscreen_progress.set_valign(Gtk.Align.END)
+        self._fullscreen_progress.set_hexpand(True)
+        self._fullscreen_progress.set_visible(False)
+        overlay.add_overlay(self._fullscreen_progress)
+
+    def _build_hint_toast(self, overlay: Gtk.Overlay) -> None:
+        """Transient status text over the picture instead of a fixed row.
+
+        The hint still reports decode fallbacks, resume notices and playlist
+        edges, but it no longer owns layout height: that row was the reason the
+        transport never reached the bottom edge of the window.
+        """
+        self._hint_label = Gtk.Label(label="")
+        self._hint_label.set_justify(Gtk.Justification.CENTER)
+        self._hint_label.set_max_width_chars(64)
+        self._hint_label.set_wrap(True)
+        self._hint_label.set_can_target(False)
+        self._hint_label.add_css_class("hint-toast")
+
+        self._hint_revealer = Gtk.Revealer()
+        self._hint_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+        self._hint_revealer.set_transition_duration(180)
+        self._hint_revealer.set_child(self._hint_label)
+        self._hint_revealer.set_halign(Gtk.Align.CENTER)
+        self._hint_revealer.set_valign(Gtk.Align.START)
+        self._hint_revealer.set_margin_top(16)
+        self._hint_revealer.set_can_target(False)
+        self._hint_revealer.set_visible(False)
+        overlay.add_overlay(self._hint_revealer)
+
     def _build_controls(self) -> Gtk.Widget:
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        """Two-row transport: the timeline on top, 44 px keys underneath.
 
-        self._play_button = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
-        self._play_button.connect("clicked", self._on_play_clicked)
-        bar.append(self._play_button)
+        The v3 mockup splits the timecode into an elapsed label on the left and
+        a duration label on the right, and keeps every transport key at 44 px.
+        Grouping (navigation / stop / playback settings / immersive tools /
+        output) keeps the row legible at 1280 px.
+        """
+        bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        bar.add_css_class("transport-bar")
 
-        self._prev_button = Gtk.Button.new_from_icon_name("media-skip-backward-symbolic")
-        self._prev_button.connect("clicked", self._on_previous_clicked)
-        bar.append(self._prev_button)
-
-        self._next_button = Gtk.Button.new_from_icon_name("media-skip-forward-symbolic")
-        self._next_button.connect("clicked", self._on_next_clicked)
-        bar.append(self._next_button)
+        seek_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        seek_row.add_css_class("seek-row")
+        self._elapsed_label = Gtk.Label(label="00:00")
+        self._elapsed_label.add_css_class("time-display")
+        self._elapsed_label.set_xalign(0.0)
+        seek_row.append(self._elapsed_label)
 
         self._seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1000, 1)
         self._seek.set_hexpand(True)
         self._seek.set_draw_value(False)
         self._seek.connect("value-changed", self._on_seek_changed)
-        bar.append(self._seek)
+        seek_row.append(self._seek)
 
-        self._time_label = Gtk.Label(label="00:00 / 00:00")
-        bar.append(self._time_label)
+        self._total_label = Gtk.Label(label="00:00")
+        self._total_label.add_css_class("time-display")
+        self._total_label.set_xalign(1.0)
+        seek_row.append(self._total_label)
+        bar.append(seek_row)
 
-        self._volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self._volume.set_size_request(110, -1)
-        self._volume.set_value(self.config.player.volume)
-        self._volume.set_draw_value(False)
-        self._volume.connect("value-changed", self._on_volume_changed)
-        bar.append(self._volume)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.add_css_class("button-row")
+
+        def divider() -> Gtk.Separator:
+            line = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+            line.add_css_class("transport-divider")
+            return line
+
+        def add_icon(icon_name: str) -> Gtk.Button:
+            button = Gtk.Button.new_from_icon_name(icon_name)
+            button.add_css_class("transport-button")
+            # Gtk.Box children default to FILL and would stretch the 44 px key.
+            button.set_valign(Gtk.Align.CENTER)
+            return button
+
+        self._prev_button = add_icon("media-skip-backward-symbolic")
+        self._prev_button.connect("clicked", self._on_previous_clicked)
+        row.append(self._prev_button)
+
+        self._play_button = Gtk.Button.new_from_icon_name(
+            "media-playback-start-symbolic"
+        )
+        self._play_button.add_css_class("transport-button")
+        self._play_button.add_css_class("transport-primary")
+        self._play_button.set_valign(Gtk.Align.CENTER)
+        self._play_button.connect("clicked", self._on_play_clicked)
+        row.append(self._play_button)
+
+        self._next_button = add_icon("media-skip-forward-symbolic")
+        self._next_button.connect("clicked", self._on_next_clicked)
+        row.append(self._next_button)
+
+        # Stop is deliberately not a fourth navigation key. It rewinds to 00:00
+        # and drops the resume point, so it sits behind a separator and is drawn
+        # as a low-weight ghost button.
+        row.append(divider())
+
+        self._stop_button = add_icon("media-playback-stop-symbolic")
+        self._stop_button.add_css_class("transport-ghost")
+        self._stop_button.set_tooltip_text(self._t("stop_playback"))
+        self._stop_button.connect("clicked", self._on_stop_clicked)
+        row.append(self._stop_button)
+
+        row.append(divider())
 
         self._speed = Gtk.DropDown.new_from_strings(list(SPEED_CHOICES))
         self._speed.set_selected(_closest_speed_index(self.config.player.speed))
+        self._speed.set_size_request(96, -1)
+        self._speed.set_valign(Gtk.Align.CENTER)
         self._speed.connect("notify::selected", self._on_speed_changed)
-        bar.append(self._speed)
+        row.append(self._speed)
 
-        self._fullscreen_button = Gtk.Button.new_from_icon_name("view-fullscreen-symbolic")
+        row.append(divider())
+
+        # The decode path belongs to playback, so it lives here rather than in
+        # the sidebar: it has to stay reachable while the video covers the
+        # window, and it is read at a glance on a demo table.
+        row.append(self._build_decode_segments())
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        row.append(spacer)
+
+        # Beauty / compare pills only exist in the fullscreen dock.  They are
+        # hidden in the windowed row, where the sidebar owns those switches.
+        self._immersive_tools = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+        )
+        self._immersive_tools.set_valign(Gtk.Align.CENTER)
+        self._immersive_tools.set_visible(False)
+        self._dock_beauty_button = Gtk.ToggleButton(label=self._t("beauty"))
+        self._dock_beauty_button.add_css_class("dock-pill")
+        self._dock_beauty_button.set_valign(Gtk.Align.CENTER)
+        self._dock_beauty_button.set_active(self.config.beauty.enabled)
+        self._dock_beauty_button.connect(
+            "toggled", self._on_dock_beauty_toggled
+        )
+        self._dock_compare_button = Gtk.ToggleButton(label=self._t("compare"))
+        self._dock_compare_button.add_css_class("dock-pill")
+        self._dock_compare_button.set_valign(Gtk.Align.CENTER)
+        self._dock_compare_button.set_active(self.config.beauty.compare_mode)
+        self._dock_compare_button.connect(
+            "toggled", self._on_dock_compare_toggled
+        )
+        self._immersive_tools.append(self._dock_beauty_button)
+        self._immersive_tools.append(self._dock_compare_button)
+        row.append(self._immersive_tools)
+
+        initial_volume = int(round(self.config.player.volume))
+        volume_icon = (
+            "audio-volume-muted-symbolic"
+            if initial_volume == 0
+            else "audio-volume-low-symbolic"
+            if initial_volume < 35
+            else "audio-volume-high-symbolic"
+        )
+        self._volume_icon = Gtk.Image.new_from_icon_name(volume_icon)
+        self._volume_icon.set_pixel_size(16)
+        self._volume_icon.add_css_class("volume-icon")
+        row.append(self._volume_icon)
+
+        self._volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self._volume.set_size_request(88, -1)
+        self._volume.set_value(self.config.player.volume)
+        self._volume.set_draw_value(False)
+        self._volume.set_valign(Gtk.Align.CENTER)
+        self._volume.connect("value-changed", self._on_volume_changed)
+        row.append(self._volume)
+
+        self._volume_label = Gtk.Label()
+        self._volume_label.set_xalign(0.5)
+        self._volume_label.add_css_class("volume-value")
+        self._volume_label.set_text(f"{int(round(self.config.player.volume))}%")
+        row.append(self._volume_label)
+
+        self._subtitle_button = Gtk.MenuButton(label="CC")
+        self._subtitle_button.add_css_class("transport-button")
+        self._subtitle_button.set_valign(Gtk.Align.CENTER)
+        self._subtitle_button.set_tooltip_text(self._t("subtitles_tooltip"))
+        self._subtitle_button.set_popover(self._build_subtitle_popover())
+        row.append(self._subtitle_button)
+
+        self._fullscreen_button = add_icon("view-fullscreen-symbolic")
         self._fullscreen_button.connect("clicked", self._on_fullscreen_clicked)
-        bar.append(self._fullscreen_button)
+        row.append(self._fullscreen_button)
+
+        bar.append(row)
         self._controls_bar = bar
         return bar
 
+    def _build_decode_segments(self) -> Gtk.Widget:
+        """Three segments rather than a switch: "auto" is a real third option."""
+        self._decode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        self._decode_row.add_css_class("decode-segments")
+        self._decode_row.set_valign(Gtk.Align.CENTER)
+        self._decode_row.set_tooltip_text(self._t("decode_mode"))
+        self._decode_buttons: dict[str, Gtk.ToggleButton] = {}
+        first_button: Gtk.ToggleButton | None = None
+        for mode in DECODE_MODES:
+            segment = Gtk.ToggleButton()
+            if first_button is None:
+                first_button = segment
+            else:
+                segment.set_group(first_button)
+            segment.set_label(self._t(f"decode_{mode}"))
+            # Set the initial state before connecting: a grouped toggle emits
+            # "toggled" for every set_active(), including this one.
+            segment.set_active(self.config.player.decode_mode == mode)
+            segment.connect("toggled", self._on_decode_toggled, mode)
+            self._decode_row.append(segment)
+            self._decode_buttons[mode] = segment
+        # Handlers are connected now: normalise the group through the guarded
+        # path so a stale state cannot leave two segments active.
+        self._sync_decode_buttons()
+        return self._decode_row
+
     def _build_sidebar(self) -> Gtk.Widget:
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        panel.set_size_request(340, -1)
+        panel.add_css_class("sidebar-panel")
+        # The pane gives the sidebar 340 px; the 4 + 8 px margins live outside
+        # the panel's allocation, so asking for 340 clipped the right edge and
+        # cut the slider values.  328 + the margins is exactly the pane width.
+        panel.set_size_request(328, -1)
         panel.set_margin_top(8)
         panel.set_margin_bottom(8)
         panel.set_margin_start(4)
         panel.set_margin_end(8)
 
+        # v4: the sidebar opens with a two-page tab strip.  Beauty no longer
+        # shares the column with the playlist, so neither page pushes the other
+        # out of view on the 1280x768 board panel.
+        panel.append(self._build_sidebar_tabs())
+        self._playlist_page = self._build_playlist_page()
+        self._beauty_page = self._build_beauty_page()
+        panel.append(self._playlist_page)
+        panel.append(self._beauty_page)
+        self._set_sidebar_tab(SIDEBAR_PAGES[0])
+        # The shipped config starts with beauty off, so the page has to open in
+        # its greyed "cascaded off" state rather than wait for the first click.
+        self._sync_beauty_page_state()
+
+        # Keep the controls reachable on the 1280x800 board panel: the sidebar
+        # itself scrolls, so expanding "More settings" never grows the window
+        # beyond the screen.
+        sidebar_scroll = Gtk.ScrolledWindow()
+        sidebar_scroll.add_css_class("sidebar-scroll")
+        sidebar_scroll.set_vexpand(True)
+        sidebar_scroll.set_hexpand(False)
+        sidebar_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sidebar_scroll.set_child(panel)
+        self._sidebar_scroll = sidebar_scroll
+        return sidebar_scroll
+
+    def _build_sidebar_tabs(self) -> Gtk.Widget:
+        """Two page tabs, styled like the decode-mode segments."""
+        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        tabs.add_css_class("sidebar-tabs")
+        self._tab_playlist = Gtk.ToggleButton(label=self._t("playlist"))
+        self._tab_beauty = Gtk.ToggleButton(label=self._t("beauty"))
+        self._tab_beauty.set_group(self._tab_playlist)
+        for button, name in (
+            (self._tab_playlist, "playlist"),
+            (self._tab_beauty, "beauty"),
+        ):
+            button.set_hexpand(True)
+            # Set the initial state before connecting: a grouped toggle emits
+            # "toggled" for every set_active(), including the first one.
+            button.set_active(name == self._sidebar_tab)
+            button.connect("toggled", self._on_sidebar_tab_toggled, name)
+            tabs.append(button)
+        return tabs
+
+    def _build_playlist_page(self) -> Gtk.Widget:
+        """Recently played plus the current playlist: the default page."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.add_css_class("sidebar-page")
+        page.add_css_class("playlist-page")
+
+        # Recently played sits above the current playlist.  After a restart the
+        # playlist only holds what the launcher passed on the command line, so
+        # without this the sidebar is empty on every demo session.  Entries
+        # already in the playlist are filtered out in _sync_recents().
+        self._recents_title = Gtk.Label()
+        self._recents_title.set_xalign(0.0)
+        self._recents_title.add_css_class("section-heading")
+        page.append(self._recents_title)
+
+        self._recents_list = Gtk.ListBox()
+        self._recents_list.add_css_class("cinema-playlist")
+        self._recents_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._recents_list.set_activate_on_single_click(True)
+        self._recents_list.connect("row-activated", self._on_recent_activated)
+        self._recents_scroll = Gtk.ScrolledWindow()
+        self._recents_scroll.add_css_class("playlist-scroll")
+        self._recents_scroll.set_vexpand(False)
+        # Three 44 px rows, like the v4 mockup; the outer sidebar scroll still
+        # reaches the rest of the history when there are more entries.
+        self._recents_scroll.set_size_request(-1, 132)
+        self._recents_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._recents_scroll.set_child(self._recents_list)
+        page.append(self._recents_scroll)
+
+        self._recents_empty = Gtk.Label()
+        self._recents_empty.set_xalign(0.0)
+        self._recents_empty.add_css_class("recents-empty")
+        page.append(self._recents_empty)
+        self._sync_recents()
+
         self._playlist_title = Gtk.Label()
         self._playlist_title.set_xalign(0.0)
-        panel.append(self._playlist_title)
+        self._playlist_title.add_css_class("section-heading")
+        page.append(self._playlist_title)
 
         self._playlist_list = Gtk.ListBox()
+        self._playlist_list.add_css_class("cinema-playlist")
         self._playlist_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self._playlist_list.set_activate_on_single_click(True)
         self._playlist_list.connect("row-activated", self._on_row_activated)
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_vexpand(False)
-        scrolled.set_size_request(-1, 160)
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_child(self._playlist_list)
-        panel.append(scrolled)
+        self._playlist_scroll = Gtk.ScrolledWindow()
+        self._playlist_scroll.add_css_class("playlist-scroll")
+        self._playlist_scroll.set_vexpand(True)
+        self._playlist_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self._playlist_scroll.set_child(self._playlist_list)
+        page.append(self._playlist_scroll)
+        self._playlist_empty = Gtk.Label(label=self._t("playlist_empty"))
+        self._playlist_empty.add_css_class("empty-playlist")
+        self._playlist_empty.set_justify(Gtk.Justification.CENTER)
+        page.append(self._playlist_empty)
+
+        self._playlist_add_button = Gtk.Button(label=self._t("playlist_add"))
+        self._playlist_add_button.add_css_class("playlist-add")
+        self._playlist_add_button.connect("clicked", self._on_open_clicked)
+        page.append(self._playlist_add_button)
         self._sync_playlist()
 
-        panel.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        self._sidebar_shortcuts = Gtk.Label(label=self._t("sidebar_shortcuts"))
+        self._sidebar_shortcuts.add_css_class("sidebar-shortcuts")
+        self._sidebar_shortcuts.set_xalign(0.0)
+        self._sidebar_shortcuts.set_margin_top(4)
+        page.append(self._sidebar_shortcuts)
+        return page
 
-        self._beauty_title = Gtk.Label()
-        self._beauty_title.set_xalign(0.0)
-        panel.append(self._beauty_title)
+    def _on_sidebar_tab_toggled(
+        self, button: Gtk.ToggleButton, name: str
+    ) -> None:
+        # A radio group deactivates its previous member before activating the
+        # clicked one; only the activation names the page to show.
+        if self._updating_tabs or not button.get_active():
+            return
+        self._set_sidebar_tab(name)
+
+    def _set_sidebar_tab(self, name: str) -> None:
+        """Show one sidebar page and keep both tab buttons in step."""
+        if name not in SIDEBAR_PAGES:
+            raise ValueError(f"unknown sidebar page: {name!r}")
+        self._sidebar_tab = name
+        self._updating_tabs = True
+        try:
+            self._tab_playlist.set_active(name == "playlist")
+            self._tab_beauty.set_active(name == "beauty")
+        finally:
+            self._updating_tabs = False
+        self._playlist_page.set_visible(name == "playlist")
+        self._beauty_page.set_visible(name == "beauty")
+        log_action("sidebar_tab", tab=name)
+
+    def _build_beauty_page(self) -> Gtk.Widget:
+        """v4 beauty page: master switch, strengths, settings, experimental.
+
+        The page owns the whole feature now.  Turning the master switch off
+        greys the body and cascades A|B and the face boxes off (see
+        :meth:`_set_beauty_enabled`), so no dependent control stays lit while
+        the effect is off.
+        """
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.add_css_class("sidebar-page")
+        page.add_css_class("beauty-page")
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        head.add_css_class("beauty-head")
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        titles.set_hexpand(True)
+        self._beauty_header = Gtk.Label(label=self._t("beauty"))
+        self._beauty_header.add_css_class("beauty-title")
+        self._beauty_header.set_xalign(0.0)
+        titles.append(self._beauty_header)
+
+        status = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._beauty_status_dot = Gtk.Label(label="●")
+        self._beauty_status_dot.add_css_class("beauty-status-dot")
+        self._beauty_status_label = Gtk.Label()
+        self._beauty_status_label.add_css_class("beauty-status")
+        self._beauty_status_label.set_xalign(0.0)
+        status.append(self._beauty_status_dot)
+        status.append(self._beauty_status_label)
+        titles.append(status)
+        head.append(titles)
 
         self._beauty_switch = Gtk.Switch()
+        self._beauty_switch.set_hexpand(False)
+        self._beauty_switch.set_valign(Gtk.Align.START)
+        self._beauty_switch.set_margin_top(4)
         self._beauty_switch.set_active(self.config.beauty.enabled)
         self._beauty_switch.connect("notify::active", self._on_beauty_toggled)
-        self._auto_beauty_label = Gtk.Label()
-        panel.append(_labelled_row(self._auto_beauty_label, self._beauty_switch))
+        head.append(self._beauty_switch)
+        page.append(head)
 
-        self._smoothing = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self._smoothing.set_value(self.config.beauty.smoothing)
-        self._smoothing.set_draw_value(True)
-        self._smoothing.set_hexpand(True)
-        self._smoothing.connect("value-changed", self._on_smoothing_changed)
-        self._smoothing_label = Gtk.Label()
-        panel.append(_labelled_scale(self._smoothing_label, self._smoothing))
+        # Shown only while the master switch is off: names what was cascaded
+        # and warns that re-enabling beauty does not bring it back.
+        self._beauty_cascade = Gtk.Label()
+        self._beauty_cascade.add_css_class("beauty-cascade")
+        self._beauty_cascade.set_xalign(0.0)
+        self._beauty_cascade.set_wrap(True)
+        page.append(self._beauty_cascade)
 
-        self._whitening = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self._whitening.set_value(self.config.beauty.whitening)
-        self._whitening.set_draw_value(True)
-        self._whitening.set_hexpand(True)
-        self._whitening.connect("value-changed", self._on_whitening_changed)
-        self._whitening_label = Gtk.Label()
-        panel.append(_labelled_scale(self._whitening_label, self._whitening))
-
-        self._compare_switch = Gtk.Switch()
-        self._compare_switch.set_active(self.config.beauty.compare_mode)
-        self._compare_switch.connect("notify::active", self._on_compare_switch_toggled)
-        self._compare_label = Gtk.Label()
-        panel.append(_labelled_row(self._compare_label, self._compare_switch))
-
-        self._split = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 0.9, 0.05)
-        self._split.set_value(self.config.beauty.split)
-        self._split.set_draw_value(True)
-        self._split.set_digits(2)
-        self._split.set_hexpand(True)
-        self._split.connect("value-changed", self._on_split_changed)
-        self._split_label = Gtk.Label()
-        panel.append(_labelled_scale(self._split_label, self._split))
-
-        self._faces_switch = Gtk.Switch()
-        self._faces_switch.set_active(self._show_faces)
-        self._faces_switch.connect("notify::active", self._on_show_faces_toggled)
-        self._faces_label = Gtk.Label()
-        panel.append(_labelled_row(self._faces_label, self._faces_switch))
-
-        self._params_label = Gtk.Label()
-        self._params_label.set_xalign(0.0)
-        self._params_label.set_wrap(True)
-        self._params_label.add_css_class("dim-label")
-        panel.append(self._params_label)
-        self._refresh_params_label()
+        # Everything below the switch greys out together when beauty is off;
+        # the switch itself stays live so the page can be re-enabled.
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._beauty_body = body
+        body.append(self._build_beauty_strengths())
+        body.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        self._beauty_settings_heading = Gtk.Label()
+        self._beauty_settings_heading.add_css_class("beauty-section-heading")
+        self._beauty_settings_heading.set_xalign(0.0)
+        body.append(self._beauty_settings_heading)
+        body.append(self._build_beauty_settings())
+        body.append(self._build_beauty_more())
+        page.append(body)
 
         self._note_label = Gtk.Label()
+        self._note_label.add_css_class("beauty-note")
         self._note_label.set_xalign(0.0)
         self._note_label.set_wrap(True)
-        self._note_label.add_css_class("dim-label")
-        panel.append(self._note_label)
+        page.append(self._note_label)
 
-        # M5 experimental warp controls live in a collapsed expander so the
-        # stable M3 beauty controls stay the default path.
-        self._experimental_expander = Gtk.Expander()
-        self._experimental_expander.set_expanded(False)
-        self._experimental_expander.connect(
-            "notify::expanded", self._on_experimental_expanded
-        )
-        warp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        warp_box.set_margin_top(6)
-        warp_box.set_margin_start(8)
+        self._beauty_shortcuts = Gtk.Label()
+        self._beauty_shortcuts.add_css_class("sidebar-shortcuts")
+        self._beauty_shortcuts.set_xalign(0.0)
+        self._beauty_shortcuts.set_margin_top(4)
+        page.append(self._beauty_shortcuts)
 
-        self._face_slim = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0, 100, 1
-        )
-        self._face_slim.set_value(self.config.beauty.face_slim)
-        self._face_slim.set_draw_value(True)
-        self._face_slim.set_hexpand(True)
-        self._face_slim.connect("value-changed", self._on_face_slim_changed)
-        self._face_slim_label = Gtk.Label()
-        warp_box.append(_labelled_scale(self._face_slim_label, self._face_slim))
-
-        self._eye_enlarge = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0, 100, 1
-        )
-        self._eye_enlarge.set_value(self.config.beauty.eye_enlarge)
-        self._eye_enlarge.set_draw_value(True)
-        self._eye_enlarge.set_hexpand(True)
-        self._eye_enlarge.connect("value-changed", self._on_eye_enlarge_changed)
-        self._eye_enlarge_label = Gtk.Label()
-        warp_box.append(_labelled_scale(self._eye_enlarge_label, self._eye_enlarge))
-
-        self._experimental_note_label = Gtk.Label()
-        self._experimental_note_label.set_xalign(0.0)
-        self._experimental_note_label.set_wrap(True)
-        self._experimental_note_label.add_css_class("dim-label")
-        warp_box.append(self._experimental_note_label)
-        self._experimental_expander.set_child(warp_box)
-        panel.append(self._experimental_expander)
-
-        # Wheel events over a Gtk.Scale adjust that scale by default. On the
+        # Wheel events over a Gtk.Scale adjust that scale by default.  On the
         # board panel users expect the wheel to scroll the whole sidebar, so
         # intercept vertical wheel events on every sidebar scale and move the
-        # sidebar adjustment instead. The playlist keeps its own scroll.
+        # sidebar adjustment instead.  The playlist keeps its own scroll.
         for scale in (
             self._smoothing,
             self._whitening,
@@ -479,42 +1441,206 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._eye_enlarge,
         ):
             self._install_page_wheel_scroll(scale)
+        return page
 
-        # Keep the controls reachable on the 1280x800 board panel: the sidebar
-        # itself scrolls, so expanding "Experimental" never grows the window
-        # beyond the screen.
-        sidebar_scroll = Gtk.ScrolledWindow()
-        sidebar_scroll.set_vexpand(True)
-        sidebar_scroll.set_hexpand(False)
-        sidebar_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sidebar_scroll.set_child(panel)
-        self._sidebar_scroll = sidebar_scroll
-        return sidebar_scroll
+    def _build_beauty_strengths(self) -> Gtk.Widget:
+        """Smoothing and whitening: title + value above a full-width trough."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
-    def _on_experimental_expanded(
-        self, expander: Gtk.Expander, _pspec: object
-    ) -> None:
-        log_action("experimental", expanded=expander.get_expanded())
-        if not expander.get_expanded():
-            return
-        # The expander is at the bottom of the sidebar; once it opens, scroll
-        # to the new bottom so both sliders are immediately reachable.
-        # Defer one layout tick: changing the adjustment from this notify
-        # handler (or from an idle callback) can crash GTK 4.18 on the board.
-        def scroll_to_bottom() -> bool:
-            if self._closed:
-                return GLib.SOURCE_REMOVE
-            adjustment = self._sidebar_scroll.get_vadjustment()
-            if adjustment is not None:
-                adjustment.set_value(
-                    max(
-                        adjustment.get_lower(),
-                        adjustment.get_upper() - adjustment.get_page_size(),
-                    )
-                )
-            return GLib.SOURCE_REMOVE
+        self._smoothing = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
+        )
+        self._smoothing.set_value(self.config.beauty.smoothing)
+        self._smoothing.set_draw_value(False)
+        self._smoothing.set_hexpand(True)
+        self._smoothing.connect("value-changed", self._on_smoothing_changed)
+        self._smoothing_label = Gtk.Label()
+        self._smoothing_value = Gtk.Label(
+            label=slider_value_text(self.config.beauty.smoothing)
+        )
+        box.append(
+            _slider_block(self._smoothing_label, self._smoothing, self._smoothing_value)
+        )
 
-        GLib.timeout_add(150, scroll_to_bottom)
+        self._whitening = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
+        )
+        self._whitening.set_value(self.config.beauty.whitening)
+        self._whitening.set_draw_value(False)
+        self._whitening.set_hexpand(True)
+        self._whitening.connect("value-changed", self._on_whitening_changed)
+        self._whitening_label = Gtk.Label()
+        self._whitening_value = Gtk.Label(
+            label=slider_value_text(self.config.beauty.whitening)
+        )
+        box.append(
+            _slider_block(self._whitening_label, self._whitening, self._whitening_value)
+        )
+        return box
+
+    def _build_beauty_settings(self) -> Gtk.Widget:
+        """The v4 settings card: A|B, split position, face boxes.
+
+        A|B used to be a full-width button above the sliders; it is a display
+        option, so it belongs with the other output switches.
+        """
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.add_css_class("beauty-settings")
+
+        self._compare_switch = Gtk.Switch()
+        self._compare_switch.set_active(self.config.beauty.compare_mode)
+        self._compare_switch.connect("notify::active", self._on_compare_toggled)
+        self._compare_title = Gtk.Label()
+        self._compare_hint = Gtk.Label()
+        card.append(
+            self._settings_row(
+                self._compare_title, self._compare_hint, self._compare_switch
+            )
+        )
+
+        card.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # Split position only means something while A|B is on; the row dims
+        # instead of staying a full-width control when the switch is off.
+        self._split_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._split_row.add_css_class("beauty-split-row")
+        split_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._split_label = Gtk.Label()
+        self._split_label.add_css_class("split-title")
+        self._split_label.set_xalign(0.0)
+        self._split_label.set_hexpand(True)
+        self._split_value = Gtk.Label(
+            label=percent_value_text(self.config.beauty.split)
+        )
+        self._split_value.add_css_class("split-value")
+        self._split_value.set_xalign(1.0)
+        split_top.append(self._split_label)
+        split_top.append(self._split_value)
+        self._split_row.append(split_top)
+        self._split = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.1, 0.9, 0.05
+        )
+        self._split.set_value(self.config.beauty.split)
+        self._split.set_draw_value(False)
+        self._split.set_hexpand(True)
+        self._split.connect("value-changed", self._on_split_changed)
+        self._split_row.append(self._split)
+        card.append(self._split_row)
+
+        card.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        self._faces_switch = Gtk.Switch()
+        self._faces_switch.set_active(self._show_faces)
+        self._faces_switch.connect("notify::active", self._on_show_faces_toggled)
+        self._faces_label = Gtk.Label()
+        self._faces_hint = Gtk.Label()
+        card.append(
+            self._settings_row(self._faces_label, self._faces_hint, self._faces_switch)
+        )
+        return card
+
+    def _settings_row(
+        self, title: Gtk.Label, hint: Gtk.Label, control: Gtk.Widget
+    ) -> Gtk.Widget:
+        """One card line: title + faint subtitle on the left, switch right."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row.add_css_class("settings-row")
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text.set_hexpand(True)
+        title.set_xalign(0.0)
+        title.add_css_class("settings-title")
+        hint.set_xalign(0.0)
+        hint.add_css_class("settings-hint")
+        text.append(title)
+        text.append(hint)
+        control.set_valign(Gtk.Align.CENTER)
+        row.append(text)
+        row.append(control)
+        return row
+
+    def _build_beauty_more(self) -> Gtk.Widget:
+        """Collapsed "More settings" card: the experimental warp sliders."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        self._more_button = Gtk.ToggleButton()
+        self._more_button.add_css_class("beauty-more-row")
+        self._more_button.set_hexpand(True)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._more_title = Gtk.Label()
+        self._more_title.add_css_class("beauty-more-title")
+        self._more_title.set_xalign(0.0)
+        self._more_hint = Gtk.Label()
+        self._more_hint.add_css_class("beauty-more-hint")
+        self._more_hint.set_xalign(1.0)
+        self._more_hint.set_hexpand(True)
+        self._more_chevron = Gtk.Label(label="▸")
+        self._more_chevron.add_css_class("beauty-more-chevron")
+        row.append(self._more_title)
+        row.append(self._more_hint)
+        row.append(self._more_chevron)
+        self._more_button.set_child(row)
+        self._more_button.connect("toggled", self._on_beauty_more_toggled)
+        box.append(self._more_button)
+
+        self._more_revealer = Gtk.Revealer()
+        self._more_revealer.set_transition_type(
+            Gtk.RevealerTransitionType.SLIDE_DOWN
+        )
+        self._more_revealer.set_transition_duration(160)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content.set_margin_top(8)
+
+        self._experimental_label = Gtk.Label()
+        self._experimental_label.set_xalign(0.0)
+        self._experimental_label.add_css_class("experimental-heading")
+        content.append(self._experimental_label)
+
+        self._face_slim = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
+        )
+        self._face_slim.set_value(self.config.beauty.face_slim)
+        self._face_slim.set_draw_value(False)
+        self._face_slim.set_hexpand(True)
+        self._face_slim.connect("value-changed", self._on_face_slim_changed)
+        self._face_slim_label = Gtk.Label()
+        self._face_slim_value = Gtk.Label(
+            label=slider_value_text(self.config.beauty.face_slim)
+        )
+        content.append(
+            _slider_block(self._face_slim_label, self._face_slim, self._face_slim_value)
+        )
+
+        self._eye_enlarge = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
+        )
+        self._eye_enlarge.set_value(self.config.beauty.eye_enlarge)
+        self._eye_enlarge.set_draw_value(False)
+        self._eye_enlarge.set_hexpand(True)
+        self._eye_enlarge.connect("value-changed", self._on_eye_enlarge_changed)
+        self._eye_enlarge_label = Gtk.Label()
+        self._eye_enlarge_value = Gtk.Label(
+            label=slider_value_text(self.config.beauty.eye_enlarge)
+        )
+        content.append(
+            _slider_block(
+                self._eye_enlarge_label, self._eye_enlarge, self._eye_enlarge_value
+            )
+        )
+
+        self._experimental_note_label = Gtk.Label()
+        self._experimental_note_label.set_xalign(0.0)
+        self._experimental_note_label.set_wrap(True)
+        self._experimental_note_label.add_css_class("dim-label")
+        content.append(self._experimental_note_label)
+
+        self._more_revealer.set_child(content)
+        box.append(self._more_revealer)
+        return box
+
+    def _on_beauty_more_toggled(self, button: Gtk.ToggleButton) -> None:
+        opened = button.get_active()
+        self._more_revealer.set_reveal_child(opened)
+        self._more_chevron.set_text("▾" if opened else "▸")
 
     def _install_page_wheel_scroll(self, scale: Gtk.Scale) -> None:
         """Make the wheel over a sidebar scale scroll the sidebar page."""
@@ -554,48 +1680,506 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _apply_language(self) -> None:
         """Retranslate every long-lived widget after a language change."""
         t = self._t
-        if self._current_path is not None:
-            self.set_title(t("title_with_media", name=self._current_path.name))
-        else:
-            self.set_title(t("app_title"))
+        self._update_title()
 
-        self._open_button.set_label(t("open"))
+        self._open_label.set_text(t("open"))
         self._open_button.set_tooltip_text(t("open_tooltip"))
-        self._compare_button.set_label(t("compare"))
-        self._compare_button.set_tooltip_text(t("compare_tooltip"))
         self._language_button.set_label(t("switch_language"))
         self._language_button.set_tooltip_text(t("switch_language_tooltip"))
 
-        self._placeholder.set_text(t("placeholder"))
+        self._empty_title.set_text(t("empty_title"))
+        self._empty_subtitle.set_text(t("empty_subtitle"))
+        self._empty_file_button.set_label(t("empty_choose_file"))
+        self._empty_folder_button.set_label(t("empty_choose_folder"))
+        self._empty_hint.set_text(t("empty_drop_hint"))
+        for label, key in zip(
+            self._capability_labels,
+            ("empty_chip_vpu", "empty_chip_npu", "empty_chip_beauty"),
+        ):
+            label.set_text(t(key))
+
+        self._recents_title.set_text(t("recents"))
         self._playlist_title.set_text(t("playlist"))
-        self._beauty_title.set_text(t("beauty"))
-        self._auto_beauty_label.set_text(t("auto_beauty"))
+        self._playlist_empty.set_text(t("playlist_empty"))
+        self._playlist_add_button.set_label(t("playlist_add"))
+        self._sidebar_shortcuts.set_text(t("sidebar_shortcuts"))
+        # Row captions (the time range) are translated too.
+        self._sync_recents()
+        self._decode_row.set_tooltip_text(t("decode_mode"))
+        for mode, segment in self._decode_buttons.items():
+            segment.set_label(t(f"decode_{mode}"))
+        self._tab_playlist.set_label(t("playlist"))
+        self._tab_beauty.set_label(t("beauty"))
+        self._beauty_header.set_text(t("beauty"))
+        self._sidebar_button.set_tooltip_text(t("toggle_sidebar"))
         self._smoothing_label.set_text(t("smoothing"))
         self._whitening_label.set_text(t("whitening"))
-        self._compare_label.set_text(t("original_beautified"))
+        self._beauty_settings_heading.set_text(t("beauty_settings"))
+        self._compare_title.set_text(t("compare_split"))
+        self._compare_hint.set_text(t("compare_split_hint"))
+        self._compare_switch.set_tooltip_text(t("compare_tooltip"))
         self._split_label.set_text(t("split_position"))
         self._faces_label.set_text(t("show_face_boxes"))
+        self._faces_hint.set_text(t("show_face_boxes_hint"))
         self._note_label.set_text(t("note"))
-        self._experimental_expander.set_label(t("experimental"))
+        self._beauty_cascade.set_text(t("beauty_cascade"))
+        self._more_title.set_text(t("beauty_more"))
+        self._more_hint.set_text(t("beauty_more_hint"))
+        self._experimental_label.set_text(t("experimental"))
         self._face_slim_label.set_text(t("face_slim"))
         self._eye_enlarge_label.set_text(t("eye_enlarge"))
         self._experimental_note_label.set_text(t("experimental_note"))
+        self._beauty_shortcuts.set_text(t("beauty_shortcuts"))
+        self._face_overlay.set_caption(t("face_prefix"))
+        self._sync_beauty_toggles()
+        self._sync_compare_toggles()
+        self._sync_beauty_page_state()
+        self._back_button.set_tooltip_text(t("library_back"))
+        self._browse.apply_language(self._t)
+        self._sync_page_chrome()
 
         self._play_button.set_tooltip_text(t("play_pause"))
+        self._stop_button.set_tooltip_text(t("stop_playback"))
         self._prev_button.set_tooltip_text(t("previous"))
         self._next_button.set_tooltip_text(t("next"))
         self._seek.set_tooltip_text(t("seek"))
         self._volume.set_tooltip_text(t("volume"))
         self._speed.set_tooltip_text(t("speed"))
-        self._fullscreen_button.set_tooltip_text(t("fullscreen"))
+        self._refresh_fullscreen_button()
+        self._subtitle_button.set_tooltip_text(t("subtitles_tooltip"))
+        self._subtitles_menu_label.set_text(t("show_subtitles"))
+        self._open_subtitle_button.set_label(t("open_subtitle"))
+        self._audio_label.set_text(t("audio_track"))
+        self._refresh_subtitle_status()
+        self._refresh_audio_tracks()
 
-        self._refresh_params_label()
+        info_label_keys = {
+            "format": "info_resolution",
+            "codec": "info_codec",
+            "decode": "info_decode",
+            "fps": "info_fps",
+        }
+        for key, label in self._info_labels.items():
+            label.set_text(t(info_label_keys[key]))
+        self._refresh_beauty_status()
         if self.backend.has_media:
             self._update_info_label()
         else:
-            self._info_label.set_text(t("info_placeholder"))
+            self._reset_info_chips()
+        self._sync_compare_overlay()
         if self._hint_key is not None:
             self._hint_label.set_text(t(self._hint_key, **self._hint_values))
+        self._render_playback_status()
+
+    def _set_playback_status(self, status: str | None, message: str = "") -> None:
+        self._playback_status = status
+        self._playback_status_message = message
+        self._render_playback_status()
+        builder = self._canvas_builder
+        if builder is not None:
+            builder.refresh(("playback-status",))
+
+    def _render_playback_status(self) -> None:
+        """Refresh the status card text, actions, and visibility for current state."""
+        if not hasattr(self, "_status_card"):
+            return
+        status = self._playback_status
+        self._sync_chrome_visibility()
+        if status is None:
+            self._status_spinner.stop()
+            self._status_card.set_visible(False)
+            return
+
+        t = self._t
+        state_classes = (
+            "status-loading",
+            "status-paused",
+            "status-error",
+            "status-ended",
+        )
+        for css_class in state_classes:
+            self._status_card.remove_css_class(css_class)
+        self._status_icon.remove_css_class("status-error-symbol")
+        self._status_card.add_css_class(f"status-{status}")
+
+        title_keys = {
+            "loading": "status_loading_title",
+            "paused": "status_paused_title",
+            "error": "status_error_title",
+            "ended": "status_ended_title",
+        }
+        message_keys = {
+            "loading": "status_loading_message",
+            "paused": "status_paused_message",
+            "error": "status_error_message",
+            "ended": "status_ended_message",
+        }
+        icon_names = {
+            "paused": "media-playback-start-symbolic",
+            "error": "dialog-error-symbolic",
+            "ended": "media-playback-stop-symbolic",
+        }
+        if status not in title_keys:
+            raise ValueError(f"unknown playback status: {status!r}")
+
+        self._status_title.set_text(t(title_keys[status]))
+        self._status_message.set_text(
+            self._playback_status_message or t(message_keys[status])
+        )
+        is_loading = status == "loading"
+        self._status_spinner.set_visible(is_loading)
+        if is_loading:
+            self._status_spinner.start()
+            self._status_icon.set_visible(False)
+        else:
+            self._status_spinner.stop()
+            self._status_icon.set_from_icon_name(icon_names[status])
+            self._status_icon.set_visible(True)
+        if status == "error":
+            self._status_icon.add_css_class("status-error-symbol")
+
+        primary_keys = {
+            "paused": "resume_playback",
+            "error": "retry_playback",
+            "ended": "replay_video",
+        }
+        primary_key = primary_keys.get(status)
+        self._status_primary_button.set_visible(primary_key is not None)
+        self._status_secondary_button.set_visible(status in ("error", "ended"))
+        self._status_actions.set_visible(primary_key is not None)
+        if primary_key is not None:
+            self._status_primary_button.set_label(t(primary_key))
+        self._status_secondary_button.set_label(t("return_to_playlist"))
+        self._status_card.set_visible(True)
+
+    def _sync_chrome_visibility(self) -> None:
+        """Show the empty drop zone or the playback chrome for the current state.
+
+        The v3 empty state has no transport at all: no clip means no progress,
+        volume or decode controls to operate.  Loading / error cards hide the
+        drop zone so two empty-state panels never stack.
+        """
+        if not hasattr(self, "_empty_state"):
+            return
+        state = chrome_state(self.backend.has_media, self._playback_status)
+        self._empty_state.set_visible(state.empty)
+        self._controls_bar.set_visible(state.transport)
+        self._info_bar.set_visible(
+            state.info
+            and bool(self.config.debug.show_info_panel)
+            and not self._immersive
+        )
+        if hasattr(self, "_fullscreen_progress"):
+            self._fullscreen_progress.set_visible(self._immersive and state.info)
+
+    def _sync_compare_overlay(self) -> None:
+        """Feed the split captions from the live beauty config and frame size."""
+        if not hasattr(self, "_compare_overlay"):
+            return
+        beauty = self.config.beauty
+        info = self.backend.video_info
+        frame_width = float(info.get("width") or 0)
+        frame_height = float(info.get("height") or 0)
+        visible = bool(
+            self.backend.has_media
+            and beauty.compare_mode
+            and beauty.enabled
+            and frame_width > 0
+            and frame_height > 0
+        )
+        params = BeautyParams.from_config(beauty)
+        params_text = self._t(
+            "compare_params",
+            smoothing=params.smoothing,
+            whitening=params.whitening,
+        )
+        self._compare_overlay.set_state(
+            visible=visible,
+            split=float(beauty.split),
+            frame_width=frame_width,
+            frame_height=frame_height,
+            labels=(self._t("compare_original"), self._t("compare_beautified")),
+            params=params_text if visible else "",
+        )
+
+    def _sync_beauty_toggles(self) -> None:
+        """Mirror beauty state into the page switch and the dock pill.
+
+        The pill carries the state in its label ("美颜 · 开 / 关"): the dock is
+        the only entrance in fullscreen and a checked tint alone is easy to
+        miss on a 1280 px panel.
+        """
+        if self._updating_toggles:
+            return
+        enabled = bool(self.config.beauty.enabled)
+        self._updating_toggles = True
+        try:
+            if self._beauty_switch.get_active() != enabled:
+                self._beauty_switch.set_active(enabled)
+            if self._dock_beauty_button.get_active() != enabled:
+                self._dock_beauty_button.set_active(enabled)
+        finally:
+            self._updating_toggles = False
+        self._dock_beauty_button.set_label(
+            self._t("beauty_pill_on" if enabled else "beauty_pill_off")
+        )
+
+    def _sync_compare_toggles(self) -> None:
+        """Mirror compare state into the A|B switch and the dock pill.
+
+        A|B needs beauty, so the fullscreen pill stays visible but disabled
+        while the effect is off, labelled "对比 · 需美颜" (v4 mockup).
+        """
+        if self._updating_toggles:
+            return
+        state = beauty_page_state(
+            enabled=self.config.beauty.enabled,
+            compare_mode=self.config.beauty.compare_mode,
+            show_faces=self._show_faces,
+        )
+        self._updating_toggles = True
+        try:
+            if self._compare_switch.get_active() != state.compare:
+                self._compare_switch.set_active(state.compare)
+            if self._dock_compare_button.get_active() != state.compare:
+                self._dock_compare_button.set_active(state.compare)
+        finally:
+            self._updating_toggles = False
+        self._dock_compare_button.set_sensitive(state.dock_compare_sensitive)
+        self._dock_compare_button.set_label(self._t(state.dock_compare_label))
+
+    def _sync_beauty_page_state(self) -> None:
+        """Grey the beauty page while its master switch is off (v4).
+
+        The switch itself stays live; everything it owns (strengths, the
+        settings card, the experimental expander) drops to 34 % and becomes
+        insensitive, and the cascade notice replaces the footer note.
+        """
+        if not hasattr(self, "_beauty_body"):
+            return
+        state = beauty_page_state(
+            enabled=self.config.beauty.enabled,
+            compare_mode=self.config.beauty.compare_mode,
+            show_faces=self._show_faces,
+        )
+        if state.page_off:
+            self._beauty_page.add_css_class("is-off")
+        else:
+            self._beauty_page.remove_css_class("is-off")
+        self._beauty_body.set_sensitive(state.body_sensitive)
+        self._beauty_body.set_opacity(state.body_opacity)
+        self._beauty_cascade.set_visible(state.cascade_visible)
+        self._note_label.set_visible(state.note_visible)
+        self._split_row.set_sensitive(state.split_sensitive)
+        self._split_row.set_opacity(state.split_opacity)
+        self._refresh_beauty_status()
+
+    def _refresh_beauty_status(self) -> None:
+        """Status line under the page title: GPU time while on, cascade while off."""
+        beauty = self.config.beauty
+        if not beauty.enabled:
+            text = self._t("beauty_status_off")
+        elif self.backend.beauty_available:
+            text = self._t("beauty_status_on", ms=self.backend.beauty_ms)
+        else:
+            text = self._t("beauty_status_on_pending")
+        self._beauty_status_label.set_text(text)
+
+    def _set_beauty_enabled(self, enabled: bool) -> None:
+        """Apply beauty from either entrance and cascade its dependants.
+
+        v4: turning the master switch off also turns off the A|B split, the
+        face boxes and (already) the effect.  Re-enabling beauty deliberately
+        does not restore the split or the boxes; they stay off until the user
+        asks for them again.
+        """
+        cascade = bool(self.config.beauty.compare_mode or self._show_faces)
+        # The helper is the single definition of the cascade: with beauty off
+        # A|B and the boxes read as off, so they are written back that way.
+        state = beauty_page_state(
+            enabled=enabled,
+            compare_mode=self.config.beauty.compare_mode,
+            show_faces=self._show_faces,
+        )
+        self._updating_toggles = True
+        try:
+            self.config.beauty.enabled = state.enabled
+            self.config.beauty.compare_mode = state.compare
+            self._show_faces = state.faces
+            if not state.enabled:
+                self._compare_switch.set_active(False)
+                self._dock_compare_button.set_active(False)
+                self._faces_switch.set_active(False)
+                self._face_overlay.set_faces((), 0.0, 0.0)
+            self._beauty_switch.set_active(state.enabled)
+            self._dock_beauty_button.set_active(state.enabled)
+        finally:
+            self._updating_toggles = False
+        self._refresh_beauty()
+        self._on_detection_dependency_toggled()
+        self._sync_beauty_page_state()
+        self._sync_beauty_toggles()
+        self._sync_compare_toggles()
+        log_action("beauty", enabled=enabled, cascade=cascade)
+
+    def _set_compare_enabled(self, enabled: bool) -> None:
+        """Apply A|B from either entrance; it is only available with beauty on.
+
+        v3 silently turned beauty on when A|B was enabled.  In v4 the split
+        lives inside the beauty page and the dock pill reads "需美颜", so the
+        gate refuses instead of switching on an effect the user turned off.
+        """
+        if enabled and not self.config.beauty.enabled:
+            self._updating_toggles = True
+            try:
+                self._compare_switch.set_active(False)
+                self._dock_compare_button.set_active(False)
+            finally:
+                self._updating_toggles = False
+            self._set_hint_key("compare_requires_beauty")
+            self._sync_compare_toggles()
+            return
+        self._updating_toggles = True
+        try:
+            self.config.beauty.compare_mode = enabled
+            self._compare_switch.set_active(enabled)
+            self._dock_compare_button.set_active(enabled)
+        finally:
+            self._updating_toggles = False
+        self._refresh_beauty()
+        self._sync_beauty_page_state()
+        self._sync_compare_toggles()
+        log_action("compare", enabled=enabled)
+
+    def _on_dock_beauty_toggled(self, button: Gtk.ToggleButton) -> None:
+        if self._updating_toggles:
+            return
+        self._set_beauty_enabled(button.get_active())
+
+    def _on_dock_compare_toggled(self, button: Gtk.ToggleButton) -> None:
+        if self._updating_toggles:
+            return
+        self._set_compare_enabled(button.get_active())
+
+    def _on_files_dropped(self, _target, value, _x: float, _y: float) -> bool:
+        """Drop target on the picture: files and folders feed the playlist."""
+        self._dropzone.remove_css_class("drag-active")
+        paths: list[Path] = []
+        try:
+            files = value.get_files()
+        except (AttributeError, TypeError):
+            files = []
+        for file in files:
+            path = file.get_path()
+            if path:
+                paths.append(Path(path))
+        self._add_dropped_paths(paths)
+        return True
+
+    def _on_drop_enter(self, *_args: object) -> int:
+        self._dropzone.add_css_class("drag-active")
+        return int(Gdk.DragAction.COPY)
+
+    def _on_drop_leave(self, *_args: object) -> None:
+        self._dropzone.remove_css_class("drag-active")
+
+    def _add_dropped_paths(self, paths: list[Path]) -> None:
+        if not paths:
+            self._set_hint_key("drop_empty")
+            return
+        try:
+            media = expand_media_args(paths)
+        except ValueError:
+            self._set_hint_key("drop_empty")
+            return
+        if not media:
+            self._set_hint_key("drop_empty")
+            return
+        for path in media:
+            self.playlist.add(path)
+        self._sync_playlist()
+        log_action("drop_media", count=len(media))
+        self._play_path(media[0])
+
+    def _on_open_folder_clicked(self, _button: Gtk.Button) -> None:
+        log_action("open_folder_dialog")
+        dialog = Gtk.FileDialog(title=self._t("open_folder"))
+        dialog.select_folder(self, None, self._on_folder_chosen)
+
+    def _on_folder_chosen(
+        self, dialog: Gtk.FileDialog, result: Gio.AsyncResult
+    ) -> None:
+        try:
+            gfile = dialog.select_folder_finish(result)
+        except GLib.Error:
+            log_action("open_folder_cancelled")
+            return
+        if gfile is None:
+            return
+        path_text = gfile.get_path()
+        if not path_text:
+            return
+        try:
+            media = expand_media_args([Path(path_text)])
+        except ValueError:
+            media = []
+        if not media:
+            self._set_hint_key("folder_empty")
+            return
+        for path in media:
+            self.playlist.add(path)
+        self._sync_playlist()
+        log_action("open_folder_selected", count=len(media))
+        self._play_path(media[0])
+
+    def _on_status_primary_clicked(self, _button: Gtk.Button) -> None:
+        if self._playback_status == "paused":
+            self._on_play_clicked(None)
+        elif self._playback_status in ("error", "ended"):
+            self._retry_playback()
+
+    def _on_status_secondary_clicked(self, _button: Gtk.Button) -> None:
+        # "Back to the list" means the library in the v5 shell.
+        self._show_page("browse")
+
+    def _retry_playback(self) -> None:
+        path = self._playback_path or self._current_path
+        if path is not None:
+            self._play_path(path)
+
+    def _return_to_playlist(self) -> None:
+        log_action("return_to_playlist")
+        if self._recorder is not None:
+            self._stop_recording()
+        # "Back to the playlist" is still leaving a clip mid-way, so the history
+        # and the resume position must see it before the pipeline goes away.
+        self._save_resume_position(remember=True)
+        self.backend.close()
+        self._current_path = None
+        self._playback_path = None
+        self._playback_started = False
+        self._fps = 0.0
+        self._duration_ns = 0
+        self._faces = ()
+        self._detection_error = None
+        self._face_overlay.set_faces((), 0.0, 0.0)
+        self._picture.set_paintable(None)
+        self._updating_seek = True
+        self._seek.set_value(0)
+        self._updating_seek = False
+        self._set_timecode("00:00 / 00:00")
+        self._update_title()
+        self._update_play_icon(False)
+        self._reset_info_chips()
+        self._set_playback_status(None)
+        self._sync_playlist()
+
+    def _on_sidebar_toggled(self, button: Gtk.ToggleButton) -> None:
+        """Collapse the sidebar so the video can take the full width."""
+        sidebar = self._paned.get_end_child()
+        if sidebar is not None:
+            sidebar.set_visible(button.get_active())
+        log_action("sidebar_toggle", visible=button.get_active())
 
     def _on_language_clicked(self, _button: Gtk.Button) -> None:
         self._t.toggle()
@@ -607,19 +2191,138 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._apply_language()
         log_action("language", lang=self._t.language)
 
+    # -- pages (ui-v5 browse shell) -------------------------------------
+
+    def _show_page(self, page: str, *, refresh: bool = True) -> None:
+        """Switch between the browse shell and the player.
+
+        Browsing means the clip is over, so returning to the shell persists the
+        resume position and the history, closes the pipeline and clears the
+        player chrome — the same work "back to playlist" always did.  The
+        browse shell remembers which of its pages (home / library / detail) the
+        player was opened from, so "back" lands there.
+        """
+        if page not in PAGE_NAMES:
+            raise ValueError(f"unknown page: {page!r}")
+        if page == "browse":
+            # Clears playback, the error card and the recording overlay in one
+            # place; safe without media because every step is a no-op then.
+            self._return_to_playlist()
+        changed = page != self._page
+        self._page = page
+        self._stack.set_visible_child_name(page)
+        if page == "browse":
+            self._browse.activate()
+        else:
+            self._browse.mark_player_origin()
+        self._sync_page_chrome()
+        if page == "player":
+            # Probing decodes video; the player page must own the VPU.
+            self._browse.suspend()
+        if changed:
+            log_action("page", page=page)
+        if page == "browse" and refresh:
+            GLib.idle_add(self._refresh_browse)
+
+    def _refresh_browse(self) -> bool:
+        if not self._closed:
+            self._browse.refresh()
+        return GLib.SOURCE_REMOVE
+
+    def _on_library_changed(self) -> None:
+        """The browse shell re-scanned or changed pages: refresh the header."""
+        if self._page == "browse":
+            self._sync_page_chrome()
+
+    def _on_library_dropped(self, paths: Sequence[Path]) -> None:
+        """Video files dropped on a browse page become the playlist."""
+        if not paths:
+            return
+        log_action("library_drop", count=len(paths))
+        self._play_paths(paths, 0)
+
+    def _on_back_clicked(self, _button: Gtk.Button) -> None:
+        log_action("back_to_browse")
+        self._show_page("browse")
+
+    def _play_paths(
+        self,
+        paths: Sequence[Path],
+        index: int = 0,
+        start_position_ns: int | None = None,
+    ) -> None:
+        """Play *paths* from *index*; the list the user sees is the playlist.
+
+        The home rows pass their own four cards, the detail page passes the
+        folder's episodes and a dropped set of files passes itself, so
+        previous/next and auto-advance always walk the list the viewer was
+        looking at when the clip started.
+        """
+        files = [Path(path) for path in paths]
+        if not files:
+            return
+        index = max(0, min(int(index), len(files) - 1))
+        self.playlist = Playlist(files)
+        try:
+            self.playlist.select(index)
+        except IndexError:
+            pass
+        log_action("browse_play", path=str(files[index]), count=len(files))
+        self._show_page("player", refresh=False)
+        if start_position_ns is None:
+            self._play_path(files[index])
+        else:
+            # The detail page's "replay" must ignore the stored resume point.
+            self._play_path(files[index], start_position_ns=start_position_ns)
+
+    def _sync_page_chrome(self) -> None:
+        """Header follows the page: title, subtitle and window actions."""
+        browse = self._page == "browse"
+        self._back_button.set_visible(not browse)
+        self._sidebar_button.set_visible(not browse)
+        if browse:
+            title, text = self._browse.headline()
+            self._title_label.set_text(title)
+            self.set_title(self._t("app_title"))
+            self._header_subtitle_label.set_text(text)
+            self._header_subtitle_label.set_visible(True)
+            self._header_subtitle_cache = text
+        else:
+            self._header_subtitle_cache = ""
+            self._update_title()
+
     # -- playback -------------------------------------------------------
 
     def _apply_demo_mode(self) -> None:
         if not self.demo:
             return
-        self._info_label.set_visible(True)
+        self._info_bar.set_visible(True)
+        # Beauty is off by default (player first), but --demo is the explicit
+        # beauty showcase.  With u_active=0 the shader returns the untouched
+        # frame before drawing the F9 divider, so the compare view would be a
+        # plain picture if we did not opt in here.
+        self.config.beauty.enabled = True
+        self._beauty_switch.set_active(True)
+        # Beauty's oval mask is built from the NPU boxes, so the demo has to
+        # opt into detection too.  This runs before open(), while the warm-up
+        # is still safe (pre-PLAYING, on the main thread).
+        self.config.detection.enabled = True
         # F9: the demo mode always shows the original/beautified split.
         self.config.beauty.compare_mode = True
         self._compare_switch.set_active(True)
-        self._compare_button.set_active(True)
         self._faces_switch.set_active(True)
+        # On stage the operator drives the sliders live, so "More settings" is
+        # open in demo mode even though it is collapsed by default.
+        self._more_button.set_active(True)
+        # v4: the showcase starts on the beauty page; the playlist tab is one
+        # click away and --demo is the only mode that promotes it this way.
+        self._set_sidebar_tab("beauty")
         self.backend.refresh_beauty()
-        self._refresh_params_label()
+        self._refresh_beauty_status()
+        self._sync_compare_overlay()
+        self._sync_beauty_toggles()
+        self._sync_compare_toggles()
+        self._sync_beauty_page_state()
 
     def _start_index(self, index: int) -> bool:
         try:
@@ -629,35 +2332,162 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._play_path(path)
         return False
 
-    def _play_path(self, path: Path) -> None:
+    def _detection_needed(self) -> bool:
+        """True when any NPU-backed feature is on (or explicitly requested)."""
+        return bool(
+            self._detection_opted_in
+            or self.demo
+            or self.config.beauty.enabled
+            or self._show_faces
+        )
+
+    def _sync_detection_need(self) -> None:
+        """Resolve whether this ``open()`` should prepare the NPU detector.
+
+        Detection costs a ~1.7 s synchronous warm-up (model load + one large
+        dummy inference) on the GTK main thread, paid before PLAYING.  A plain
+        player must not pay it, so the shipped default is off; --demo and the
+        beauty/face-box switches request it.  It is deliberately resolved here,
+        right before ``backend.open()``, and never while a pipeline is live:
+        warming the NPU with decoder/GL buffers alive aborts librknnrt on the
+        RK3576 with ``std::bad_alloc``.
+        """
+        self.config.detection.enabled = self._detection_needed()
+
+    def _on_detection_dependency_toggled(self) -> None:
+        """Start the NPU when a dependent switch is turned on mid-playback.
+
+        The warm-up must happen before the new pipeline goes to PLAYING (see
+        :meth:`_sync_detection_need`), so a live clip is reopened from its
+        current position.  Only warning about "the next clip" left the beauty
+        switch lit with no face box for the shader to paint: on the board that
+        read as "beauty is on but nothing happens".
+        """
+        needed = self._detection_needed()
+        if not needed:
+            self._cancel_detection_reopen()
+            if self._hint_key == "detection_enabling":
+                self._set_hint_key(None)
+            return
+        if self.config.detection.enabled:
+            self._cancel_detection_reopen()
+            return
+        if not self.backend.has_media:
+            # Nothing open yet: the next _play_path() resolves detection.
+            return
+        path = self._playback_path or self._current_path
+        if path is None:
+            # Media without a path should not happen, but a staged rebuild is
+            # still better than pretending detection is already live.
+            self._set_hint_key("detection_pending")
+            return
+        # Capture the position while the live pipeline is still alive, then
+        # rebuild on idle: tearing down the pipeline (and its bus) inside the
+        # switch's own notify::active emission is the failure documented in
+        # PITFALLS.md.
+        position_ns = max(0, int(self.backend.position_ns()))
+        self._cancel_detection_reopen()
+        self._detection_reopen_id = GLib.idle_add(
+            self._reopen_for_detection, path, position_ns
+        )
+        self._set_hint_key("detection_enabling")
+
+    def _cancel_detection_reopen(self) -> None:
+        """Drop a queued detection rebuild (the switches changed again)."""
+        if self._detection_reopen_id:
+            GLib.source_remove(self._detection_reopen_id)
+            self._detection_reopen_id = 0
+
+    def _reopen_for_detection(self, path: Path, position_ns: int) -> bool:
+        """Idle callback: rebuild once the toggle's signal has returned."""
+        self._detection_reopen_id = 0
+        if self._closed or not self._detection_needed():
+            return GLib.SOURCE_REMOVE
+        if (self._playback_path or self._current_path) != path:
+            # Another clip was opened while this rebuild was queued; that open
+            # already resolved detection from the same switches.
+            return GLib.SOURCE_REMOVE
+        if not self.backend.has_media:
+            return GLib.SOURCE_REMOVE
+        self._play_path(path, start_position_ns=position_ns, keep_hint=True)
+        return GLib.SOURCE_REMOVE
+
+    def _play_path(
+        self,
+        path: Path,
+        *,
+        start_position_ns: int | None = None,
+        keep_hint: bool = False,
+    ) -> None:
+        """Open ``path``, optionally at an explicit position instead of resume.
+
+        ``keep_hint`` leaves the current toast alone: the detection rebuild
+        sets "正在启用人脸检测" just before this call and must not replace it
+        with the resume confirmation.
+        """
         log_action("play_path", path=path)
+        self._cancel_detection_reopen()
+        # Persist the outgoing clip first: ``position_ns()`` is only meaningful
+        # while the old pipeline is still alive.
+        self._save_resume_position(remember=True)
+        resume_ns = self._resume_target_ns(path, start_position_ns)
+        self._playback_path = path
+        self._current_path = path
+        self._update_title()
+        self._apply_subtitle(find_sidecar(path))
+        self._playback_started = False
+        self._fps = 0.0
+        self._duration_ns = 0
+        self._detection_ms = 0.0
+        self._detection_error = None
+        self._faces = ()
+        self._face_overlay.set_faces((), 0.0, 0.0)
+        self._picture.set_paintable(None)
+        self._reset_info_chips()
+        self._set_timecode("00:00 / 00:00")
+        self._updating_seek = True
+        self._seek.set_value(0)
+        self._updating_seek = False
+
         if not path.exists():
+            self.backend.close()
+            self._current_path = None
+            self._update_title()
             self._show_error(self._t("media_file_not_found", path=path))
             return
+        self._set_playback_status("loading")
+        self._sync_detection_need()
         list_index = self.playlist.add(path)
         self.playlist.select(list_index)
         try:
-            self.backend.open(path, autoplay=True)
+            self.backend.open(path, autoplay=True, start_position_ns=resume_ns)
         except PlaybackError as exc:
             self._show_error(str(exc))
             return
         log_action("play_path_ok", path=path)
-        self._fps = 0.0
-        self._faces = ()
-        self._detection_ms = 0.0
-        self._detection_error = None
-        self._face_overlay.set_faces((), 0.0, 0.0)
         paintable = self.backend.paintable
         if paintable is not None:
             self._picture.set_paintable(paintable)
-            self._placeholder.set_visible(False)
         self._sync_playlist()
+        # Opening a file is what makes it recent; the stored duration is
+        # unknown at this point, touch() keeps whatever it had before.
+        if self._recents is not None:
+            self._remember_recent(path, resume_ns, 0)
         self._update_play_icon(True)
         self._current_path = path
         self.set_title(self._t("title_with_media", name=path.name))
-        self._set_hint_key(None)
+        if not keep_hint:
+            if resume_ns > 0:
+                # Confirm the jump: a player that silently starts at 00:12 looks
+                # broken on a demo table.
+                self._set_hint_key("resumed_from", time=_format_time(resume_ns))
+            else:
+                self._set_hint_key(None)
 
     def _on_play_clicked(self, _button: Gtk.Button | None) -> None:
+        if self._playback_status == "error":
+            self._retry_playback()
+            return
         if not self.backend.has_media:
             if self.playlist:
                 self._start_index(0)
@@ -665,8 +2495,109 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 self._on_open_clicked(self._open_button)
             return
         self.backend.toggle_play()
-        self._update_play_icon(self.backend.is_playing)
-        log_action("play_toggle", playing=self.backend.is_playing)
+        playing = self.backend.is_playing
+        self._update_play_icon(playing)
+        # Pausing stays silent too: the card used to cover the very frame the
+        # operator was looking at, and the transport icon already says it.
+        self._set_playback_status(None)
+        if self._hint_key == "hint_finished":
+            self._set_hint_key(None)
+        log_action("play_toggle", playing=playing)
+
+    def _on_stop_clicked(self, _button: Gtk.Button) -> None:
+        """Stop the current clip and rewind it to 00:00."""
+        log_action("stop")
+        if not self.backend.has_media:
+            if self.playlist:
+                self._start_index(0)
+            return
+        # Stopping is the opposite of resuming: drop the stored position so the
+        # next launch starts at 00:00 instead of jumping back into the clip, and
+        # reset the row in "recently played" to match.
+        path = self._playback_path or self._current_path
+        if path is not None:
+            self._remember_recent(path, 0, self._duration_ns)
+        self._clear_resume_position()
+        self._playback_started = False
+        self.backend.stop()
+        self._update_play_icon(False)
+        self._set_playback_status(None)
+        self._faces = ()
+        self._face_overlay.set_faces((), 0.0, 0.0)
+        self._updating_seek = True
+        self._seek.set_value(0)
+        self._updating_seek = False
+        self._set_timecode(f"00:00 / {_format_time(self._duration_ns)}")
+        self._set_progress_fraction(0.0)
+        self._set_hint_key("hint_stopped")
+
+    def _on_decode_toggled(self, button: Gtk.ToggleButton, mode: str) -> None:
+        if self._updating_decode:
+            return
+        if not button.get_active():
+            # GTK emits "toggled" for the segment it deactivates as well.  Never
+            # force it back on: re-activating it used to fight the radio group,
+            # leave two segments active and retrigger the signal until the row
+            # stopped responding after a single click.
+            return
+        if mode != self.config.player.decode_mode:
+            self.config.player.decode_mode = mode
+            log_action("decode_mode", mode=mode)
+            self._apply_decode_mode(mode)
+        # Re-assert the config as the single source of truth.  Programmatic
+        # set_active() calls below are guarded, so they cannot loop back here.
+        self._sync_decode_buttons()
+
+    def _sync_decode_buttons(self) -> None:
+        """Mirror ``config.player.decode_mode`` into the segments."""
+        self._updating_decode = True
+        try:
+            wanted = self.config.player.decode_mode
+            for mode, segment in self._decode_buttons.items():
+                if segment.get_active() != (mode == wanted):
+                    segment.set_active(mode == wanted)
+        finally:
+            self._updating_decode = False
+
+    def _apply_decode_mode(self, mode: str) -> None:
+        """Reopen the current clip so the new decode path takes effect."""
+        mode_label = self._t(f"decode_{mode}")
+        path = self._playback_path or self._current_path
+        if path is None or not self.backend.has_media:
+            # Nothing open yet: the new mode applies to the next file.
+            self._set_hint_key("decode_staged", mode=mode_label)
+            return
+        # _play_path persists the position before rebuilding and resumes from
+        # it, so the viewer keeps their place across the reopen.  Defer it to
+        # the next main-loop turn: this runs inside a "toggled" emission and
+        # tearing down the pipeline (and its bus) while GTK is still
+        # dispatching that signal is the failure documented in PITFALLS.md.
+        if self._decode_reopen_id:
+            GLib.source_remove(self._decode_reopen_id)
+            self._decode_reopen_id = 0
+        self._decode_reopen_id = GLib.idle_add(
+            self._reopen_for_decode_mode, mode, path
+        )
+        self._set_hint_key("decode_switched", mode=mode_label)
+
+    def _reopen_for_decode_mode(self, mode: str, path: Path) -> bool:
+        """Idle callback: rebuild once the click's signal has returned."""
+        self._decode_reopen_id = 0
+        if self._closed or mode != self.config.player.decode_mode:
+            # Window closed, or a newer click superseded this rebuild.
+            return GLib.SOURCE_REMOVE
+        self._play_path(path)
+        return GLib.SOURCE_REMOVE
+
+    def _on_decode_fallback(self, message: str) -> None:
+        """The backend dropped from the VPU to the CPU decoder on its own."""
+        log_action("decode_fallback", message=message)
+        # The pipeline is about to be rebuilt, so show the loading card again
+        # instead of leaving the last frame frozen.
+        self._set_playback_status("loading")
+        self._set_hint_key("decode_fallback", message=message[:80])
+        # A fallback is a warning, not a failure: amber, not red.
+        self._hint_label.add_css_class("warn-hint")
 
     def _on_previous_clicked(self, _button: Gtk.Button) -> None:
         if not self.backend.has_media:
@@ -693,11 +2624,28 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _on_seek_changed(self, scale: Gtk.Scale) -> None:
         if self._updating_seek or not self.backend.has_media:
             return
-        self.backend.seek_fraction(scale.get_value() / 1000.0)
+        fraction = max(0.0, min(1.0, scale.get_value() / 1000.0))
+        if self._duration_ns > 0:
+            target = int(self._duration_ns * fraction)
+            self._set_timecode(
+                f"{_format_time(target)} / {_format_time(self._duration_ns)}"
+            )
+        self.backend.seek_fraction(fraction)
+        self._set_progress_fraction(fraction)
 
     def _on_volume_changed(self, scale: Gtk.Scale) -> None:
-        self.config.player.volume = int(round(scale.get_value()))
-        self.backend.set_volume(self.config.player.volume)
+        volume = int(round(scale.get_value()))
+        self.config.player.volume = volume
+        self.backend.set_volume(volume)
+        self._volume_label.set_text(f"{volume}%")
+        icon = (
+            "audio-volume-muted-symbolic"
+            if volume == 0
+            else "audio-volume-low-symbolic"
+            if volume < 35
+            else "audio-volume-high-symbolic"
+        )
+        self._volume_icon.set_from_icon_name(icon)
 
     def _on_speed_changed(self, dropdown: Gtk.DropDown, _param: object) -> None:
         index = dropdown.get_selected()
@@ -705,65 +2653,292 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self.config.player.speed = SPEED_VALUES[index]
             self.backend.set_rate(SPEED_VALUES[index])
 
-    def _on_fullscreen_clicked(self, _button: Gtk.Button) -> None:
+    def _on_fullscreen_clicked(self, _button: Gtk.Button | None) -> None:
+        if self._page != "player":
+            return
         if self.is_fullscreen():
             self.unfullscreen()
             log_action("fullscreen", on=False)
         else:
             self.fullscreen()
             log_action("fullscreen", on=True)
+        self._sync_immersive()
+
+    # -- fullscreen HUD ---------------------------------------------------
+
+    def _sync_immersive(self) -> None:
+        """Enter or leave the fullscreen HUD, matching the window state.
+
+        ``--record`` runs fullscreen too, but keeps the windowed layout: the
+        capture canvas is composed from the live allocations of the very
+        widgets this mode moves and hides.
+        """
+        want = self.is_fullscreen() and self._record_path is None
+        if want != self._immersive:
+            self._immersive = want
+            if want:
+                self._enter_immersive()
+            else:
+                self._leave_immersive()
+            log_action("immersive", on=want)
+        self._refresh_fullscreen_button()
+
+    def _enter_immersive(self) -> None:
+        sidebar = self._paned.get_end_child()
+        if sidebar is not None:
+            sidebar.set_visible(False)
+        # Edge to edge: the 8 px window padding separates the video from the
+        # sidebar, which no longer exists in this mode.
+        self._player_box.set_margin_top(0)
+        self._player_box.set_margin_bottom(0)
+        self._player_box.set_margin_start(0)
+        self._player_box.set_margin_end(0)
+        self._info_bar_was_visible = self._info_bar.get_visible()
+        # Only the transport moves into the dock.  The info row is replaced by
+        # the always-on telemetry line in the top-left corner.
+        if self._controls_bar.get_parent() is not None:
+            self._controls_bar.unparent()
+        self._dock.append(self._controls_bar)
+        self._info_bar.set_visible(False)
+        self._controls_bar.add_css_class("docked")
+        self._immersive_tools.set_visible(True)
+        self._player_overlay.add_css_class("immersive")
+        self._dock_revealer.set_visible(True)
+        self._dock_revealer.set_reveal_child(True)
+        self._telemetry_box.set_visible(self.backend.has_media)
+        self._telemetry_box.set_opacity(1.0)
+        self._fullscreen_progress.set_visible(self.backend.has_media)
+        self._sync_compare_overlay()
+        self._sync_subtitle_margin()
+        self._dock_hover = False
+        self._dock_deadline = time.monotonic() + DOCK_IDLE_SECONDS
+
+    def _leave_immersive(self) -> None:
+        if self._controls_bar.get_parent() is self._dock:
+            self._controls_bar.unparent()
+        self._dock_revealer.set_reveal_child(False)
+        self._dock_revealer.set_visible(False)
+        self._telemetry_box.set_visible(False)
+        self._telemetry_box.set_opacity(1.0)
+        self._fullscreen_progress.set_visible(False)
+        self._immersive_tools.set_visible(False)
+        self._sync_subtitle_margin()
+        self._controls_bar.remove_css_class("docked")
+        self._player_overlay.remove_css_class("immersive")
+        # Same order as _build_player_area: picture, info line, transport.
+        self._player_box.append(self._controls_bar)
+        margin = self._player_margin
+        self._player_box.set_margin_top(margin)
+        self._player_box.set_margin_bottom(margin)
+        self._player_box.set_margin_start(margin)
+        self._player_box.set_margin_end(margin)
+        sidebar = self._paned.get_end_child()
+        if sidebar is not None:
+            sidebar.set_visible(self._sidebar_button.get_active())
+        self._sync_chrome_visibility()
+
+    def _show_dock(self) -> None:
+        if not self._immersive:
+            return
+        self._dock_deadline = time.monotonic() + DOCK_IDLE_SECONDS
+        self._telemetry_box.set_opacity(1.0)
+        if not self._dock_revealer.get_reveal_child():
+            self._dock_revealer.set_reveal_child(True)
+            self._sync_subtitle_margin()
+
+    def _maybe_hide_dock(self) -> None:
+        """Fade the dock out once the pointer has been still for a while.
+
+        The telemetry and the bottom progress hairline deliberately stay: the
+        viewer keeps the clip identity and position after the controls go.
+        """
+        if not self._immersive or not self._dock_revealer.get_reveal_child():
+            return
+        if self._dock_hover or not self.backend.is_playing:
+            # A paused frame is something to look at, so the timecode and the
+            # transport stay until playback resumes.
+            self._dock_deadline = time.monotonic() + DOCK_IDLE_SECONDS
+            return
+        if time.monotonic() >= self._dock_deadline:
+            self._dock_revealer.set_reveal_child(False)
+            self._telemetry_box.set_opacity(TELEMETRY_IDLE_OPACITY)
+            self._sync_subtitle_margin()
+
+    def _sync_subtitle_margin(self) -> None:
+        """Keep subtitles clear of the dock while it is on screen."""
+        lifted = self._immersive and self._dock_revealer.get_reveal_child()
+        self._subtitle_label.set_margin_bottom(
+            DOCK_SUBTITLE_CLEARANCE if lifted else 24
+        )
+
+    def _on_surface_pressed(self, *_args: object) -> None:
+        self._show_dock()
+
+    def _on_pointer_motion(
+        self, _controller: Gtk.EventControllerMotion, x: float, y: float
+    ) -> None:
+        if not self._immersive:
+            return
+        # Without the hover check a dock parked under the pointer would fade
+        # exactly as the viewer reaches for it.  The band is deliberately
+        # generous; the dock itself is about 140 px tall.
+        height = self.get_height()
+        if height <= 0:
+            # Motion can arrive before the first allocation; with height 0 the
+            # comparison below is true for every Y and would latch the flag.
+            return
+        self._dock_hover = y >= height - DOCK_HOVER_BAND
+        # The compositor keeps sending motion events for a resting pointer, and
+        # each one used to push the fade deadline forward, so the dock never
+        # hid.  Only a real move counts as intent to see the transport.
+        last = self._dock_pointer
+        self._dock_pointer = (x, y)
+        if last is not None and abs(x - last[0]) < 3 and abs(y - last[1]) < 3:
+            return
+        self._show_dock()
+
+    def _on_fullscreen_notified(self, *_args: object) -> None:
+        self._sync_immersive()
+
+    def _refresh_fullscreen_button(self) -> None:
+        full = self.is_fullscreen()
+        self._fullscreen_button.set_icon_name(
+            "view-restore-symbolic" if full else "view-fullscreen-symbolic"
+        )
+        self._fullscreen_button.set_tooltip_text(
+            self._t("exit_fullscreen" if full else "fullscreen")
+        )
 
     def _on_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
         log_action("playlist_row", index=row.get_index())
         self._start_index(row.get_index())
 
+    # -- recently played -------------------------------------------------
+
+    def _sync_recents(self) -> None:
+        """Rebuild the history rows from the store.
+
+        Rows carry their path out of band (``_recent_paths``) so activating one
+        does not have to parse a label or trust a caption as a file name.
+        Entries already present in the current playlist are skipped so the same
+        file never appears twice in the sidebar.
+        """
+        while self._recents_list.get_row_at_index(0) is not None:
+            row = self._recents_list.get_row_at_index(0)
+            self._recents_list.remove(row)
+        store = self._recents
+        all_items = store.items(only_existing=True) if store is not None else ()
+        items = (
+            store.items(only_existing=True, exclude=self.playlist)
+            if store is not None
+            else ()
+        )
+        self._recent_paths = [item.path for item in items]
+        for item in items:
+            row = Gtk.ListBoxRow()
+            row.add_css_class("recent-row")
+            row.set_tooltip_text(str(item.path))
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            name = Gtk.Label(label=item.name)
+            name.set_xalign(0.0)
+            name.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+            name.add_css_class("recent-name")
+            meta = Gtk.Label(label=self._recent_meta(item))
+            meta.set_xalign(0.0)
+            meta.add_css_class("recent-meta")
+            box.append(name)
+            box.append(meta)
+            row.set_child(box)
+            self._recents_list.append(row)
+        # Three states: a normal history, a genuinely empty history (keep the
+        # hint), or every entry already in the playlist (hide the whole
+        # section rather than leaving a lone heading behind).
+        show_section = bool(items) or not all_items
+        self._recents_title.set_visible(show_section)
+        self._recents_scroll.set_visible(bool(items))
+        self._recents_empty.set_text(self._t("recents_empty"))
+        self._recents_empty.set_visible(not all_items and show_section)
+
+    def _recent_meta(self, item: RecentItem) -> str:
+        if item.duration_ns <= 0:
+            return self._t("recent_no_duration")
+        return f"{_format_time(item.position_ns)} / {_format_time(item.duration_ns)}"
+
+    def _on_recent_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        index = row.get_index()
+        if not 0 <= index < len(self._recent_paths):
+            return
+        path = self._recent_paths[index]
+        log_action("recent_row", index=index, path=path)
+        if not path.is_file():
+            # The history outlives the file: a cleaned-up demo folder must not
+            # leave a row that opens a black window.
+            if self._recents is not None:
+                self._recents.remove(path)
+            self._sync_recents()
+            self._set_hint_key("recent_missing", name=path.name)
+            return
+        self._play_path(path)
+
+    def _remember_recent(self, path: Path, position_ns: int, duration_ns: int) -> None:
+        if self._recents is None:
+            return
+        if self._recents.touch(
+            path, duration_ns=duration_ns, position_ns=position_ns
+        ):
+            self._sync_recents()
+
     # -- beauty panel (M3: live shader uniforms) ------------------------
 
     def _on_smoothing_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.smoothing = int(round(scale.get_value()))
+        self._smoothing_value.set_text(slider_value_text(scale.get_value()))
         self._refresh_beauty()
         log_action("smoothing", value=self.config.beauty.smoothing)
 
     def _on_whitening_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.whitening = int(round(scale.get_value()))
+        self._whitening_value.set_text(slider_value_text(scale.get_value()))
         self._refresh_beauty()
         log_action("whitening", value=self.config.beauty.whitening)
 
     def _on_split_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.split = round(scale.get_value(), 3)
+        self._split_value.set_text(percent_value_text(scale.get_value()))
         self._refresh_beauty()
         log_action("split", value=self.config.beauty.split)
 
     def _on_face_slim_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.face_slim = round(scale.get_value(), 1)
+        self._face_slim_value.set_text(slider_value_text(scale.get_value()))
         self._refresh_beauty()
         log_action("face_slim", value=self.config.beauty.face_slim)
 
     def _on_eye_enlarge_changed(self, scale: Gtk.Scale) -> None:
         self.config.beauty.eye_enlarge = round(scale.get_value(), 1)
+        self._eye_enlarge_value.set_text(slider_value_text(scale.get_value()))
         self._refresh_beauty()
         log_action("eye_enlarge", value=self.config.beauty.eye_enlarge)
 
     def _on_beauty_toggled(self, switch: Gtk.Switch, _param: object) -> None:
-        self.config.beauty.enabled = switch.get_active()
-        self._refresh_beauty()
-        log_action("beauty", enabled=self.config.beauty.enabled)
+        if self._updating_toggles:
+            return
+        self._set_beauty_enabled(switch.get_active())
 
-    def _on_compare_toggled(self, button: Gtk.ToggleButton) -> None:
-        self.config.beauty.compare_mode = button.get_active()
-        self._compare_switch.set_active(button.get_active())
-        self._refresh_beauty()
-
-    def _on_compare_switch_toggled(self, switch: Gtk.Switch, _param: object) -> None:
-        self.config.beauty.compare_mode = switch.get_active()
-        self._compare_button.set_active(switch.get_active())
-        self._refresh_beauty()
-        log_action("compare", enabled=self.config.beauty.compare_mode)
+    def _on_compare_toggled(self, switch: Gtk.Switch, _param: object) -> None:
+        if self._updating_toggles:
+            return
+        self._set_compare_enabled(switch.get_active())
 
     def _toggle_beauty(self) -> None:
         self._beauty_switch.set_active(not self._beauty_switch.get_active())
 
     def _toggle_compare(self) -> None:
+        # The C key must respect the same gate as the switch and the dock pill:
+        # with beauty off the split is unavailable instead of forcing beauty on.
+        if not self.config.beauty.enabled:
+            self._set_hint_key("compare_requires_beauty")
+            return
         self._compare_switch.set_active(not self._compare_switch.get_active())
 
     def _toggle_debug_mask(self) -> None:
@@ -774,76 +2949,57 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _refresh_beauty(self) -> None:
         """Apply the current beauty config to the running shader immediately."""
         self.backend.refresh_beauty()
-        self._refresh_params_label()
+        self._refresh_beauty_status()
         self._update_info_label()
-
-    def _refresh_params_label(self) -> None:
-        beauty = self.config.beauty
-        params = BeautyParams.from_config(beauty)
-        t = self._t
-        state = t("beauty_state_on" if beauty.enabled else "beauty_state_off")
-        if beauty.compare_mode:
-            state += t("beauty_split", split=beauty.split)
-        warp = ""
-        if params.face_slim > 0.0 or params.eye_enlarge > 0.0:
-            warp = t(
-                "beauty_warp",
-                slim=params.face_slim,
-                eyes=params.eye_enlarge,
-            )
-        extra = ""
-        if self.backend.beauty_available:
-            extra = t("beauty_ms", ms=self.backend.beauty_ms)
-        elif not beauty.enabled:
-            extra = ""
-        else:
-            extra = t("beauty_gpu_unavailable")
-        self._params_label.set_text(
-            t(
-                "beauty_params",
-                state=state,
-                smoothing=params.smoothing,
-                whitening=params.whitening,
-                warp=warp,
-                extra=extra,
-            )
-        )
+        self._sync_compare_overlay()
 
     def _on_beauty_error(self, message: str) -> None:
         log_action("beauty_error", message=message)
         self._beauty_error = message
         self._beauty_switch.set_sensitive(False)
-        self._beauty_switch.set_active(False)
-        self.config.beauty.enabled = False
+        # A failed GPU pass is the feature switching itself off: use the same
+        # cascade so no split or face box outlives the effect.
+        self._set_beauty_enabled(False)
         self._set_hint_key("beauty_error", message=message)
         self._hint_label.add_css_class("error-hint")
-        self._refresh_params_label()
+        self._refresh_beauty_status()
         self._update_info_label()
 
     # -- backend callbacks ----------------------------------------------
 
     def _on_state_changed(self, state: str) -> None:
         self._update_play_icon(state == "playing")
+        if state == "playing":
+            self._playback_started = True
+            self._set_playback_status(None)
+            # The demuxer only exposes its audio pads during preroll, so the
+            # track list has to be rebuilt here rather than in _play_path.
+            self._refresh_audio_tracks()
         log_action("playback_state", state=state)
 
     def _on_video_info(self, info: dict[str, object]) -> None:
         # The beauty element exists only once the video branch is built, so the
-        # panel is refreshed here to replace the "unavailable" placeholder.
-        self._refresh_params_label()
+        # status line is refreshed here to replace the "preparing" placeholder.
+        self._refresh_beauty_status()
         self._update_info_label()
+        self._sync_compare_overlay()
+        self._sync_chrome_visibility()
 
     def _on_fps(self, fps: float) -> None:
         self._fps = fps
         self._update_info_label()
 
     def _on_detection(self, result: DetectionResult) -> None:
-        if not self._show_faces:
-            return
+        # The boxes feed two consumers with different switches: the overlay
+        # draws them only when asked, while the info line (and the beauty
+        # shader) always want the newest result.  Returning early on
+        # ``_show_faces`` used to report ``NPU —`` while beauty was still
+        # masking with those very boxes.
         faces = tuple(result.faces)
         changed = faces != self._faces
         self._faces = faces
         self._detection_ms = result.inference_ms
-        if changed:
+        if changed and self._show_faces:
             width = float(self.backend.video_info.get("width") or 0)
             height = float(self.backend.video_info.get("height") or 0)
             self._face_overlay.set_faces(self._faces, width, height)
@@ -861,6 +3017,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         log_action("detection_error", message=message)
 
     def _on_show_faces_toggled(self, switch: Gtk.Switch, _param: object) -> None:
+        # The cascade in _set_beauty_enabled clears the boxes through this
+        # switch; honour the guard so it does not look like a user action.
+        if self._updating_toggles:
+            return
         self._show_faces = switch.get_active()
         log_action("show_faces", enabled=self._show_faces)
         if not self._show_faces:
@@ -869,9 +3029,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
             width = float(self.backend.video_info.get("width") or 0)
             height = float(self.backend.video_info.get("height") or 0)
             self._face_overlay.set_faces(self._faces, width, height)
+        self._on_detection_dependency_toggled()
 
     def _on_eos(self) -> None:
         log_action("eos")
+        # Update the history first (a finished clip shows 100 % there), then
+        # drop the resume entry: keeping it would make the next launch jump
+        # into the last seconds and advance again.
+        self._save_resume_position(remember=True)
+        self._clear_resume_position()
+        self._playback_started = False
         self._update_play_icon(False)
         if self.playlist.has_next():
             target = self.playlist.next()
@@ -879,12 +3046,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 log_action("eos_advance")
                 self._play_path(target)
                 return
+        # A finished clip is not an error, so no card: it used to cover the last
+        # frame.  The transport icon returns to "play" (which now rewinds) and
+        # the hint line reports the end.
+        self._set_playback_status(None)
         self._set_hint_key("hint_finished")
 
     def _show_error(self, message: str) -> None:
         log_action("playback_error", message=message)
-        self._set_hint_key("playback_error", message=message)
-        self._hint_label.add_css_class("error-hint")
+        self._playback_started = False
+        self._set_playback_status("error", message)
         self._update_play_icon(False)
 
     # -- helpers --------------------------------------------------------
@@ -893,49 +3064,167 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._hint_key = key
         self._hint_values = values
         self._hint_label.remove_css_class("error-hint")
-        self._hint_label.set_text("" if key is None else self._t(key, **values))
+        self._hint_label.remove_css_class("warn-hint")
+        text = "" if key is None else self._t(key, **values)
+        self._hint_label.set_text(text)
+        self._hint_revealer.set_visible(bool(text))
+        self._hint_revealer.set_reveal_child(bool(text))
+        if self._hint_timeout:
+            GLib.source_remove(self._hint_timeout)
+            self._hint_timeout = 0
+        if text:
+            # Long enough to read a decode-fallback line, short enough that the
+            # picture is clean again before anyone starts talking about it.
+            self._hint_timeout = GLib.timeout_add(6000, self._hide_hint_toast)
+
+    def _hide_hint_toast(self) -> bool:
+        self._hint_timeout = 0
+        self._hint_revealer.set_reveal_child(False)
+        return False
+
+    def _update_title(self) -> None:
+        """Keep the header's two lines and the window title in step."""
+        if getattr(self, "_page", "player") == "browse":
+            return
+        t = self._t
+        if self._current_path is not None:
+            self.set_title(t("title_with_media", name=self._current_path.name))
+            self._title_label.set_text(self._current_path.name)
+        else:
+            self.set_title(t("app_title"))
+            self._title_label.set_text(t("app_title"))
+        self._refresh_subtitle()
+
+    def _header_subtitle_text(self) -> str:
+        """Header second line: brand when idle, playlist position when open.
+
+        Resolution / codec / fps used to repeat here; they now live once in the
+        labelled info row under the picture.
+        """
+        if self._current_path is None or not self.backend.has_media:
+            return "Quectel Pi M2 · RK3576"
+        if len(self.playlist):
+            return self._t(
+                "playlist_position",
+                index=self.playlist.index + 1,
+                count=len(self.playlist),
+            )
+        return ""
+
+    def _refresh_subtitle(self) -> None:
+        if getattr(self, "_page", "player") == "browse":
+            return
+        text = self._header_subtitle_text()
+        if text == self._header_subtitle_cache:
+            return
+        self._header_subtitle_cache = text
+        self._header_subtitle_label.set_text(text)
+        self._header_subtitle_label.set_visible(bool(text))
 
     def _update_play_icon(self, playing: bool) -> None:
         icon = "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
         self._play_button.set_icon_name(icon)
 
     def _update_info_label(self) -> None:
+        """Refresh the labelled info row and the fullscreen telemetry line."""
         t = self._t
         info = self.backend.video_info
         width = info.get("width", "—")
         height = info.get("height", "—")
-        codec = info.get("codec", "—")
+        codec = normalise_codec(info.get("codec", "—"))
         decoder = info.get("decoder", "—")
-        fps = self._fps or info.get("fps") or "—"
-        if self._detection_error:
-            npu = t("npu_off")
+        fps_value = self._fps or info.get("fps")
+        if fps_value in ("—", None):
+            fps_text = "—"
+        else:
+            try:
+                fps_text = f"{float(fps_value):.1f}"
+            except (TypeError, ValueError):
+                fps_text = str(fps_value)
+        # v4: the face clause reports what is on screen, not what the NPU is
+        # still running for the beauty mask.  With the boxes switch off (the
+        # cascade clears it with the effect) the row reads "人脸 关", matching
+        # the mockup; detection can stay armed behind the shader.
+        if not self._show_faces:
+            face_text = t("info_face_off")
+        elif self._detection_error:
+            face_text = t("info_face_unavailable")
         elif self._faces:
-            count = len(self._faces)
-            npu = t("npu_face" if count == 1 else "npu_faces", count=count, ms=self._detection_ms)
-        else:
-            npu = "—"
-        if self._beauty_error or not self.backend.beauty_available:
-            beauty = (
-                t("beauty_unavailable")
-                if self._beauty_error
-                else t("beauty_state_off")
+            face_text = t(
+                "info_face_on",
+                count=len(self._faces),
+                ms=self._detection_ms,
             )
+        elif not self.config.detection.enabled:
+            face_text = t("info_face_off")
+        else:
+            face_text = t("info_face_none")
+        if self._beauty_error:
+            beauty_text = t("info_beauty_unavailable")
+        elif not self.backend.beauty_available:
+            beauty_text = t("info_beauty_off")
         elif not self.config.beauty.enabled:
-            beauty = t("beauty_state_off")
+            beauty_text = t("info_beauty_off")
         else:
-            beauty = t("beauty_on", ms=self.backend.beauty_ms)
-        self._info_label.set_text(
-            t(
-                "info_line",
-                width=width,
-                height=height,
-                codec=codec,
-                decoder=decoder,
-                fps=fps,
-                npu=npu,
-                beauty=beauty,
-            )
+            beauty_text = t("info_beauty_on", ms=self.backend.beauty_ms)
+        format_text = f"{width}×{height}" if width != "—" else "—"
+        values = {
+            "format": format_text,
+            "codec": codec,
+            "decode": self._decode_chip_text(decoder),
+            "fps": fps_text,
+        }
+        for key, text in values.items():
+            self._info_values[key].set_text(text)
+        self._info_face.set_text(face_text)
+        self._info_beauty.set_text(beauty_text)
+        # v4 mockup: the live dot is extinguished with the effect (both the
+        # windowed row and the fullscreen telemetry share the info-dot class).
+        if self.config.beauty.enabled:
+            self._info_dot.remove_css_class("is-off")
+        else:
+            self._info_dot.add_css_class("is-off")
+        # "mppvideodec" would not fit the row; keep the element name in the
+        # tooltip so a decode fallback is still diagnosable.
+        self._info_values["decode"].set_tooltip_text(str(decoder))
+
+        # The fullscreen line is the same telemetry without labels on the
+        # static fields; NPU/beauty keep their labels because the numbers move.
+        self._telemetry_main.set_text(
+            f"{format_text} · {codec} · {values['decode']} · {fps_text} fps"
         )
+        self._telemetry_live.set_text(f"{face_text} · {beauty_text}")
+        self._refresh_subtitle()
+
+    def _decode_chip_text(self, decoder: str) -> str:
+        """Collapse the element name to 硬解 / 软解; the name lives in a tooltip."""
+        name = str(decoder)
+        if "mpp" in name:
+            return self._t("decode_hw")
+        if name and name != "—":
+            return self._t("decode_sw")
+        return "—"
+
+    def _reset_info_chips(self) -> None:
+        """Neutral state used before a file is open and after it is closed."""
+        for value in self._info_values.values():
+            value.set_text("—")
+            value.set_tooltip_text(None)
+        self._info_face.set_text("—")
+        self._info_beauty.set_text("—")
+        self._telemetry_main.set_text("—")
+        self._telemetry_live.set_text("")
+        self._set_timecode("00:00 / 00:00")
+        self._set_progress_fraction(0.0)
+
+    def _set_timecode(self, text: str) -> None:
+        """Split ``00:03 / 00:10`` into the two time labels."""
+        position, _, total = text.partition(" / ")
+        self._elapsed_label.set_text(position or "00:00")
+        self._total_label.set_text(total or "00:00")
+
+    def _set_progress_fraction(self, fraction: float) -> None:
+        self._fullscreen_progress.set_fraction(max(0.0, min(1.0, fraction)))
 
     def _sync_playlist(self) -> None:
         while self._playlist_list.get_row_at_index(0) is not None:
@@ -952,8 +3241,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
             row = self._playlist_list.get_row_at_index(self.playlist.index)
             if row is not None:
                 self._playlist_list.select_row(row)
+        # Empty playlist gets the dashed hint from the mockup instead of a
+        # blank box; the list and the hint never show together.
+        if hasattr(self, "_playlist_scroll"):
+            self._playlist_scroll.set_visible(bool(self.playlist))
+            self._playlist_empty.set_visible(not self.playlist)
+        # The playlist changed: an entry shown as "recent" a moment ago may
+        # now be duplicated, so rebuild the history section too.
+        self._sync_recents()
+        self._refresh_subtitle()
 
     def _tick(self) -> bool:
+        self._maybe_hide_dock()
         if self.backend.has_media:
             measured = self.backend.measured_fps()
             if measured and abs(measured - self._fps) >= 0.5:
@@ -967,14 +3266,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
                     self._updating_seek = True
                     self._seek.set_value(position / duration * 1000.0)
                     self._updating_seek = False
-                self._time_label.set_text(
+                self._set_timecode(
                     f"{_format_time(position)} / {_format_time(duration)}"
                 )
+                self._set_progress_fraction(position / duration)
+                self._update_subtitle(position)
             self._update_info_label()
             if self.backend.beauty_available and self.config.beauty.enabled:
-                # Keep the panel's ms/frame in sync with the live GPU timing;
+                # Keep the page's ms/frame in sync with the live GPU timing;
                 # otherwise it stays at the value captured before playback.
-                self._refresh_params_label()
+                self._refresh_beauty_status()
+            if self._resume is not None and self.backend.is_playing:
+                now = time.monotonic()
+                if now - self._resume_saved_at >= RESUME_SAVE_INTERVAL:
+                    self._resume_saved_at = now
+                    self._save_resume_position()
         # Log after the measured-fps correction above: logging first sampled
         # fpsdisplaysink's lifetime average, which reads far too low while the
         # stream warms up and looked like a fps dip on a perfectly smooth run.
@@ -1011,6 +3317,202 @@ class PlayerWindow(Gtk.ApplicationWindow):
             flush=True,
         )
 
+    # -- resume ------------------------------------------------------------
+
+    def _save_resume_position(self, *, remember: bool = False) -> None:
+        """Persist the position of the clip that is playing.
+
+        Called every couple of seconds and on close.  :class:`ResumeStore`
+        decides whether the value is worth keeping (it drops the first ten
+        seconds and anything inside the tail of the file), so this can be
+        called unconditionally.
+
+        ``remember=True`` also refreshes the "recently played" row.  That is
+        deliberately kept off the two-second timer: the history only needs to
+        know where a clip stopped when playback actually stops, and two small
+        JSON writes per second is real flash wear on a board that runs all day.
+        """
+        path = self._playback_path or self._current_path
+        if path is None:
+            return
+        position = self.backend.position_ns()
+        if position <= 0:
+            return
+        duration = self.backend.duration_ns()
+        if remember:
+            self._remember_recent(path, position, duration)
+        if self._resume is None:
+            return
+        self._resume.save(path, position, duration)
+
+    def _resume_target_ns(
+        self, path: Path, requested_ns: int | None = None
+    ) -> int:
+        """Start position for an open: explicit rebuild position, else resume.
+
+        The detection rebuild must keep the viewer exactly where they were even
+        when resume positions are disabled (``player.resume=false``) or the
+        outgoing position was never stored (the first ten seconds).
+        """
+        if requested_ns is not None:
+            return max(0, int(requested_ns))
+        if self._resume is not None:
+            return int(self._resume.load(path) or 0)
+        return 0
+
+    def _clear_resume_position(self) -> None:
+        if self._resume is None:
+            return
+        path = self._playback_path or self._current_path
+        if path is not None:
+            self._resume.clear(path)
+
+    # -- subtitles -------------------------------------------------------
+
+    def _build_subtitle_popover(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_size_request(260, -1)
+
+        self._subtitle_switch = Gtk.Switch()
+        self._subtitle_switch.set_active(self._subtitles_enabled)
+        self._subtitle_switch.connect("notify::active", self._on_subtitles_toggled)
+        self._subtitles_menu_label = Gtk.Label(label=self._t("show_subtitles"))
+        self._subtitles_menu_label.set_xalign(0.0)
+        box.append(_labelled_row(self._subtitles_menu_label, self._subtitle_switch))
+
+        self._open_subtitle_button = Gtk.Button(label=self._t("open_subtitle"))
+        self._open_subtitle_button.connect("clicked", self._on_open_subtitle)
+        box.append(self._open_subtitle_button)
+
+        self._audio_label = Gtk.Label(label=self._t("audio_track"))
+        self._audio_label.set_xalign(0.0)
+        self._audio_dropdown = Gtk.DropDown.new_from_strings(
+            [self._t("audio_track_none")]
+        )
+        self._audio_dropdown.set_sensitive(False)
+        self._audio_dropdown.set_hexpand(True)
+        self._audio_dropdown.connect("notify::selected", self._on_audio_track_selected)
+        box.append(_labelled_row(self._audio_label, self._audio_dropdown))
+
+        self._subtitle_status_label = Gtk.Label()
+        self._subtitle_status_label.set_xalign(0.0)
+        self._subtitle_status_label.set_wrap(True)
+        self._subtitle_status_label.add_css_class("dim-label")
+        self._subtitle_status_label.set_text(self._t("subtitle_none"))
+        box.append(self._subtitle_status_label)
+
+        popover.set_child(box)
+        return popover
+
+    def _apply_subtitle(self, path: Path | None) -> None:
+        """Load (or clear) the subtitle track shown for the current clip."""
+        self._subtitle_path = path
+        self._subtitles = None
+        if path is not None:
+            cues = load_srt(path)
+            if cues:
+                self._subtitles = SubtitleTrack(cues)
+        self._subtitle_text = None
+        self._subtitle_label.set_text("")
+        self._subtitle_label.set_visible(False)
+        self._refresh_subtitle_status()
+
+    def _refresh_subtitle_status(self) -> None:
+        if self._subtitle_path is not None and self._subtitles is not None:
+            self._subtitle_status_label.set_text(
+                self._t(
+                    "subtitle_loaded",
+                    name=self._subtitle_path.name,
+                    count=len(self._subtitles),
+                )
+            )
+        elif self._subtitle_path is not None:
+            self._subtitle_status_label.set_text(
+                self._t("subtitle_empty", name=self._subtitle_path.name)
+            )
+        else:
+            self._subtitle_status_label.set_text(self._t("subtitle_none"))
+
+    def _update_subtitle(self, position_ns: int) -> None:
+        text = None
+        if self._subtitles_enabled and self._subtitles is not None:
+            text = self._subtitles.text_at(position_ns)
+        if text == self._subtitle_text:
+            return
+        self._subtitle_text = text
+        self._subtitle_label.set_text(text or "")
+        self._subtitle_label.set_visible(bool(text))
+
+    def _on_subtitles_toggled(self, switch: Gtk.Switch, _param: object) -> None:
+        self._subtitles_enabled = switch.get_active()
+        log_action("subtitles_toggle", enabled=self._subtitles_enabled)
+        if not self._subtitles_enabled:
+            self._subtitle_text = None
+            self._subtitle_label.set_text("")
+            self._subtitle_label.set_visible(False)
+
+    def _refresh_audio_tracks(self) -> None:
+        """Rebuild the track dropdown from the container's audio pads."""
+        count = self.backend.audio_track_count
+        if count > 0:
+            labels = [
+                self._t("audio_track_n", index=index + 1) for index in range(count)
+            ]
+        else:
+            labels = [self._t("audio_track_none")]
+        self._updating_audio = True
+        try:
+            self._audio_dropdown.set_model(Gtk.StringList.new(labels))
+            self._audio_dropdown.set_sensitive(count > 1)
+            self._audio_dropdown.set_selected(
+                min(self.backend.audio_track_index, max(0, count - 1))
+            )
+        finally:
+            self._updating_audio = False
+
+    def _on_audio_track_selected(
+        self, dropdown: Gtk.DropDown, _param: object
+    ) -> None:
+        if self._updating_audio:
+            return
+        index = int(dropdown.get_selected())
+        log_action("audio_track", index=index)
+        if not self.backend.set_audio_track(index):
+            # Fall back to the track that is actually playing.
+            self._refresh_audio_tracks()
+
+    def _on_open_subtitle(self, _button: Gtk.Button) -> None:
+        log_action("subtitle_dialog")
+        dialog = Gtk.FileDialog(title=self._t("open_subtitle"))
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name(self._t("subtitle_files"))
+        file_filter.add_suffix("srt")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(file_filter)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(file_filter)
+        dialog.open(self, None, self._on_subtitle_chosen)
+
+    def _on_subtitle_chosen(
+        self, dialog: Gtk.FileDialog, result: Gio.AsyncResult
+    ) -> None:
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error:
+            return
+        if gfile is None:
+            return
+        path_text = gfile.get_path()
+        if not path_text:
+            return
+        self._apply_subtitle(Path(path_text))
+        self._set_hint_key("subtitle_loaded", name=Path(path_text).name, count=len(self._subtitles) if self._subtitles else 0)
+
     def _on_open_clicked(self, _button: Gtk.Button) -> None:
         log_action("open_dialog")
         dialog = Gtk.FileDialog(title=self._t("open_video"))
@@ -1036,6 +3538,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         path_text = gfile.get_path()
         if path_text:
             log_action("open_selected", path=path_text)
+            self._show_page("player", refresh=False)
             self._play_path(Path(path_text))
 
     def _on_key_pressed(
@@ -1046,11 +3549,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         _state: Gdk.ModifierType,
     ) -> bool:
         name = Gdk.keyval_name(keyval)
+        # Reaching for the keyboard is the same intent as reaching for the
+        # transport: bring it back before the command lands.
+        self._show_dock()
         if name in {
             "space", "Left", "Right", "f", "F", "Escape", "n", "N",
             "p", "P", "b", "B", "c", "C", "m", "M", "r", "R", "o", "O",
+            "s", "S",
         }:
             log_action("key", name=name)
+        if self._page == "browse":
+            # The browse pages are not the player: transport and feature
+            # shortcuts must not fire here (space used to open the file dialog
+            # on the library page).  Only Escape has a meaning: leave detail.
+            if name == "Escape" and self._browse.is_detail():
+                self._browse.back_from_detail()
+                self._sync_page_chrome()
+                return True
+            return False
         if name == "space":
             self._on_play_clicked(None)
             return True
@@ -1065,12 +3581,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return True
         if name == "Escape" and self.is_fullscreen():
             self.unfullscreen()
+            self._sync_immersive()
             return True
+        if name == "Escape" and self._page == "player":
+            self._show_page("browse")
+            return True
+
+
         if name in ("n", "N"):
             self._on_next_clicked(None)
             return True
         if name in ("p", "P"):
             self._on_previous_clicked(None)
+            return True
+        if name in ("s", "S"):
+            self._on_stop_clicked(None)
             return True
         if name in ("b", "B"):
             self._toggle_beauty()
@@ -1090,6 +3615,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return False
 
     # -- recording (demo video capture) ---------------------------------
+
+    def _recording_layer_specs(self) -> list[tuple[str, Gtk.Widget]]:
+        """Chrome painted into the recorder canvas, in paint order.
+
+        The canvas spans the whole window, so it has to include the header bar
+        too — otherwise the recording keeps an empty 59 px band at the top where
+        the title bar would be.  The list is a method (not inline in
+        :meth:`_maybe_start_recording`) so the order can be asserted without a
+        display.
+        """
+        return [
+            ("header", self._headerbar),
+            ("sidebar", self._sidebar_scroll),
+            ("info", self._info_bar),
+            ("controls", self._controls_bar),
+            ("hint", self._hint_label),
+            ("playback-status", self._status_card),
+        ]
 
     def _maybe_start_recording(self) -> None:
         """Start ``--record`` once the window is painted and a video plays.
@@ -1123,10 +3666,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         from .capture import CanvasBuilder
 
         builder = CanvasBuilder(self)
-        builder.add_layer("sidebar", self._sidebar_scroll)
-        builder.add_layer("info", self._info_label)
-        builder.add_layer("controls", self._controls_bar)
-        builder.add_layer("hint", self._hint_label)
+        for name, widget in self._recording_layer_specs():
+            builder.add_layer(name, widget)
         builder.set_video_widget(self._player_overlay)
         builder.set_backdrop(self._theme_background())
         if not builder.refresh_background():
@@ -1173,19 +3714,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
             print(f"[rec] started {path} canvas={builder.size}", flush=True)
 
     def _theme_background(self) -> tuple[int, int, int, int]:
-        """Window background colour, used to fill the recording canvas."""
-        try:
-            found, colour = self.get_style_context().lookup_color("window_bg_color")
-            if found:
-                return (
-                    int(round(colour.red * 255)),
-                    int(round(colour.green * 255)),
-                    int(round(colour.blue * 255)),
-                    255,
-                )
-        except (AttributeError, TypeError, ValueError):  # pragma: no cover
-            pass
-        return (0xFA, 0xFA, 0xFA, 255)
+        """The window base colour, shared with the custom recording canvas.
+
+        Read from the ui-v5 ``bg`` token instead of repeating the triple: the
+        recorder composites its own backdrop, so a literal here would drift
+        from ``window.cinema-window`` and put a different frame around the
+        video.
+        """
+        red, green, blue, _alpha = rgba("bg")
+        return (
+            round(red * 255.0),
+            round(green * 255.0),
+            round(blue * 255.0),
+            255,
+        )
 
     @staticmethod
     def _save_rgba_png(image, path: str) -> None:
@@ -1246,7 +3788,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
             if self._record_ticks % 30 == 1:
                 builder.refresh(("sidebar",))
             if self._record_ticks % 10 == 1:
-                builder.refresh(("info", "controls", "hint"))
+                builder.refresh(
+                    ("header", "info", "controls", "hint", "playback-status")
+                )
         info = self.backend.video_info
         width = int(info.get("width") or 0)
         height = int(info.get("height") or 0)
@@ -1349,7 +3893,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._timer_id:
             GLib.source_remove(self._timer_id)
             self._timer_id = 0
+        if self._decode_reopen_id:
+            GLib.source_remove(self._decode_reopen_id)
+            self._decode_reopen_id = 0
+        if self._detection_reopen_id:
+            GLib.source_remove(self._detection_reopen_id)
+            self._detection_reopen_id = 0
+        self._save_resume_position(remember=True)
         self.backend.close()
+        self._browse.shutdown()
         return False
 
 

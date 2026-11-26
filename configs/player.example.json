@@ -1,16 +1,17 @@
 {
   "version": 1,
   "player": {
-    "hw_decode": true,
+    "decode_mode": "auto",
     "render_sink": "gtk4paintablesink",
     "video_convert": "auto",
     "texture_max_dimension": 1280,
     "volume": 80,
     "speed": 1.0,
-    "resume": true
+    "resume": true,
+    "recent_files": true
   },
   "beauty": {
-    "enabled": true,
+    "enabled": false,
     "smoothing": 60,
     "whitening": 40,
     "face_slim": 0.0,
@@ -23,7 +24,7 @@
     "debug_mask": false
   },
   "detection": {
-    "enabled": true,
+    "enabled": false,
     "model_path": "models/yunet_rk3576.rknn",
     "interval_frames": 3,
     "max_faces": 3,
@@ -31,6 +32,10 @@
     "track_fill": true,
     "core_mask": 0,
     "hold_ms": 600
+  },
+  "library": {
+    "directories": [],
+    "max_items": 500
   },
   "debug": {
     "show_info_panel": true,
