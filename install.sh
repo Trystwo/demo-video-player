@@ -5,7 +5,9 @@
 #   1. validate the runtime environment (--check, board-only features optional)
 #   2. register the launcher on PATH            (~/.local/bin/video-player-demo)
 #   3. install a desktop entry                  (~/.local/share/applications)
-#   4. print "Deployment complete." with the exact paths that were written
+#   4. install the app icon and, on GNOME, the bundled Desktop Icons NG
+#      extension so icons actually appear on the desktop (user-level only)
+#   5. print "Deployment complete." with the exact paths that were written
 #
 # The script never runs apt and never installs system packages as root: board
 # packages are documented in docs/BOARD.md and README.md.  Deployment is per-user
@@ -22,6 +24,11 @@ DRY_RUN=0
 INSTALL_DESKTOP=1
 DESKTOP_DIR_OVERRIDE=""
 BIN_DIR_OVERRIDE=""
+ICON_NAME="video-player-demo"
+ICON_THEME_DIR="$HOME/.local/share/icons/hicolor"
+ICON_SVG="$ICON_THEME_DIR/scalable/apps/$ICON_NAME.svg"
+DING_SRC="$SCRIPT_DIR/assets/desktop-icons"
+DING_UUID="ding@rastersoft.com"
 
 usage() {
   cat <<'EOF'
@@ -102,7 +109,7 @@ Name[zh_CN]=视频播放器
 Comment=Hardware-decoded video player with NPU face detection and GPU beauty
 Comment[zh_CN]=硬件解码本地视频播放器，带 NPU 人脸检测与 GPU 美颜
 Exec=$LAUNCHER %f
-Icon=media-playback-start
+Icon=$ICON_SVG
 Terminal=false
 Categories=AudioVideo;Video;Player;
 Keywords=video;player;beauty;rk3576;
@@ -111,6 +118,152 @@ DESKTOP_EOF
   log "desktop entry installed: $DESKTOP_FILE"
   LAUNCHER_PATH="$LAUNCHER"
   DESKTOP_PATH="$DESKTOP_FILE"
+}
+
+# Install a dedicated app icon (SVG + rasterized PNGs), a desktop shortcut and
+# a GNOME Dash favourite.  Every step is best-effort: playback never depends on
+# the icon, and a missing desktop-icons extension simply leaves no desktop icon.
+install_icon() {
+  if [ "$INSTALL_DESKTOP" -eq 0 ]; then
+    log "skipping icon (--no-desktop)"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] write icon %s\n' "$ICON_SVG"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$ICON_SVG")"
+  cat > "$ICON_SVG" <<'ICON_EOF'
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#20345c"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5ee7f0"/>
+      <stop offset="1" stop-color="#4b7bff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)"/>
+  <rect x="14" y="14" width="228" height="228" rx="48" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="3"/>
+  <circle cx="128" cy="128" r="74" fill="none" stroke="url(#ring)" stroke-width="10"/>
+  <circle cx="128" cy="128" r="65" fill="none" stroke="#ffffff" stroke-opacity="0.16" stroke-width="2"/>
+  <path d="M110 90 L110 166 L174 128 Z" fill="#ffffff"/>
+</svg>
+ICON_EOF
+
+  # Rasterize for launchers that only accept PNG (best effort).
+  "$PYTHON_BIN" - "$ICON_SVG" "$ICON_THEME_DIR" <<'PY_EOF' 2>/dev/null || log "warning: PNG rasterization unavailable; SVG icon is still valid"
+import os
+import sys
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf
+svg, root = sys.argv[1], sys.argv[2]
+for size in (48, 64, 128, 256):
+    out = os.path.join(root, "%dx%d" % (size, size), "apps")
+    os.makedirs(out, exist_ok=True)
+    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(svg, size, size, True)
+    pb.savev(os.path.join(out, "video-player-demo.png"), "png", [], [])
+print("[icon] rasterized 48/64/128/256 PNG")
+PY_EOF
+
+  # Desktop shortcut (shown when a desktop-icons extension is installed).
+  if [ -d "$HOME/Desktop" ]; then
+    cp "$DESKTOP_FILE" "$HOME/Desktop/$ICON_NAME.desktop"
+    chmod +x "$HOME/Desktop/$ICON_NAME.desktop"
+    gio set "$HOME/Desktop/$ICON_NAME.desktop" metadata::trusted true 2>/dev/null || true
+    log "desktop shortcut: $HOME/Desktop/$ICON_NAME.desktop"
+  fi
+
+  # Pin to the GNOME Dash so the icon is visible in the Activities overview.
+  "$PYTHON_BIN" - <<'PY_EOF' 2>/dev/null || log "warning: could not pin to GNOME Dash"
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio
+s = Gio.Settings.new("org.gnome.shell")
+fav = list(s.get_strv("favorite-apps"))
+if "video-player-demo.desktop" not in fav:
+    fav.append("video-player-demo.desktop")
+    s.set_strv("favorite-apps", fav)
+print("[icon] pinned to GNOME Dash")
+PY_EOF
+
+  update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
+  gtk-update-icon-cache -f -t "$ICON_THEME_DIR" 2>/dev/null || true
+  log "icon installed: $ICON_SVG"
+}
+
+# Install the bundled Desktop Icons NG (DING) extension so GNOME paints icons
+# on the desktop.  User-level only: no root, no apt, no network.  Best-effort --
+# playback and the launcher never depend on it.  GNOME Shell scans extension
+# directories only at startup, so on a running Wayland session the icons appear
+# after one log out / log in.
+install_desktop_icons() {
+  if [ "$INSTALL_DESKTOP" -eq 0 ]; then
+    log "skipping desktop-icons extension (--no-desktop)"
+    return 0
+  fi
+  if [ ! -d "$DING_SRC/$DING_UUID" ]; then
+    log "warning: bundled desktop-icons extension missing at $DING_SRC; skipping"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '[dry-run] install desktop-icons %s -> %s/.local/share/gnome-shell/extensions/%s\n' \
+      "$DING_SRC/$DING_UUID" "$HOME" "$DING_UUID"
+    return 0
+  fi
+  if ! command -v gnome-shell >/dev/null 2>&1; then
+    log "gnome-shell not found; skipping desktop-icons extension"
+    return 0
+  fi
+  case "${XDG_CURRENT_DESKTOP:-}" in
+    "" | *[Gg][Nn][Oo][Mm][Ee]*) ;;
+    *)
+      log "desktop is not GNOME (XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP); skipping desktop-icons extension"
+      return 0
+      ;;
+  esac
+
+  EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$DING_UUID"
+  SCHEMA_DIR="$HOME/.local/share/glib-2.0/schemas"
+  mkdir -p "$EXT_DIR" "$SCHEMA_DIR"
+  cp -a "$DING_SRC/$DING_UUID/." "$EXT_DIR/"
+  if [ -d "$DING_SRC/schemas" ]; then
+    cp -a "$DING_SRC/schemas/." "$SCHEMA_DIR/"
+    glib-compile-schemas "$SCHEMA_DIR" 2>/dev/null || \
+      log "warning: glib-compile-schemas failed; the extension may not load"
+  fi
+
+  # Needed when invoked from a non-interactive SSH session (no session bus yet).
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "/run/user/$(id -u)/bus" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+  fi
+
+  # Append to enabled-extensions without clobbering the user's other extensions.
+  "$PYTHON_BIN" - "$DING_UUID" <<'DING_EOF' 2>/dev/null || \
+    log "warning: could not enable desktop-icons via GSettings (enable it in the Extensions app)"
+import sys
+
+import gi
+
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio
+
+uuid = sys.argv[1]
+settings = Gio.Settings.new("org.gnome.shell")
+enabled = list(settings.get_strv("enabled-extensions"))
+if uuid not in enabled:
+    enabled.append(uuid)
+    settings.set_strv("enabled-extensions", enabled)
+print("[ding] enabled", uuid)
+DING_EOF
+
+  log "desktop-icons extension installed: $EXT_DIR"
+  log "note: GNOME Shell loads extensions at startup; log out and back in once (or reboot) on Wayland"
 }
 
 while [ $# -gt 0 ]; do
@@ -238,6 +391,8 @@ if [ "$CHECK_STATUS" -ne 0 ]; then
 fi
 
 install_launcher
+install_icon
+install_desktop_icons
 
 cat <<EOF
 
