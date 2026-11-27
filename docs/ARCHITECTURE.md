@@ -1,7 +1,9 @@
 # 视频播放器架构设计（M1–M5：播放、检测、GPU 美颜、录制与实验性 warp）
 
 > 状态：M1 硬解播放、M2 NPU 人脸检测、M3 GPU 美颜与对比模式、M4 录制与交付打磨、
-> M5 检测保持与实验性瘦脸/大眼 warp 均已实现并在板端验证：1080p30 播放稳定 30 fps；
+> M5 检测保持与实验性瘦脸/大眼 warp 均已实现并在板端验证；ui-v5 P1–P4（浏览壳/首页/详情/
+> 播放页）已于 2026-11-27 全部板端验收（§2.11）；同日的**最小设置页**（§2.12，语言 / 解码 /
+> 扫描目录 / 关于）已于 2026-11-27 10:02 上板验收（§2.12）；1080p30 播放稳定 30 fps；
 > 磨皮/美白在 Mali GPU 的单个 `glshader` 内完成（M3 单帧 0.8–1.6 ms，相对纯播放的
 > CPU 增量约 +1–2 个百分点）；人脸遮罩由 NPU 检测框光栅化，分屏对比在同一帧、
 > 同一次 pass 内完成。证据见 `docs/evidence/m3-*.png`，实测数据见
@@ -360,14 +362,16 @@ P1 把内嵌样式表拆到 `ui/style.py` 并换成琥珀 token 之后，P2 把�
   「返回片库」不会留下半截状态。
 - **启动落点**：无媒体 → browse；带媒体参数 / `--demo` / `--record` → player
   （录制画布按播放页控件分配合成）。`--check` 不建窗口。
-- **左导航**：88 px，品牌块 + 片库 / 最近 / 设置（置灰）+ 底部状态点与时钟。
+- **左导航**：88 px，首页 / 片库 / 最近 / 设置 + 底部状态点与时钟（设置曾在
+  P1–P3 置灰，2026-11-27 起是真页面，见 §2.12）。
   图标是 21 px `DrawingArea` 手绘线稿，绕开板端精简 icon theme 会画空按钮的问题。
-  「最近」不是独立页面，等价于片库的「最近观看」筛选。
+  「最近」在 P2/P3 里只是片库的 `recent` 筛选；2026-11-27 起改成独立页（见 §2.13）。
+  顶部的「面」品牌块（42×42）于 2026-11-27 按用户决定删除，导航随之上移（§2.14）。
 - **片库数据层**（`library.py`，无 GTK / GStreamer 依赖）：
   `config.library.directories` 与 XDG state 里用户「选择目录」的结果取并集 →
   单层扫描（与 `expand_media_args` 一致）→ `LibraryItem`。元数据缓存以
-  「解析后路径 + size + mtime」为键，文件变了自动失效；筛选
-  `all / recent / finished`、排序 `name / duration / added`、chip 计数都是纯函数。
+  「解析后路径 + size + mtime」为键，文件变了自动失效；筛选 `all / finished`
+  （`recent` 于 2026-11-27 移入独立页）、排序 `name / duration / added`、chip 计数都是纯函数。
 - **元数据与缩略图**（`probe.py`）：`GstPbutils.Discoverer` 的同步接口在**工作
   线程**里串行跑（`discover_uri_async()` 在本栈 PyGObject 上不派发回调，见
   PITFALLS），`playbin ! appsink` 在 PAUSED 后 seek 到 10% 拉一帧，按
@@ -376,7 +380,7 @@ P1 把内嵌样式表拆到 `ui/style.py` 并换成琥珀 token 之后，P2 把�
   会话内集合，避免每次进页重复付 8 s 超时。两件事都只在 browse 页可见时运行，
   进 player 页立即 `suspend()`，VPU 归播放。
 - **片库页**（`ui/library_page.py`）：页头（片库 / 项数 / 目录数 / 排序菜单 /
-  重扫）、三个筛选 chip（全部 / 最近观看 / 已看完）、4 列 × 273 px 固定宽卡片
+  重扫）、两个筛选 chip（全部 / 已看完；「最近观看」2026-11-27 起是独立页）、4 列 × 273 px 固定宽卡片
   网格（273×4 + 16×3 = 1140，与内容宽精确对齐）、页脚扫描摘要。卡片是 Cairo
   自绘：圆角裁切、封面居中裁剪、时长胶囊、已看完徽标、进度发丝线；GTK4 不能把
   子控件内容裁到 CSS 圆角，所以不用 `Gtk.Picture`。无海报时画同尺寸占位板，
@@ -401,12 +405,13 @@ P1 把内嵌样式表拆到 `ui/style.py` 并换成琥珀 token 之后，P2 把�
 P3 在 P2 的浏览壳里加两个页面，并把「点卡片」的落点从播放页改成详情页；播放页
 （`Gtk.Paned`、侧栏两页、全屏 dock、录制编排）完全没动。
 
-- **浏览壳结构**：`ui/browse.py::BrowseShell` = `Rail(88 px)` + `Gtk.Stack(home / library
-  / detail)`。左导航从 `library_page.py` 抽到 `ui/rail.py`（首页 / 片库 / 最近 / 设置置灰）；
-  「最近」仍是片库的筛选而不是独立页。外层 `PlayerWindow` 仍是 `Gtk.Stack(browse / player)`。
+- **浏览壳结构**：`ui/browse.py::BrowseShell` = `Rail(88 px)` + `Gtk.Stack(home / library /
+  recent / detail / settings)`。左导航从 `library_page.py` 抽到 `ui/rail.py`（首页 / 片库 /
+  最近 / 设置）；「最近」在 P3 时仍是片库的筛选，2026-11-27 改成独立页（§2.13）。
+  外层 `PlayerWindow` 仍是 `Gtk.Stack(browse / player)`。
 - **导航与返回**：启动无媒体落 home；卡片→详情→播放，播放页返回箭头 / `Esc` / 状态卡
   「返回列表」都回**打开播放页时所在的那一页**（`BrowseShell.mark_player_origin()` /
-  `activate()`）；详情页自己的返回圆钮与 `Esc` 回来源页（home 或 library）。
+  `activate()`）；详情页自己的返回圆钮与 `Esc` 回来源页（home / library / recent）。
   在 browse 页上除 `Esc` 外的播放/功能快捷键不再响应（P2 时空格会弹打开文件对话框）。
 - **播放列表语义**：`PlayerWindow._play_paths(paths, index, start_position_ns=None)` 用
   「用户眼前那份列表」装 playlist——详情页=目录选集顺序、首页继续观看=4 卡顺序、
@@ -415,7 +420,8 @@ P3 在 P2 的浏览壳里加两个页面，并把「点卡片」的落点从播�
   时长·分辨率·编码·体积/路径/CTA）+「继续观看」4 卡 +「最近添加」4 卡；hero 是**弹性带**
   （`vexpand`，最小 170 px），把行高/字体的变化吃掉，不把 1280×768 窗口撑大。
   主 CTA 位置 ≥1 s 且未看完才写「继续观看 mm:ss」（`browse.RESUME_MIN_NS`）；空片库时整页
-  换成取景框空态（选择目录 / 打开文件 / 前往片库），不是「空 hero」。
+  换成取景框空态（选择目录 / 打开文件 / 前往片库），不是「空 hero」。「继续观看 › 全部」
+  落到最近页（§2.13），「最近添加 › 全部」仍进片库。
 - **详情页**（`ui/detail_page.py`）：268 px 背景板（返回圆钮 + chips + 标题/副题 + 路径 +
   续播/播放/重播 CTA）+ 左栏 3 列选集（当前集琥珀描边 + `正在播放` + 进度线 + 自动滚到当前行）
   + 右栏「文件参数」（编码/画面/帧率/时长/大小/码率/解码，7 行真值）与「同目录」3 行。
@@ -437,6 +443,317 @@ P3 在 P2 的浏览壳里加两个页面，并把「点卡片」的落点从播�
   板端 GTK 4.18 实测 headerbar 58 px、内容 1280×709，首页 / 详情 / 片库 / 空态四张
   1280×768 截图与 54 项断言全过；详情参数行的「VPU 硬解」与 hero 续播均为真值。
 
+### 2.11 ui-v5 播放页重做（2026-11-27，P4）
+
+P4 把播放页从「GTK header + 侧栏 + 信息行 + 控制条」改成视觉稿的**画面优先**结构。
+浏览壳、播放后端、美颜管线、录制分支都没有改协议，只换了播放页的控件树和展示。
+
+- **页面结构**（`window.py::_build_player_area`）：播放页不再显示 `Gtk.HeaderBar`，
+  窗口根是 `Gtk.Overlay`（`play-stage`，底色 `@video` 纯黑），主 child 是
+  `Gtk.AspectFrame(16:9, obey_child=False)` 包住的视频 overlay。1280×768 时视频区
+  实测 **1280×720 @ y=24**；上下黑边也属于 stage，所以换窗口尺寸仍居中。
+  顶部/底部 scrim（`play-veil-top/bottom`）是 `can_target=False` 的渐变层；顶栏、
+  底部 dock、右侧抽屉、toast 都是 stage 的 overlay 子节点。
+- **顶栏**（`ui/player_chrome.py::PlayerTopBar`）：44 px 返回圆钮 + 标题（`stem`，
+  不带 `.mp4`）+ 副题（`播放列表 i/n`）+「选集」chip + 44 px 更多圆钮。
+  「选集」是 `Gtk.MenuButton`，popover 里是当前 playlist、最近播放（已排除 playlist
+  重复项）和「+ 添加文件」；行激活后关闭 popover 并切集。「更多」是打开文件 /
+  打开文件夹 / 切换语言 / 录制·停止 / 关闭窗口 + 快捷键说明。
+- **遥测行**（`PlayerChrome.TelemetryBar`）：`● 硬解/软解 | 编码 | 分辨率 | fps |
+  人脸 | 美颜 | CPU`。CPU 是 `resource.getrusage()` 的**进程 CPU（全部线程）**，
+  每秒采样；硬解状态点用 `ok`，软解点降为 `line_3`。窗口态和全屏态共用同一行，
+  全屏 dock 淡出后由左上角的 `fullscreen-telemetry` 常驻行接管。
+- **时间轴**（`PlayerChrome.ChapterTimeline`）：自绘 20 px 命中带、4 px 轨道、
+  12 px 琥珀/暖白旋钮；实现 `Gtk.Scale` 的 `set_value/get_value` 0–1000 子集和
+  `value-changed` 信号，所以 v4 的 seek 代码不用改。点击/拖动轨道会 seek。
+  章节刻度来自**真实数据**：GStreamer 在当前栈上的 `qtdemux` 不实现 `TocSetter`，
+  演示素材也没有章节，所以时间轴读取视频旁的
+  `<clip>.chapters.json`（`{"chapters":[{"start":15,"title":"…"}]}`，也接受裸列表），
+  没有 sidecar 就不画刻度，绝不按百分比编造刻度；`chapter_marks()` 只投影
+  0 < fraction < 1 的起点。P4 本机 QC 素材带 3 个章节，截图刻度为 25/50/75%。
+- **44 px 控制条**：上一项 / −15 s / 52 px 播放 / +15 s / 下一项 / 停止 /
+  倍速（0.5–2.0×）/ 解码三段 / 音量 / 字幕 / 美颜 pill / 全屏。全屏时额外出现
+  禁用态「对比 · 需美颜」pill（v4 的全屏 dock 入口保留）。美颜 pill 现在**打开
+  右侧抽屉**，其 checked/label 仍镜像 `beauty.enabled`；B 键仍直接开关美颜。
+- **右侧美颜抽屉**（`Gtk.Revealer(SLIDE_LEFT)` + 352 px panel）：固定标题/总开关/
+  NPU 人脸计数，下面 `Gtk.ScrolledWindow` 承载磨皮/美白、A|B、分屏位置、人脸框、
+  更多设置（瘦脸/大眼）和说明。抽屉滚轮仍由 `_install_page_wheel_scroll()` 捕获，
+  避免滚轮改数值（PITFALLS §5）。关闭美颜的级联与 v4 完全相同：A|B、人脸框、
+  效果一起关，重开不自动恢复；抽屉只换容器，不改状态机。
+- **全屏 dock**：窗口态底部 dock 与全屏态是同一个控件，不再在两种布局间搬运；
+  `_enter_immersive()` 只隐藏顶栏、显示 compare pill、显示常驻遥测和底部 2 px
+  进度线；顶/底 scrim 随 HUD 出现/隐藏；2.5 s 静止后 `_dock_revealer` 淡出，
+  左上遥测保留 62%，鼠标/键盘/点按唤回。暂停、抽屉打开时 dock 不淡出。
+  `--record` 仍停留在窗口态（画布按控件分配合成）。
+- **录制编排**：`_recording_layer_specs()` 从 v4 的 header/sidebar/info/controls 改为
+  **top / dock / drawer / hint / playback-status** 五层，视频 hole 仍取
+  16:9 视频 overlay；画布底色改为 `@video`（纯黑）以匹配播放页的上下黑边。
+  `_on_record_tick()` 每秒刷新 top/dock，抽屉打开时额外每 3 s 刷一次；录制中
+  `CanvasBuilder` 的 `video_area` 实测 `Rect(0,24,1280,720)`。
+- **兼容与返回**：browse 壳不变；播放页顶栏返回/`Esc` 回打开时的 browse 页面，
+  浏览页重新显示 headerbar。启动无媒体时仍落 browse home。
+
+**本机验证**（2026-11-27，GTK 4.14.5 / GStreamer 1.24.2 / Xvfb :13 1280×800）：
+真窗口 1280×768（无 WM 下用 1290×778 默认尺寸抵消 CSD 阴影）、106 项交互断言全过；
+截图见 `.cache/qc/ui-v5-p4/out/`，录制画布合成见 `.cache/qc/ui-v5-p4/recording-composed.png`。
+本机没有 `gtk4paintablesink`/GL/NPU，探针里的视频帧是从同一素材抽出的真实帧注入
+`Gtk.Picture`，美颜可用性与 GPU ms 只在截图阶段按板端数据展示，**不作能力验收**。
+
+**板端验证**（2026-11-27 09:19，用户当次授权；GTK 4.18.6 / GStreamer 1.26.2 / GNOME Wayland）：
+5 文件原子替换、`--check --require-board` 17 ok、CSS 34,598 B / 0 parsing errors；
+真实 `mppvideodec` + `gtk4paintablesink` 下 8 个 mode / **116 项断言全过**——窗口 1280×768、
+视频 `(0,24,1280,720)`、全屏 1280×800 `(0,40,1280,720)`、顶栏 46、dock 96、播放键 52、
+控制键 44、时间轴 20、遥测 `硬解/H.264/1920×1080/30.0 fps`、章节 25/50/75、抽屉 318×546、
+抽屉开美颜 GPU 2.2–3.0 ms/帧（NPU 2 张脸、fps 30.8）；30 s 录制成片 1280×768@30 /
+902 帧 / 30.07 s。全过程 uptime 连续、无重启。
+**仍未验证**：触摸点按；popover 在 Wayland 是独立 subsurface，整窗快照与无焦点探针都拿不到
+（surface 1×1），只有内容/行为断言、没有 popover 截图；H.265/VP9/AV1、4K、网络流未在 P4 复测。
+证据：`.cache/qc/ui-v5-p4-board/`（内部）。
+
+**P5 修订（2026-11-27，本机完成并已板端验收）**——真实使用推翻了 P4 的两条取舍：
+
+- **窗口态不再隐藏 headerbar**：`_sync_page_chrome()` 只在「播放页 + 非全屏 + 非
+  `--record`」时显示 `Gtk.HeaderBar`（片段名 + 窗口按钮），画面顶栏进入 *compact*：
+  隐藏标题/副题两个 label、保留 titles box 作占位，所以「选集/更多」仍在右侧。
+  全屏隐藏 headerbar 并恢复完整标题；`--record` 的画布与 P4 逐项一致。
+  1280×768 时：47 px 标题栏 + 721 px 画面（16:9 → 1280×720）。
+- **「选集」从 popover 改为占布局的右侧栏**：`Gtk.Revealer(SLIDE_LEFT)` 包
+  360 px `sidebar-panel`（标题/计数/✕、播放列表、+ 添加文件、最近播放；`Esc`、
+  再点选集、✕ 均可关闭）。窗口态默认打开，视频缩到 **920×517**；打开时控制条
+  切两行（第一行 = 上一项/−15/播放/+15/下一项/停止/倍速/解码/音量；第二行 =
+  字幕/美颜/全屏），关闭后恢复单行 1280 布局。全屏与 `--record` 收起栏目但保留
+  用户选择；与美颜抽屉互斥（打开美颜先收起栏目，反之亦然）。
+- **headerbar 左上常驻「＋ 打开」菜单**（打开视频 / 选择文件夹，复用
+  `_on_open_clicked` / `_on_open_folder_clicked`）；片库/首页空态 CTA 保留，片库
+  非空后仍有全局入口。播放页「更多」里的同名入口不重复删除。
+- **画面手势**：单击 = 播放/暂停（300 ms 防抖）、双击 = 全屏/退出；分组在
+  `ui/taps.py`（纯 Python，`TapTracker`），不依赖 `Gtk.GestureClick` 的 `n_press`
+  ——触摸序列的 `n_press` 由 GTK/服务器的双击时间决定，不是产品契约。
+- **点外部关闭美颜抽屉**：stage 上 CAPTURE 阶段 `Gtk.GestureClick`，命中抽屉 panel
+  之外就关闭并 `set_state(CLAIMED)`，这一次点击不再穿透到暂停或控制条。
+
+本机验证（GTK 4.14.5 / X11 / 1920×1080 屏）：pytest **592 passed / 15 skipped**；
+`.cache/qc/fix58/shoot.py` **21/0**（4 张 1280×768 + 全屏 1920×1080 截图）；
+`.cache/qc/fix58/interactions.py` 五个场景 **39/0**（真实 xdotool 单击/双击/点外部）。
+**板端验收（2026-11-27 15:04，GTK 4.18.6 / Wayland / DSI 1280×800）**：4 文件原子替换、
+`--check --require-board` 17 ok、CSS 38,332 B / 0 errors；真实 `mppvideodec` 下
+layout **15/0**、fullscreen **8/0**、interact **9/0**——窗口 1280×768、视频 **920×517**、
+控制条 row1 830 + row2 177 ≤ dock 872；真全屏 **1280×800**、视频 **1280×720**；
+截图 1280×768 / 1280×800。**仍未验证**：真实手指触摸双击/点外部、30 s `--record` 成片、
+H.265/VP9/AV1/4K。证据 `.cache/qc/fix58-board/`。
+
+### 2.12 ui-v5 设置页（2026-11-27，已上板验收）
+
+视觉稿的第四项「设置」当时没有出稿，P1–P3 里一直置灰（`rail.py` 里 `set_sensitive(False)`、
+不接信号），悬停提示「设置页未出稿」。2026-11-27 产品决定补一个**最小设置页**，范围固定为四块：
+
+1. **界面语言**：中文 / 英文两段，切换走 `PlayerWindow._set_language()`（写 XDG config、
+   `_apply_language()` 全量重译）。2026-11-27 起设置页是**浏览页唯一入口**：header 的语言按钮已删除
+   （板端 18/0：titlebar 只剩标题与窗口按钮，无 `English` / `中文` 标签）；播放页「更多」里的语言项
+   保留（播放时 header 隐藏，否则只能退出播放才能改语言）。
+2. **解码方式**：自动 / 硬解 / 软解，读 `config.player.decode_mode`。在播放页切换时沿用
+   `_apply_decode_mode()`（重建管线、保住位置）；在浏览页切换只改配置（`_set_decode_mode()`
+   判断不在播放页就不碰管线），下次打开生效。**该值不落盘**，启动值仍来自配置文件。
+3. **扫描目录**：`config.library.directories` + `LibraryStore` 里用户选的目录，合并去重
+   （`settings.folder_rows()`）；配置里的目录只读（标「配置」），用户目录可移除；
+   选择/移除/重扫都委托 `LibraryPage`，页面不另存一份状态。
+4. **关于**：只读事实——版本、平台、内核、GTK、GStreamer、解码后端（`mppvideodec` 是否存在）、
+   状态文件与缓存目录（`settings.about_rows()` 给行，UI 只排版）。
+
+**结构**：`ui/settings_page.py::SettingsPage` = `Gtk.ScrolledWindow` + 四张 `.card-box` 卡片；
+页面不持有业务状态，语言/解码通过回调回到 `PlayerWindow`，目录通过 `LibraryPage` 的公共方法
+（`choose_directory()` / `rescan()` / `remove_directory()`）。纯数据在 `video_player/settings.py`
+（不 import `gi`），所以规则能在 `.venv` 下跑单测。
+
+**导航**：`BROWSE_PAGES` 增加 `settings`；rail 第四项恢复可点，`_sync_rail()` 负责高亮，
+`headline()` 返回（`设置`，`界面 · 播放 · 片库 · 关于`），`Esc` 回首页（这一页没有返回箭头）。
+从播放页返回时 `mark_player_origin()` 仍能记住 settings。
+
+**本机验证**（2026-11-27，GTK 4.14.5 / Xvfb :11 / 真实 `PlayerWindow`，空片库）：
+真窗口 1280×768，探针 **33/0** —— rail 可点、页面/标题/四卡、语言中英往返并落盘、
+解码段与播放页控制条双向同步、目录增删（临时目录）、关于 8 行、`Esc` 回首页；
+截图 `.cache/qc/ui-v5-settings/out/ui-v5-settings-01-zh.png` / `-02-en.png`。
+pytest **561 passed / 15 skipped**（新增 `test_settings_model.py` 8 项、`test_settings_page.py` 13 项）。
+
+**板端验证**（2026-11-27 10:02，用户当次授权；GTK 4.18.6 / GStreamer 1.26.2 / Wayland）：
+8 文件原子替换、`--check --require-board` 17 ok、CSS 35,892 B / 0 parsing errors；真实窗口
+**35 项断言全过**——窗口 1280×768、内容区 1192×711、语言分段容器 120×36、语言中英往返并落盘、
+设置页与播放页控制条的解码段双向同步、目录增删、`Esc` 回首页；关于卡读到真实板端值
+（`Linux aarch64` / `6.1.118-rt36` / `4.18.6` / `GStreamer 1.26.2` / `VPU 硬解可用`）。
+部署后回归 P4 播放页 `play` mode **33/0**；常驻实例 PID 1564280。证据：`.cache/qc/ui-v5-settings-board/`（内部）。
+
+**已知限制**：触摸点按、目录对话框的真实点选未验证；解码方式不跨启动持久化（改配置文件才跨启动）；
+设置页没有「恢复默认」或机型字段——演示不需要，不编数据。
+
+### 2.13 ui-v5 最近观看页（2026-11-27，方向 C：独立续播页）
+
+**背景**：视觉稿（`mockups/ui-v5`，README §4）把「最近」定成片库的 `recent` 筛选，并让左导航
+跟着筛选高亮。实现照做后暴露出三处不一致：点「最近」进去 H1 仍是「片库」、页头计数仍是全库
+12 项、排序仍是「最近添加」（按文件 mtime），而 rail 会被 chip 反控。2026-11-27 决定把它做成
+独立页（备选的方向 A「删入口」/ B「续播模式」未采用，效果图见 `mockups/ui-v5-directions/`）。
+
+**结构**：`ui/recent_page.py::RecentPage` = 页头（`最近观看` / 项数 / `继续观看 N · 已看完 M` /
+`清除记录`）+ `Gtk.ScrolledWindow` 里的两组卡片网格 + 空态。组头是
+`标题 + 计数 + 1 px 分隔线`（`.recent-group-*`、`.recent-rule`），卡片直接复用
+`library_page.LibraryCard`（273 px，4 列，与片库同一套海报/进度/徽标）。
+页面**不启 worker**：海报走 `LibraryPage.poster_for()`，元数据走 `item_for()`，两张表都来自
+片库页已经跑完的探测；缩略图后到时由 `BrowseShell._on_poster()` 转进 `on_poster()` 原地换图。
+
+**数据**：`browse.recent_view(items, recents)`（无 GTK，单测覆盖）把 `RecentsStore` 与扫描结果
+做**交集**——和首页「继续观看」同一条规则，只列还扫得到的文件（文件夹外的单文件没有海报与
+同目录选集，详情页无从渲染，仍留在播放页的「最近播放」列表里）。组内按
+`RecentItem.updated_at` 倒序，`progress ≥ FINISHED_THRESHOLD`（95%）进「已看完」，其余进
+「继续观看」。`HomeCard` 因此多了 `updated_at` 字段，首页与最近页共用同一个卡片模型。
+
+**交互**：
+- 「继续观看」卡片点按**直接续播**（playlist = 该组卡片顺序，`_play_paths` 走已有续播路径），
+  与首页「继续观看」一致；「已看完」卡片进详情页，用详情页的「重新播放」。
+- 页头「清除记录」走 `Gtk.AlertDialog` 确认（默认按钮是「取消」），确认后
+  `RecentsStore.clear()`，再经 `BrowseShell._on_history_cleared()` 调
+  `LibraryPage.refresh_history()` 把片库卡片的进度条与「已看完」计数一起归零。
+  文案只说清空记录列表，不承诺清 `ResumeStore`（那是 `player.resume` 的另一份状态）。
+- 空态 = 取景框 + 「还没有播放记录」+ 一句说明 + 「去片库」，清除按钮置灰。
+- 卡片 meta 用 `chrome.format_watch_time()`：`刚刚观看` / `今天 HH:MM` / `昨天 HH:MM` /
+  `M 月 D 日` / `YYYY 年 M 月 D 日`（英文 `Just now` / `Today HH:MM` / `M/D` / `Y/M/D`），
+  可续播时追加 `剩 mm:ss`。
+
+**导航**：`BROWSE_PAGES` 增加 `recent`；`_on_nav("recent")` 直接切页并刷新，不再经过
+`library.select_filter()`；`_sync_rail()` **只跟页面**（详情页跟 `_detail_origin`），
+chip 切换不再移动 rail 高亮；首页「继续观看 › 全部」落到最近页，`Esc` 回首页（同设置页）。
+
+**片库同步**：`FILTERS` 从 `all / recent / finished` 收成 `all / finished`，`filter_items()` /
+`library_counts()` 去掉 `recent_paths`；`LibraryPage` 去掉 `on_filter_change` 回调（原先只为
+同步 rail 而存在），新增 `item_for()` 与 `refresh_history()`。
+
+**文案**：新增 `recent_*` 17 条（标题/副题/组名/清除确认/空态/时间桶），删除已无入口的
+`library_filter_recent`；rail 的「最近」提示改用 `recent_title`。
+
+**验证**（2026-11-27，本机）：
+- `pytest` **573 passed / 15 skipped**（新增 `tests/test_recent.py` 10 项；`test_library` 的
+  筛选契约同步收窄）。
+- 真窗口探针 `.cache/qc/ui-v5-recent/shoot_recent.py`（GTK 4.14.5 / Xvfb :10.0 / 真实
+  `PlayerWindow` / 12 个 VP9 文件 + seed 的 `recent.json`）：**0 失败**，断言
+  page/rail/两组计数/页头副题/卡片控件数/空态/清除后进度归零/`Esc` 回首页；
+  截图 `out/recent.png`、`out/recent-en.png`、`out/recent-empty.png`（1280×768）。
+- **板端验收**（2026-11-27 11:00，用户当次授权「部署」；GTK 4.18.6 / GStreamer 1.26.2 /
+  Wayland / 真实 `mppvideodec`）：11 文件原子替换、`sha256sum -c` 11/11、`--check --require-board`
+  **17 ok / 0 warn / 0 fail**、CSS **36,593 B / 0 parse errors**；真窗口 **33/0**——rail 信号切页/
+  高亮、两组与计数、273×170 卡、英文标签、片库两 chip、空态、点卡经 `mppvideodec` 起播
+  （playlist = 继续观看组）、`Esc` 回最近页；2 张 1280×768 截图。部署后 P4 播放页回归 **33/0**。
+  证据 `.cache/qc/ui-v5-recent-board/`。
+- **未验证**：触摸点按、清除确认对话框的人工点选。
+
+**已知限制**：只列扫描目录里的文件（与首页一致，见上）；不造「今天/昨天」时间分组标题
+（组维度是观看状态，时间是卡片 meta）；清除记录不清 `ResumeStore`（文案已如实说明）。
+
+### 2.14 ui-v6 方案 C「编辑台」落地（2026-11-27；本机完成，17:55 已板端部署）
+
+**决定**：`mockups/ui-v6` 三方向中用户选定 **C · 编辑台**（冷中性 + 骨白操作色 + 琥珀只做
+数据），并要求删除左导航顶部 42×42 的「面」标志（连底板）。设计源是
+`mockups/ui-v6/{README.md,base.css,skin-c.css,app.html,c-*.png}`；落地只改视觉层，页面结构、
+控件位置与点击区域、播放列 920 + 抽屉 360、视频 920×517 均不动（§1 冻结几何）。
+
+**配色拆分（`ui/style.py`）**：ui-v5 把强调色全给琥珀；C 拆成两个语义：
+- **骨白 = 操作**（`play` #F1EDE4 / `play_hi` / `play_active`）：主 CTA、开关 ON、
+  当前导航项/页签、播放键、滑块手柄、焦点环。
+- **琥珀 = 数据**（`accent` #D9A85C / `accent_hi`）：进度、计数、实时遥测、滑杆填充、
+  时间轴播放段、卡片进度线。
+- 冷中性表面：页底 `#0B0D0F`、导航底 `#090B0D`、面板 `#111417`、抬起面 `#171B1F`、
+  发丝线 `#20252A`、播放页底 `#050607`、抽屉 `#0E1114`、设置卡 `#0C0F11`；卡名
+  13 px / 元信息等宽 11 px `#828B93`、时长淡底等宽、圆角 10（Hero·抽屉）/ 8（海报·
+  导航项）/ 9（按钮·Chip）。`annotation` 仍只给画面标注，widget 规则不引用
+  （`tests/test_theme.py` 守住）。
+- `tests/test_theme.py` 从 ui-v5 契约改成 ui-v6：冻结 9 个语义 token（含骨白），
+  分别断言骨白到 8 个操作控件、琥珀到 7 个数据读数，并要求 GTK `parsing-error`
+  信号 **0 条**（旧版只捕获 `load_from_data` 异常，未知属性不会失败）。
+
+**删除「面」标志**：`ui/rail.py` 删 `mark_box` / `_mark`、`apply_language` 不再取
+`rail_mark`；`i18n.py` 删该 key；`style.py` 删 `label.rail-mark`。rail 保持
+`padding: 14px 0 12px 0`、nav 保持 `margin-top: 24px`，导航第一项落在 rail 顶下
+**38 px**；相对旧构建实测上移 **44 px**（旧 mark 盒是 42 px 高 + 2 px margin，
+设计稿的「42 px」只算底板）。当前项不再用整块琥珀底：`_ActiveBar` 是 2×40 px 骨白
+子控件（GTK CSS 无 `::before`），图标与文字转骨白；录制画布不含 rail，无需另删。
+
+**GTK 落地要点**：
+- 40 px 短 Tab 下划线：`player_chrome.DrawerTabRule` 是 2 px `DrawingArea`，同层画
+  1 px 发丝线 + 40 px 骨白下划线，挂在大纲「选集」列与美颜抽屉的标题行下；
+  产品没有 mockup 的「选集 / 美颜」双 Tab（两者是独立面板），所以标记落在当前
+  面板标题下，而不是新增一排 Tab。
+- 时间轴：3 px 轨道 + `10×15` 竖条骨白滑块（`ChapterTimeline`），章节刻度 1×10。
+- 海报：`paint.py` 圆角 8、50 px 单段渐变 scrim、淡底等宽时长、2 px 琥珀进度；
+  Hero/详情背景板圆角 10，scrim 换成 C 的左右渐隐 + 底部压暗配方。
+- 开关 44×24 / 5 px 圆角 / 骨白 ON + 墨色 knob；播放键 52 px 骨白 + 1 px 高光边；
+  解码段选中为 12% 骨白 + 1 px inset 环；Chip 9 px 圆角；焦点环骨白。
+- 不新增字体；卡名用 400 字重（板端 Noto Sans CJK 无 450/500，会回退 400）；
+  不使用 `backdrop-filter`（效果稿也未用，玻璃感 = alpha 填充 + 1 px 边）。
+
+**验证（本机 GTK 4.14.5 / X11 :10.0 / 真窗口 1280×768）**：
+- `PYTHONPATH="$HOME/.local/lib/python3.10/site-packages" python3 -m pytest tests -q`
+  → **598 passed / 15 skipped / 0 failed**（基线 592 + 15；新增 `test_theme.py` 6 项；
+  `board-install.sh` payload 已按流程重建为 **74 文件 / 383,854 B**）。
+- CSS **40,237 B**、`Gtk.CssProvider` `parsing-error` **0**、运行时无 `GtkGizmo`
+  尺寸告警（上一版 `scale slider` 的 10 px 覆盖会报 `min width -4`，已删）。
+- `.cache/qc/ui-v6/probe.py`（真实 `PlayerWindow` + 注入帧 + `display_bypass`
+  实时 fakesink）：**37/0** —— 无 rail mark、导航 38 px、当前项 2×40 骨白条、卡片
+  273×132 圆角 8、库三行不滚动、视频 920×517、选集列 360、Tab 规则 2 px、后端
+  定位到 15 s；截图 `out/ui-v6-01-home…05-play-beauty-on`（1280×768）。
+- `.cache/qc/ui-v6/pages.py`：详情 / 最近 / 设置三页 **12/0**（窗口高 768、页面不溢出），
+  截图 `ui-v6-06…08`。对比图 `out/compare-*.png`、`out/compare-sheet.png`。
+- **板端部署**（2026-11-27 17:55）：8 文件替换、GTK 4.18.6 CSS 0 errors、`--check --require-board` 17 ok、
+  `home-1280x768.png` 探针 10/0；常驻实例 PID 2219404（tris）；详见 `.cache/handoff/STATE.md` §65。
+  `docs/PITFALLS.md` §2 的板端字体/尺寸经验仍适用（底部预算以板端实测为准）。
+
+**与效果稿的已知差异（均为保留的既有结构 / mockup 与 GTK 的度量差）**：
+headerbar 50 px（GTK 实测）vs 稿 59；rail 项 72 px（min-height 60 + padding 12，v5 既有）
+vs 稿 60；Hero 弹性 234 px vs 稿 220（v5 的行距 10/9 未改）；播放页视频垂直居中 top 147
+vs 稿 95；控制条在选集列打开时拆两行、产品无「选集/美颜」双 Tab —— **已由 P6 解决（§2.15）**；
+美颜抽屉 352×529（内容 318×495）浮层（margins 76/112/24）vs 稿 360 全高列，故「更多设置」需滚动；片库只有 2 个 chip
+（「最近观看」自 §2.13 起是独立页）。骨架色板、骨白/琥珀纪律、圆角与字阶按 C 落地。
+
+### 2.15 ui-v5 P6 窗口态单行控制条 + 选集/美颜面板（2026-11-27，已上板验收）
+
+P5/v6 的窗口态在选集栏打开时把「字幕 / 美颜 / 全屏」拆到第二行（920 px 画面 + 872 px dock），
+视觉上像控制条断了。P6 把底部固定成一行，并把次级入口放回各自的容器：
+
+- **右侧 360 px 面板 = 选集 / 美颜两个标签**：`_build_episodes_sidebar()` 的头部换成
+  `.sidebar-tabs` 分段（两个 `Gtk.ToggleButton` 用 `set_group` 成单选），下面是 `Gtk.Stack`；
+  选集页保留播放列表/计数/+ 添加文件/最近播放，美颜页就是原来的 `_build_beauty_page()` 整页。
+  面板顶部标签 + ✕；✕ / chip / `Esc` 关闭，`_panel_tab` 记住上次标签。
+- **美颜页只构建一次，按模式换宿主**：窗口态放进面板标签（去掉 `.beauty-drawer` 卡片类、
+  margin 归零、隐藏页头标题/第二个 ✕/40 px 下划线）；全屏和 `--record` 放回右侧 overlay
+  抽屉（恢复 margin 76/112/24、352 px、卡片类、页头/✕/下划线）。搬页面前若抽屉开着先关，
+  且 `Gtk.Stack` 的旧页名要显式 `remove` 后再 `add_named`（见 PITFALLS §2）。
+- **字幕跟着顶栏走**：窗口态把 `_subtitle_button`（沿用原 popover）插到画面顶栏 titles box
+  之后、面板 chip 之前；全屏/`--record` 面板不可用时插回底部行 spacer 之后（`--record` 保持
+  P4 画布：字幕仍在底部行）。
+- **底部固定一行**：`_build_controls()` 只返回一行（transport + 倍速 + 解码 + 音量 + 全屏；
+  美颜 pill 和对比 pill 只在面板不可用的模式显示）。删除 `_controls_row2` /
+  `_set_transport_compact` 与 `.play-controls-stack`；音量百分比 label 删除（值进 tooltip）。
+  窗口态 872 px dock 下 row 自然宽 **838**（中英相同，余 34 px）；全屏 1232 px dock 下
+  **1080 中 / 1194 英**（含对比 pill）；`--record` **972**。
+- **chip 图标化**：顶栏面板按钮隐藏「选集 · 美颜」文字（只留 ☰ + tooltip「选集 / 美颜」），
+  美颜开启时加琥珀点（选中态骨白底时点变墨色）。
+- **状态机**：`_sync_episodes_layout()` 只做页面/全屏/录制门控，再调
+  `_sync_secondary_placement(available)`；`_set_beauty_drawer_open()` 在页面被面板持有时
+  拒绝打开（pill 同时隐藏）；面板 chip 在面板不可用的模式（`--record`）隐藏，避免死控件。
+
+**本机验证**（GTK 4.14.5 / Xvfb 1280×768 与 1280×820、真实 `PlayerWindow`、fakesink 注入
+画面）：pytest **606 passed / 15 skipped**（新增 `tests/test_player_panel.py` 7 项、
+`test_player_drawer.py` +1、`test_player_episodes.py` 改写）；`.cache/qc/fix59/check.py`
+windowed **24/0**、fullscreen **11/0**、record **11/0**；截图 5 张在 `mockups/fix59/`
+（本机，gitignored）。
+
+**板端验收**（2026-11-27 18:36，用户当次授权；GTK 4.18.6 / Wayland / DSI 1280×800 /
+真实 `mppvideodec`）：3 文件原子替换（`window.py 401ad1f7…`、`style.py 5fce8be6…`、
+`i18n.py 814a9c1a…`），`--check --require-board` **17 ok**、CSS 0 errors；探针
+`/home/tris/ui-v6-p6-accept/board_accept_p6.py` windowed **21/0**、beauty **23/0**、
+fullscreen **12/0**、record **11/0**——窗口 1280×768、视频 **920×517**、dock **872**、
+row **838 ≤ 872**；真全屏 1280×800、视频 **1280×720**、dock **1232**、row
+**1066 ≤ 1232**；record 1280×768、row **967 ≤ 1232**。截图
+`docs/evidence/ui-v5-player-1280x768.png` / `...fullscreen-1280x800.png`；常驻实例
+**PID 2278277**（tris，语言 zh，13 项 / 2 目录）。**仍未验证**：真实手指触摸标签/✕/chip、
+30 s `--record` 成片、H.265/VP9/AV1/4K。
+
 ## 3. 模块划分
 
 | 文件 | 职责 | 状态 |
@@ -457,15 +774,20 @@ P3 在 P2 的浏览壳里加两个页面，并把「点卡片」的落点从播�
 | `src/video_player/rknn_runtime.py` | `librknnrt.so` 的最小 ctypes 封装（init/query/inputs/run/outputs/release） | M2 已实现 |
 | `src/video_player/detection.py` | NV12→BGR、pad probe 采样、单深度队列与后台检测线程、NPU 起播预热（在 pipeline PLAYING 前、主线程执行） | M2 已实现；M3 加真实尺寸预热；2026-11-18 从 `start()` 移到 `prepare()`，避免 streaming thread 上 RKNN `std::bad_alloc` |
 | `src/video_player/beauty.py` | 美颜参数与 fragment shader、uniform 打包、纹理坐标反向旋转、CPU 参考蒙版、脸型拟合 | M3 已实现（单测覆盖）；M5 加 12 个 warp uniform 与实验性瘦脸/大眼；M5.2 加 10 个 shape uniform、`FaceShape`/`fit_face_shape`、Lab 肤色分割与脸内瘦脸（单测覆盖） |
-| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、空态拖放区、信息行、44 px 两行控制条、播放列表、顶部美颜面板、全屏 dock/遥测/进度线、分屏标签、L 形人脸框、中英文切换、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志、滚轮事件路由与操作日志；ui-v5 P2 起根节点为 `Gtk.Stack`（browse / player）、header 返回箭头、启动落点与 Escape 回片库；ui-v5 P3 起 browse 子节点为 `BrowseShell`（home/library/detail 三页），`_play_paths()` 决定 playlist，browse 页上播放快捷键全部失效（Escape 回上一级） | M1–M3 已接线（板端验证）；中英文切换已板端点击验证；M5 加实验性 warp 滑杆；2026-11-19 侧栏滚轮改为滚动整页；2026-11-26 **UI v3 全量改造**：空态拖放区、带标签信息行、44 px 两行控制条、顶部美颜面板、不透明全屏 dock + 美颜/对比 pill、淡出后常驻遥测与 2 px 进度线、分屏原始/美颜标签、四角 L 形人脸框；板端 5 态快照见 `docs/evidence/ui-v3-0*.png`，`--check --require-board` 17 ok/0 warn/0 fail；2026-11-26 **UI v4**：侧栏播放列表/美颜两页、美颜页独立、关闭美颜联动；**同日落码**普通启动下运行中开美颜或人脸框时，若 `detection.enabled` 仍为 false 且已有媒体，按当前播放位置 `GLib.idle_add` 重开当前视频（保持美颜状态）并提示「正在启用人脸检测（约2秒）」，见 BOARD.md「运行中开美颜自动重开实测」 |
-| `src/video_player/ui/chrome.py` | UI 纯函数：编码归一（`X-H264` → `H.264`）、`CONTAIN` 视频矩形、四角 L 臂坐标、空态/控制条可见性、参数/时长/体积/分辨率格式化 | UI v3 新增；无 GTK 依赖，`tests/test_ui_chrome.py` 覆盖 |
-| `src/video_player/ui/style.py` | ui-v5 调色板单一来源：25 个 `@define-color` token + 内嵌样式表（27,954 B）；Cairo 图层用 `rgba()` 读同一份 token | ui-v5 P1 新增（`tests/test_theme.py` 40 项） |
-| `src/video_player/ui/library_page.py` | 片库页：页头/筛选/排序/卡片网格/页脚、空态与扫描范围栏、片库探测 worker 编排；卡片回调与 `on_poster`/`on_metadata` 钩子 | ui-v5 P2 新增；P3 把左导航与拖放 receptor 移到 `ui/rail.py` / `ui/browse.py`，卡片改为「打开详情」 |
-| `src/video_player/ui/rail.py` | 88 px 左导航：首页/片库/最近/设置（置灰）、手绘图标、硬解状态点、扫描时钟 | ui-v5 P3 从 `library_page.py` 抽出 |
-| `src/video_player/ui/paint.py` | Cairo 共用件：`Poster`（圆角海报/时长胶囊/徽标/进度线/当前集描边）、`GhostFrame`、`BackdropArt(hero/detail)`（封面裁剪 + 多层 scrim）、`paint_cover`/`draw_pill`/`rounded_path` | ui-v5 P3 新增（`tests/test_browse_shell.py` 守样式类名） |
-| `src/video_player/ui/browse.py` | `BrowseShell`：rail + home/library/detail 三页栈、导航/返回/拖放、`BackdropCache`（1140 px 大图，单 worker 串行 + size/mtime/width 缓存） | ui-v5 P3 新增；本机真窗口 93 项交互断言；板端 2026-11-26 部署，四张 1280×768 截图 + 54 项断言 |
-| `src/video_player/ui/home_page.py` | 首页：hero（弹性高度、续播 CTA、设备行）+ 继续观看 4 卡 + 最近添加 4 卡 + 空态整页 | ui-v5 P3 新增 |
+| `src/video_player/ui/window.py` | GTK4 主窗口、播放区、空态拖放区、信息行、单行 44 px 控制条、选集/美颜双标签面板（P6）、全屏 dock/遥测/进度线、分屏标签、L 形人脸框、中英文切换、`--record` 编排（画布定时器/录制时长/R 键）、快照、PERF 日志、滚轮事件路由与操作日志；ui-v5 P2 起根节点为 `Gtk.Stack`（browse / player）、header 返回箭头、启动落点与 Escape 回片库；ui-v5 P3 起 browse 子节点为 `BrowseShell`（home/library/detail 三页），`_play_paths()` 决定 playlist，browse 页上播放快捷键全部失效（Escape 回上一级）；ui-v5 P4（2026-11-27）播放页重做：隐藏 headerbar、16:9 居中画面、顶栏/选集/更多 popover、遥测行、章节时间轴、44 px 控制条、右侧美颜抽屉、全屏 dock 复用同一控件；录制图层改为 top/dock/drawer/hint/status | M1–M3 已接线（板端验证）；中英文切换已板端点击验证；M5 加实验性 warp 滑杆；2026-11-19 侧栏滚轮改为滚动整页；2026-11-26 **UI v3 全量改造**：空态拖放区、带标签信息行、44 px 两行控制条、顶部美颜面板、不透明全屏 dock + 美颜/对比 pill、淡出后常驻遥测与 2 px 进度线、分屏原始/美颜标签、四角 L 形人脸框；板端 5 态快照见 `docs/evidence/ui-v3-0*.png`，`--check --require-board` 17 ok/0 warn/0 fail；2026-11-26 **UI v4**：侧栏播放列表/美颜两页、美颜页独立、关闭美颜联动；**同日落码**普通启动下运行中开美颜或人脸框时，若 `detection.enabled` 仍为 false 且已有媒体，按当前播放位置 `GLib.idle_add` 重开当前视频（保持美颜状态）并提示「正在启用人脸检测（约2秒）」，见 BOARD.md「运行中开美颜自动重开实测」 |
+| `src/video_player/ui/chrome.py` | UI 纯函数：编码归一（`X-H264` → `H.264`）、`CONTAIN` 视频矩形、四角 L 臂坐标、空态/控制条可见性、参数/时长/体积/分辨率格式化、观看时间（刚刚/今天/昨天/月日） | UI v3 新增；无 GTK 依赖，`tests/test_ui_chrome.py` 覆盖；2026-11-27 加 `format_watch_time()` |
+| `src/video_player/ui/player_chrome.py` | P4 播放页无状态件：`ChapterTimeline`（自绘轨道/竖条旋钮/章节刻度 + `Gtk.Scale` 0–1000 子集）、`PlayerTopBar`（返回/标题/选集/更多）、`TelemetryBar`（硬解/编码/分辨率/fps/人脸/美颜/CPU）、`DrawerTabRule`（抽屉标题下 1 px 发丝线 + 40 px 骨白下划线） | ui-v5 P4 新增；ui-v6 §2.14 把旋钮改 10×15 竖条、4 px 轨道收到 3 px，并加 `DrawerTabRule`；常量 `CONTROL_HEIGHT=44`、`PLAY_BUTTON_SIZE=52`、`TIMELINE_HEIGHT=20`、`DRAWER_RULE_UNDERLINE=40` |
+| `src/video_player/ui/chapters.py` | 可选章节 sidecar 读取与投影：`<clip>.chapters.json`、裸列表兼容、坏文件静默为空、章节起点→0–1 fraction | ui-v5 P4 新增（`tests/test_chapters.py` 10 项） |
+| `src/video_player/ui/style.py` | 调色板单一来源：34 个 `@define-color` token + 内嵌样式表（ui-v6 约 40.0 KB）；Cairo 图层用 `rgba()` 读同一份 token | ui-v5 P1 新增；P2/P3/P4 持续追加规则；2026-11-27 换成 ui-v6 方案 C（骨白操作色 + 琥珀数据色，见 §2.14），`tests/test_theme.py` 改为 v6 契约 |
+| `src/video_player/ui/library_page.py` | 片库页：页头/筛选/排序/卡片网格/页脚、空态与扫描范围栏、片库探测 worker 编排；卡片回调与 `on_poster`/`on_metadata` 钩子 | ui-v5 P2 新增；P3 把左导航与拖放 receptor 移到 `ui/rail.py` / `ui/browse.py`，卡片改为「打开详情」；2026-11-27 去掉 `recent` chip 与筛选联动，加 `item_for()` / `refresh_history()` 供最近页复用 |
+| `src/video_player/ui/rail.py` | 88 px 左导航：首页/片库/最近/设置、手绘图标、硬解状态点、扫描时钟；当前项用 2×40 px 骨白竖条（`_ActiveBar` 子控件） | ui-v5 P3 从 `library_page.py` 抽出；2026-11-27 设置项从置灰改为可点，「最近」项改为真实页面；同日 ui-v6 删「面」标志、导航上移、当前项改骨白竖条（§2.14） |
+| `src/video_player/settings.py` | 设置页纯数据（无 GTK）：扫描目录合并去重与「配置 / 用户 / 缺失」标志、关于行的稳定顺序与字段 | 设置页新增（`tests/test_settings_model.py` 8 项） |
+| `src/video_player/ui/settings_page.py` | 设置页：语言 / 解码 / 扫描目录 / 关于四张卡；语言与解码走回调回窗口，目录委托 `LibraryPage`（`choose_directory`/`rescan`/`remove_directory`） | 设置页新增（`tests/test_settings_page.py` 13 项；本机探针 33/0） |
+| `src/video_player/ui/paint.py` | Cairo 共用件：`Poster`（圆角海报/淡底等宽时长/徽标/2 px 进度线/当前集描边）、`GhostFrame`、`BackdropArt(hero/detail)`（封面裁剪 + 多层 scrim）、`paint_cover`/`draw_pill`/`rounded_path` | ui-v5 P3 新增（`tests/test_browse_shell.py` 守样式类名）；ui-v6 §2.14 圆角 8/10、50 px 渐变 scrim、时长改淡底等宽 |
+| `src/video_player/ui/browse.py` | `BrowseShell`：rail + home/library/recent/detail/settings 五页栈、导航/返回/拖放、`BackdropCache`（1140 px 大图，单 worker 串行 + size/mtime/width 缓存） | ui-v5 P3 新增；本机真窗口 93 项交互断言；板端 2026-11-26 部署，四张 1280×768 截图 + 54 项断言；2026-11-27 加 settings 路由；同日晚加 recent 页（`_sync_rail()` 只跟页面，不再跟筛选） |
+| `src/video_player/ui/home_page.py` | 首页：hero（弹性高度、续播 CTA、设备行）+ 继续观看 4 卡 + 最近添加 4 卡 + 空态整页 | ui-v5 P3 新增；2026-11-27「继续观看 › 全部」改落最近页 |
 | `src/video_player/ui/detail_page.py` | 详情页：268 px 背景板（返回/chips/标题/CTA）+ 3 列选集（当前集自动滚入）+ 文件参数卡 + 同目录 3 行 | ui-v5 P3 新增 |
+| `src/video_player/ui/recent_page.py` | 最近观看页：页头（项数 / 继续观看 N · 已看完 M / 清除记录）+ 两组卡片网格（组内按观看时间倒序）+ 空态；海报与元数据复用片库缓存，不启 worker | 2026-11-27 新增（方向 C，见 §2.13） |
 | `src/video_player/i18n.py` | 中英文文案表、`--lang`/按钮切换、XDG 语言偏好持久化（默认中文，按钮显示目标语言） | 新增；单测覆盖，板端已验证 |
 | `src/video_player/diagnostics.py` | 崩溃与操作诊断：`faulthandler` 写 `crash.log`、关键 UI 操作追加 `actions.log`（XDG cache，失败静默） | 新增；单测覆盖，板端验证 `crash.log` 可捕获 SIGSEGV |
 | `src/video_player/ui/capture.py` | 逐 widget 快照（`Gtk.WidgetPaintable`→`render_texture`→pixbuf）与 `CanvasBuilder` 画布合成（缓存 base、分层刷新、人脸框） | M3 收尾新增（录制用） |
@@ -477,7 +799,7 @@ P3 在 P2 的浏览壳里加两个页面，并把「点卡片」的落点从播�
 | `scripts/measure_tap.py` | 板端 headless 检测吞吐测量（`fakesink sync=true`） | 可用（M2 实测工具） |
 | `scripts/probe_board.py` | 环境报告导出（文本/JSON/Markdown） | 可用 |
 | `scripts/build_board_install.py` | 重新生成 / 校验 `board-install.sh` 的内嵌源码包（确定性 tar.gz + base64） | 可用（发布前 `--check`） |
-| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制/中英文/检测保持/warp/诊断/UI chrome/全屏 dock/主题/片库/页面栈 单测 | 本机 `PYTHONPATH=~/.local/lib/python3.10/site-packages python3 -m pytest tests -q` → **531 passed / 15 skipped / 0 failed**（15 skip 为无 numpy 的既有能力差异）。ui-v5 P2 新增 `test_library.py`（23）、`test_probe.py`（5）、`test_page_shell.py`，并扩了 `test_ui_chrome.py` / `test_config.py` / `test_i18n.py`；ui-v5 P3 新增 `test_browse.py`（28）、`test_browse_shell.py`（11），`test_page_shell.py` 重写为 18 项（browse 壳/播放页往返、playlist、详情 Escape）；2026-11-26 新增 `test_board_install.py`（10），校验离线安装包内嵌源码与工作区逐字节一致；2026-11-27 新增 `test_recording_layers.py`（2），锁定录制画布必须包含标题栏 |
+| `tests/` | config/beauty/face/pipeline/playlist/app/envcheck/seek/launcher/fps/预热/录制/中英文/检测保持/warp/诊断/UI chrome/全屏 dock/主题/片库/页面栈 单测 | 本机 `PYTHONPATH=~/.local/lib/python3.10/site-packages python3 -m pytest tests -q` → **561 passed / 15 skipped / 0 failed**（15 skip 为无 numpy 的既有能力差异）。ui-v5 P2 新增 `test_library.py`（23）、`test_probe.py`（5）、`test_page_shell.py`，并扩了 `test_ui_chrome.py` / `test_config.py` / `test_i18n.py`；ui-v5 P3 新增 `test_browse.py`（28）、`test_browse_shell.py`（11），`test_page_shell.py` 重写为 18 项（browse 壳/播放页往返、playlist、详情 Escape）；2026-11-26 新增 `test_board_install.py`（10），校验离线安装包内嵌源码与工作区逐字节一致；2026-11-27 新增 `test_recording_layers.py`（2），锁定录制画布包含顶栏；ui-v5 P4 新增 `test_chapters.py`（10）、`test_player_drawer.py`（4），重写 `test_fullscreen_dock.py`（10）与 `test_page_shell.py`（18），`test_recording_layers.py` 改为 top/dock/drawer/hint/status；设置页新增 `test_settings_model.py`（8，纯数据）与 `test_settings_page.py`（13，结构 + 单选行为） |
 
 ## 4. 线程模型
 

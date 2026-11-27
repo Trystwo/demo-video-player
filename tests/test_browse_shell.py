@@ -28,6 +28,8 @@ NEW_UI_MODULES = (
     SRC / "ui" / "detail_page.py",
     SRC / "ui" / "rail.py",
     SRC / "ui" / "paint.py",
+    SRC / "ui" / "recent_page.py",
+    SRC / "ui" / "settings_page.py",
 )
 
 
@@ -63,7 +65,9 @@ def test_browse_pages_and_rail_entries() -> None:
     assert _module_constant(SRC / "ui" / "browse.py", "BROWSE_PAGES") == (
         "home",
         "library",
+        "recent",
         "detail",
+        "settings",
     )
     assert _module_constant(SRC / "ui" / "rail.py", "RAIL_ITEMS") == (
         "home",
@@ -91,6 +95,13 @@ def test_browse_shell_exposes_the_window_hooks() -> None:
         "apply_language",
     }
     assert required <= _methods(shell)
+
+
+def test_recent_page_surface() -> None:
+    recent = _class("RecentPage", SRC / "ui" / "recent_page.py")
+    assert {"refresh", "apply_language", "on_poster", "on_metadata", "summary"} <= _methods(
+        recent
+    )
 
 
 def test_home_page_and_detail_page_surface() -> None:
@@ -177,6 +188,28 @@ def test_new_home_and_detail_copy_is_present_in_both_languages() -> None:
         "spec_decode_hw",
         "spec_decode_sw",
     )
+    for key in (
+        "recent_title",
+        "recent_headline",
+        "recent_group_continue",
+        "recent_group_finished",
+        "recent_clear",
+        "recent_clear_title",
+        "recent_clear_body",
+        "recent_clear_confirm",
+        "recent_cancel",
+        "recent_empty_title",
+        "recent_empty_body",
+        "recent_open_library",
+        "recent_time_just",
+        "recent_time_today",
+        "recent_time_yesterday",
+        "recent_time_date",
+        "recent_time_date_year",
+    ):
+        chinese, english = TEXT[key]
+        assert chinese and english, key
+        assert chinese != english, key
     for key in keys:
         chinese, english = TEXT[key]
         assert chinese and english, key
@@ -206,6 +239,10 @@ def test_stylesheet_covers_the_new_pages() -> None:
         "label.spec-value",
         "button.rel-row",
         "label.detail-foot",
+        ".recent-page",
+        "label.recent-group-title",
+        "box.recent-rule",
+        "button.recent-clear:hover",
     ):
         assert selector + " {" in rules, selector
 

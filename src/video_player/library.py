@@ -47,9 +47,11 @@ __all__ = [
 #: so "已看完" is a filter over the recents progress rather than a second store.
 FINISHED_THRESHOLD = 0.95
 
-#: Filter chips: everything, what is in the recents history, what was watched
-#: through.  "剧集" is deliberately absent: there is no episode data source yet.
-FILTERS = ("all", "recent", "finished")
+#: Filter chips: everything, what was watched through.  "最近观看" is not a
+#: chip: it is the browse shell's own page (:mod:`video_player.browse`), so the
+#: grid only filters by what the history says about *progress*.  "剧集" is
+#: deliberately absent: there is no episode data source yet.
+FILTERS = ("all", "finished")
 
 #: Sort orders exposed by the page-head menu.  ``added`` is the file mtime.
 SORTS = ("name", "duration", "added")
@@ -369,13 +371,11 @@ def filter_items(
     items: Iterable[LibraryItem],
     filter_key: str,
     *,
-    recent_paths: Iterable[Path] = (),
     finished_paths: Iterable[Path] = (),
 ) -> list[LibraryItem]:
     """Keep the items a filter chip selects.
 
-    ``recent_paths`` are the files in the recents history (resolved paths);
-    ``finished_paths`` the subset watched past :data:`FINISHED_THRESHOLD`.
+    ``finished_paths`` are the files watched past :data:`FINISHED_THRESHOLD`.
     Unknown filter keys raise instead of silently showing everything.
     """
     if filter_key not in FILTERS:
@@ -383,9 +383,6 @@ def filter_items(
     ordered = list(items)
     if filter_key == "all":
         return ordered
-    if filter_key == "recent":
-        allowed = set(recent_paths)
-        return [item for item in ordered if item.path in allowed]
     allowed = set(finished_paths)
     return [item for item in ordered if item.path in allowed]
 
@@ -417,15 +414,12 @@ def sort_items(items: Iterable[LibraryItem], sort_key: str) -> list[LibraryItem]
 def library_counts(
     items: Iterable[LibraryItem],
     *,
-    recent_paths: Iterable[Path] = (),
     finished_paths: Iterable[Path] = (),
 ) -> dict[str, int]:
     """Chip counts for :data:`FILTERS`, in that order."""
     ordered = list(items)
-    recent = set(recent_paths)
     finished = set(finished_paths)
     return {
         "all": len(ordered),
-        "recent": sum(1 for item in ordered if item.path in recent),
         "finished": sum(1 for item in ordered if item.path in finished),
     }

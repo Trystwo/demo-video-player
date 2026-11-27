@@ -1,11 +1,11 @@
 """Fullscreen dock bookkeeping, testable without GTK or a display.
 
-The window cannot be instantiated on a host without GTK, so these tests lift
-the immersive layout methods straight out of ``window.py`` and run them against
-parent-tracking stand-ins.  What matters is the invariant the v3 mockup asks
-for: only the transport moves into the dock, the info row is replaced by the
-always-on telemetry line, and after the dock fades the telemetry (dimmed) and
-the bottom progress hairline stay visible.
+The P4 player page keeps the telemetry/rail/transport block in one place: the
+same dock is shown in the window and faded in fullscreen.  These tests lift the
+immersive methods out of ``window.py`` and drive them against stand-ins.  What
+matters is the behaviour the v4 mockup promised and P4 keeps: entering
+fullscreen hides the top chrome, the dock fades after idle while the corner
+telemetry and bottom hairline stay, and leaving restores the windowed chrome.
 """
 
 from __future__ import annotations
@@ -27,108 +27,9 @@ METHODS = (
     "_show_dock",
     "_maybe_hide_dock",
     "_sync_subtitle_margin",
+    "_sync_veils",
 )
 
-
-class FakeWidget:
-    """Minimal widget that enforces single-parent insertion rules."""
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.parent: FakeWidget | None = None
-        self.children: list[FakeWidget] = []
-        self.classes: set[str] = set()
-        self.visible = True
-        self.revealed = False
-        self.opacity = 1.0
-        self.margins: dict[str, int] = {}
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"<{self.name}>"
-
-    def get_parent(self) -> FakeWidget | None:
-        return self.parent
-
-    def unparent(self) -> None:
-        assert self.parent is not None, f"{self} unparent() with no parent"
-        self.parent.children.remove(self)
-        self.parent = None
-
-    def append(self, child: FakeWidget) -> None:
-        assert child.parent is None, f"{child} appended while inside {child.parent}"
-        child.parent = self
-        self.children.append(child)
-
-    def add_css_class(self, name: str) -> None:
-        self.classes.add(name)
-
-    def remove_css_class(self, name: str) -> None:
-        self.classes.discard(name)
-
-    def get_visible(self) -> bool:
-        return self.visible
-
-    def set_visible(self, visible: bool) -> None:
-        self.visible = visible
-
-    def set_margin_top(self, value: int) -> None:
-        self.margins["top"] = value
-
-    def set_margin_bottom(self, value: int) -> None:
-        self.margins["bottom"] = value
-
-    def set_margin_start(self, value: int) -> None:
-        self.margins["start"] = value
-
-    def set_margin_end(self, value: int) -> None:
-        self.margins["end"] = value
-
-    def set_reveal_child(self, revealed: bool) -> None:
-        self.revealed = revealed
-
-    def get_reveal_child(self) -> bool:
-        return self.revealed
-
-    def set_opacity(self, opacity: float) -> None:
-        self.opacity = float(opacity)
-
-    def get_opacity(self) -> float:
-        return self.opacity
-
-    def child_names(self) -> list[str]:
-        return [child.name for child in self.children]
-
-
-class FakePaned(FakeWidget):
-    def get_end_child(self) -> FakeWidget | None:
-        return self.children[0] if self.children else None
-
-
-class FakeSidebarButton(FakeWidget):
-    def __init__(self, name: str, active: bool = True) -> None:
-        super().__init__(name)
-        self.active = active
-
-    def get_active(self) -> bool:
-        return self.active
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def monotonic(self) -> float:
-        return self.now
-
-
-class FakeBackend:
-    def __init__(self) -> None:
-        self.is_playing = True
-        self.has_media = True
-
-
-#: Module constants the extracted methods read; taken from the real source so a
-#: changed timeout shows up here instead of being shadowed by a copy.
 CONSTANTS = (
     "DOCK_IDLE_SECONDS",
     "DOCK_SUBTITLE_CLEARANCE",
@@ -141,19 +42,20 @@ def _read_source() -> tuple[str, ast.Module]:
     return text, ast.parse(text)
 
 
-def _load_methods() -> dict[str, Any]:
+def _load_methods() -> dict[str, str]:
     text, tree = _read_source()
     window = next(
         node
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "PlayerWindow"
     )
-    produced: dict[str, Any] = {}
-    for node in window.body:
-        if isinstance(node, ast.FunctionDef) and node.name in METHODS:
-            produced[node.name] = ast.get_source_segment(text, node)
-    assert set(produced) == set(METHODS), sorted(produced)
-    return produced
+    found = {
+        node.name: ast.get_source_segment(text, node)
+        for node in window.body
+        if isinstance(node, ast.FunctionDef) and node.name in METHODS
+    }
+    assert set(found) == set(METHODS), sorted(found)
+    return found
 
 
 def _load_constants() -> dict[str, Any]:
@@ -174,117 +76,140 @@ CLEARANCE = CONSTANTS_VALUES["DOCK_SUBTITLE_CLEARANCE"]
 IDLE_OPACITY = CONSTANTS_VALUES["TELEMETRY_IDLE_OPACITY"]
 
 
-def _exec_methods(clock: FakeClock) -> dict[str, Any]:
+class FakeWidget:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.classes: set[str] = set()
+        self.visible = True
+        self.revealed = True
+        self.opacity = 1.0
+        self.margins: dict[str, int] = {}
+
+    def add_css_class(self, name: str) -> None:
+        self.classes.add(name)
+
+    def remove_css_class(self, name: str) -> None:
+        self.classes.discard(name)
+
+    def set_visible(self, visible: bool) -> None:
+        self.visible = bool(visible)
+
+    def get_visible(self) -> bool:
+        return self.visible
+
+    def set_reveal_child(self, revealed: bool) -> None:
+        self.revealed = bool(revealed)
+
+    def get_reveal_child(self) -> bool:
+        return self.revealed
+
+    def set_opacity(self, opacity: float) -> None:
+        self.opacity = float(opacity)
+
+    def get_opacity(self) -> float:
+        return self.opacity
+
+    def set_margin_bottom(self, value: int) -> None:
+        self.margins["bottom"] = value
+
+    def get_margin_bottom(self) -> int:
+        return self.margins.get("bottom", 0)
+
+
+class FakeBackend:
+    def __init__(self) -> None:
+        self.has_media = True
+        self.is_playing = True
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _namespace(clock: FakeClock) -> dict[str, Any]:
     namespace: dict[str, Any] = {
         "time": clock,
         "log_action": lambda *args, **kwargs: None,
-        "TELEMETRY_IDLE_OPACITY": IDLE_OPACITY,
-        **_load_constants(),
+        **CONSTANTS_VALUES,
     }
     for source in _load_methods().values():
-        code = compile(source, "<window.py>", "exec")
-        exec(code, namespace)  # noqa: S102 - fixed, in-repo source
+        exec(compile(source, "<window.py>", "exec"), namespace)  # noqa: S102
     return namespace
 
 
 class Harness:
-    """A stand-in window holding just the widgets the dock code touches."""
+    """Stand-in window holding just the widgets the HUD methods touch."""
 
-    def __init__(self, immersive: bool = True) -> None:
+    def __init__(self, immersive: bool = False) -> None:
         self.clock = FakeClock()
-        namespace = _exec_methods(self.clock)
-
-        self.box = FakeWidget("box")
-        self.overlay = FakeWidget("overlay")
-        self.dock = FakeWidget("dock")
-        self.revealer = FakeWidget("revealer")
-        self.telemetry = FakeWidget("telemetry")
-        self.progress = FakeWidget("progress")
-        self.tools = FakeWidget("tools")
-        self.info = FakeWidget("info")
-        self.bar = FakeWidget("bar")
-        self.subtitles = FakeWidget("subtitle")
-        self.paned = FakePaned("paned")
-        self.sidebar = FakeWidget("sidebar")
-        self.sidebar_button = FakeSidebarButton("sidebar-button")
-        self.backend = FakeBackend()
-
-        # Windowed layout: picture, info row, transport.
-        self.box.append(self.overlay)
-        self.box.append(self.info)
-        self.box.append(self.bar)
-        self.paned.append(self.sidebar)
-        self.subtitles.set_margin_bottom(24)
-
-        self._immersive = immersive
-        self._dock_hover = False
-        self._dock_deadline = 0.0
-        self._player_margin = 8
-        self._player_box = self.box
-        self._dock = self.dock
-        self._dock_revealer = self.revealer
-        self._telemetry_box = self.telemetry
-        self._fullscreen_progress = self.progress
-        self._immersive_tools = self.tools
-        self._info_bar = self.info
-        self._controls_bar = self.bar
-        self._subtitle_label = self.subtitles
-        self._player_overlay = self.overlay
-        self._paned = self.paned
-        self._sidebar_button = self.sidebar_button
-        self._info_bar_was_visible = True
-        self._sync_compare_overlay = lambda: None
-        self._sync_chrome_visibility = lambda: self.info.set_visible(True)
-
+        namespace = _namespace(self.clock)
         for name in METHODS:
             setattr(self, name, types.MethodType(namespace[name], self))
 
+        self.backend = FakeBackend()
+        self._page = "player"
+        self._immersive = immersive
+        self._drawer_open = False
+        self._dock_hover = False
+        self._dock_deadline = 0.0
+        self._top_bar = FakeWidget("top-bar")
+        self._headerbar = FakeWidget("header-bar")
+        self._record_path = None
+        self._episodes_open = True
+        self._sync_episodes_layout = lambda: None
+        self._immersive_tools = FakeWidget("immersive-tools")
+        self._player_overlay = FakeWidget("video")
+        self._dock_revealer = FakeWidget("dock-revealer")
+        self._telemetry_box = FakeWidget("telemetry")
+        self._fullscreen_progress = FakeWidget("progress")
+        self._subtitle_label = FakeWidget("subtitles")
+        self._top_veil = FakeWidget("top-veil")
+        self._bottom_veil = FakeWidget("bottom-veil")
+        self._top_bar.visible = True
+        self._immersive_tools.visible = False
+        self._telemetry_box.visible = False
+        self._fullscreen_progress.visible = False
+        self._subtitle_label.set_margin_bottom(24)
+        self._sync_compare_overlay = lambda: None
+        self._sync_chrome_visibility = lambda: None
+
     def get_height(self) -> int:
-        return 720
+        return 768
 
 
-def test_enter_moves_only_the_transport_into_the_dock() -> None:
+def test_entering_fullscreen_hides_top_chrome_and_shows_the_dock() -> None:
     h = Harness()
     h._enter_immersive()
 
-    assert h.box.child_names() == ["overlay", "info"]
-    assert h.dock.child_names() == ["bar"]
-    assert h.revealer.visible and h.revealer.revealed
-    assert not h.info.get_visible(), "the info row is replaced by telemetry"
-    assert not h.tools.get_visible() or True  # tools live in the dock row
-    assert h.telemetry.visible and h.telemetry.get_opacity() == pytest.approx(1.0)
-    assert h.progress.visible
-    assert "docked" in h.bar.classes
-    assert "immersive" in h.overlay.classes
-    assert not h.sidebar.get_visible()
-    assert h.box.margins == {"top": 0, "bottom": 0, "start": 0, "end": 0}
+    assert not h._top_bar.get_visible()
+    assert h._immersive_tools.get_visible()
+    assert "immersive" in h._player_overlay.classes
+    assert h._dock_revealer.get_visible()
+    assert h._dock_revealer.get_reveal_child()
+    assert not h._telemetry_box.get_visible(), "the corner line waits for the fade"
+    assert h._fullscreen_progress.get_visible()
+    assert not h._top_veil.get_visible(), "no top bar means no top scrim"
+    assert h._bottom_veil.get_visible(), "the dock keeps its bottom scrim"
+    assert h._subtitle_label.get_margin_bottom() == CLEARANCE
 
 
-def test_leave_restores_the_windowed_order() -> None:
+def test_leaving_fullscreen_restores_windowed_chrome() -> None:
     h = Harness()
     h._enter_immersive()
     h._leave_immersive()
 
-    assert h.box.child_names() == ["overlay", "info", "bar"]
-    assert h.dock.children == []
-    assert not h.revealer.visible and not h.revealer.revealed
-    assert not h.telemetry.visible
-    assert not h.progress.visible
-    assert not h.tools.visible
-    assert h.info.get_visible()
-    assert "docked" not in h.bar.classes
-    assert "immersive" not in h.overlay.classes
-    assert h.sidebar.get_visible()
-    assert h.box.margins == {"top": 8, "bottom": 8, "start": 8, "end": 8}
-
-
-def test_hidden_sidebar_stays_hidden_after_fullscreen() -> None:
-    h = Harness()
-    h.sidebar_button.active = False
-    h._enter_immersive()
-    h._leave_immersive()
-
-    assert not h.sidebar.get_visible()
+    assert h._top_bar.get_visible()
+    assert not h._immersive_tools.get_visible()
+    assert "immersive" not in h._player_overlay.classes
+    assert h._dock_revealer.get_reveal_child(), "windowed mode always shows the dock"
+    assert not h._telemetry_box.get_visible()
+    assert not h._fullscreen_progress.get_visible()
+    assert h._top_veil.get_visible() and h._bottom_veil.get_visible()
+    assert h._subtitle_label.get_margin_bottom() == CLEARANCE
 
 
 @pytest.mark.parametrize("rounds", [1, 3])
@@ -292,12 +217,11 @@ def test_round_trip_is_repeatable(rounds: int) -> None:
     h = Harness()
     for _ in range(rounds):
         h._enter_immersive()
-        assert h.box.child_names() == ["overlay", "info"]
-        assert h.dock.child_names() == ["bar"]
-        assert h.telemetry.visible and h.progress.visible
+        assert not h._top_bar.get_visible()
+        assert h._dock_revealer.get_reveal_child()
         h._leave_immersive()
-        assert h.box.child_names() == ["overlay", "info", "bar"]
-        assert not h.telemetry.visible and not h.progress.visible
+        assert h._top_bar.get_visible()
+        assert h._dock_revealer.get_reveal_child()
 
 
 def test_dock_hides_after_idle_but_telemetry_and_progress_stay() -> None:
@@ -306,14 +230,16 @@ def test_dock_hides_after_idle_but_telemetry_and_progress_stay() -> None:
 
     h.clock.now = 1001.0
     h._maybe_hide_dock()
-    assert h.revealer.revealed, "hid before the idle window elapsed"
+    assert h._dock_revealer.get_reveal_child(), "hid before the idle window elapsed"
 
     h.clock.now = 1006.0
     h._maybe_hide_dock()
-    assert not h.revealer.revealed
-    assert h.telemetry.visible, "the telemetry line must survive the dock fade"
-    assert h.telemetry.get_opacity() == pytest.approx(IDLE_OPACITY)
-    assert h.progress.visible, "the bottom progress hairline must survive the fade"
+    assert not h._dock_revealer.get_reveal_child()
+    assert h._telemetry_box.get_visible(), "the corner telemetry must survive the fade"
+    assert h._telemetry_box.get_opacity() == pytest.approx(IDLE_OPACITY)
+    assert h._fullscreen_progress.get_visible()
+    assert not h._top_veil.get_visible() and not h._bottom_veil.get_visible()
+    assert h._subtitle_label.get_margin_bottom() == 24
 
 
 def test_hovering_the_dock_postpones_hiding() -> None:
@@ -327,11 +253,11 @@ def test_hovering_the_dock_postpones_hiding() -> None:
 
     h.clock.now = 1004.0
     h._maybe_hide_dock()
-    assert h.revealer.revealed, "hovering did not extend the deadline"
+    assert h._dock_revealer.get_reveal_child(), "hovering did not extend the deadline"
 
     h.clock.now = 1006.0
     h._maybe_hide_dock()
-    assert not h.revealer.revealed
+    assert not h._dock_revealer.get_reveal_child()
 
 
 def test_dock_stays_while_paused() -> None:
@@ -341,32 +267,43 @@ def test_dock_stays_while_paused() -> None:
 
     h.clock.now = 9000.0
     h._maybe_hide_dock()
-    assert h.revealer.revealed
+    assert h._dock_revealer.get_reveal_child()
 
 
-def test_show_dock_restores_full_telemetry_opacity() -> None:
+def test_dock_stays_while_the_beauty_drawer_is_open() -> None:
+    h = Harness()
+    h._enter_immersive()
+    h._drawer_open = True
+
+    h.clock.now = 9000.0
+    h._maybe_hide_dock()
+    assert h._dock_revealer.get_reveal_child()
+
+
+def test_show_dock_restores_transport_and_hides_corner_telemetry() -> None:
     h = Harness()
     h._enter_immersive()
     h.clock.now = 9000.0
     h._maybe_hide_dock()
-    assert h.telemetry.get_opacity() == pytest.approx(IDLE_OPACITY)
+    assert h._telemetry_box.get_opacity() == pytest.approx(IDLE_OPACITY)
 
     h._show_dock()
-    assert h.revealer.revealed
-    assert h.telemetry.get_opacity() == pytest.approx(1.0)
+    assert h._dock_revealer.get_reveal_child()
+    assert not h._telemetry_box.get_visible()
+    assert h._bottom_veil.get_visible()
+    assert h._subtitle_label.get_margin_bottom() == CLEARANCE
 
 
 def test_subtitles_clear_the_dock_while_it_is_up() -> None:
-    h = Harness()
-    h._enter_immersive()
-    assert h.subtitles.margins["bottom"] == CLEARANCE
+    h = Harness(immersive=True)
+    h._sync_subtitle_margin()
+    assert h._subtitle_label.get_margin_bottom() == CLEARANCE
 
-    h.clock.now = 9000.0
-    h._maybe_hide_dock()
-    assert h.subtitles.margins["bottom"] == 24, "subtitles still lifted while hidden"
+    h._maybe_hide_dock()  # deadline is 0: hides immediately
+    assert h._subtitle_label.get_margin_bottom() == 768 - 768 + 24
 
     h._show_dock()
-    assert h.subtitles.margins["bottom"] == CLEARANCE
+    assert h._subtitle_label.get_margin_bottom() == CLEARANCE
 
     h._leave_immersive()
-    assert h.subtitles.margins["bottom"] == 24
+    assert h._subtitle_label.get_margin_bottom() == CLEARANCE

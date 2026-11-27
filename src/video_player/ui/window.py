@@ -35,7 +35,7 @@ from ..beauty import BeautyParams  # noqa: E402
 from ..config import Config  # noqa: E402
 from ..diagnostics import install_crash_logging, log_action  # noqa: E402
 from ..face import DetectionResult, Face  # noqa: E402
-from ..i18n import Translator, save_language  # noqa: E402
+from ..i18n import LANGUAGES, Translator, save_language  # noqa: E402
 from ..pipeline import DECODE_MODES, VIDEO_SUFFIXES  # noqa: E402
 from ..playlist import Playlist, expand_media_args  # noqa: E402
 from ..recents import RecentItem, RecentsStore  # noqa: E402
@@ -52,12 +52,23 @@ from .chrome import (  # noqa: E402
     slider_value_text,
 )
 from .browse import BrowseShell  # noqa: E402
+from .chapters import Chapter, chapter_marks, load_chapters  # noqa: E402
+from .player_chrome import (  # noqa: E402
+    CONTROL_HEIGHT,
+    PLAY_BUTTON_SIZE,
+    TIMELINE_HEIGHT,
+    ChapterTimeline,
+    DrawerTabRule,
+    PlayerTopBar,
+    TelemetryBar,
+)
 from .style import CSS, rgba  # noqa: E402
+from .taps import DOUBLE_TAP_MS, DOUBLE, TapTracker  # noqa: E402
 
 APP_ID = "io.quectel.pi.VideoPlayer"
 GST_SECOND = 1_000_000_000
 
-SPEED_CHOICES = ("0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x")
+SPEED_CHOICES = ("0.5×", "0.75×", "1.0×", "1.25×", "1.5×", "2.0×")
 SPEED_VALUES = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
 
 #: Attempts to attach the recording branch; the first ones can fail while the
@@ -72,12 +83,12 @@ RESUME_SAVE_INTERVAL = 2.0
 #: The fullscreen dock measures 120 px on the board (plus a 12 px inset), so
 #: 140 px catches the pointer just before it reaches the controls without
 #: keeping the HUD up from mid-screen.
-DOCK_HOVER_BAND = 140
+DOCK_HOVER_BAND = 170
 
 #: Subtitle lift while the dock is on screen: the dock is an overlay child
 #: added after the subtitle layer, so without this the bar would cover it.
-#: Measured dock height (120 px) + its 12 px bottom inset + 8 px of slack.
-DOCK_SUBTITLE_CLEARANCE = 140
+#: The P4 dock is ~150 px tall (telemetry + 20 px rail + 52 px play row).
+DOCK_SUBTITLE_CLEARANCE = 168
 
 #: Idle seconds before the fullscreen transport fades away.  Long enough to
 #: read the timecode after a seek, short enough that it is gone by the time the
@@ -87,9 +98,6 @@ DOCK_IDLE_SECONDS = 2.5
 #: The fullscreen telemetry line stays readable after the dock fades, but it
 #: must not compete with the picture; 62 % matches the v3 mockup.
 TELEMETRY_IDLE_OPACITY = 0.62
-
-#: Sidebar page names, in tab order.  ``playlist`` stays the default page.
-SIDEBAR_PAGES = ("playlist", "beauty")
 
 #: Top-level pages of the ui-v5 shell: the library browser and the player.
 PAGE_NAMES = ("browse", "player")
@@ -461,13 +469,37 @@ class PlayerWindow(Gtk.ApplicationWindow):
         # promises exactly that.
         if not config.beauty.enabled:
             config.beauty.compare_mode = False
-        # Guards the sidebar switch and fullscreen pill from echoing each other.
+        # Guards the beauty switch and the dock pill from echoing each other.
         self._updating_toggles = False
-        # v4 sidebar pages: ``playlist`` is the default; ``beauty`` has its own
-        # page instead of the v3 first-level panel that pushed the playlist out.
-        self._sidebar_tab = SIDEBAR_PAGES[0]
-        self._updating_tabs = False
+        # P4: the beauty controls live in a right-hand drawer.  The drawer is
+        # closed on start and stays open across clip changes; the cascade state
+        # still comes from the single `config.beauty` source of truth.
+        self._drawer_open = False
+        #: Docked 选集 column.  Windowed playback opens it by default; the
+        #: recorder keeps it collapsed so the captured canvas stays unchanged.
+        self._episodes_open = record is None
+        #: Which tab of the windowed panel is active ("episodes"/"beauty").
+        self._panel_tab = "episodes"
+        #: Where the secondary controls live: "panel" while windowed, "dock"
+        #: in fullscreen/--record.  None until the first sync.
+        self._secondary_placement: str | None = None
+        #: Own double-tap grouping: GTK's n_press is not a product contract on
+        #: the touch panel (see ui/taps.py).
+        self._tap_tracker = TapTracker()
+        self._tap_timeout_id = 0
+        self._tap_path: Path | None = None
+        self._ignore_surface_tap_until = 0.0
         self._last_detection_label_at = 0.0
+        # Optional chapter sidecar for the current clip; projected onto the
+        # timeline once the duration is known.
+        self._chapters: tuple[Chapter, ...] = ()
+        self._chapter_duration_ns = 0
+        # Process CPU (all threads), sampled once a second for the telemetry
+        # row.  `ru_utime + ru_stime` is real process time, not an estimate.
+        self._cpu_percent = 0.0
+        self._cpu_sampled_at = time.monotonic()
+        _usage = resource.getrusage(resource.RUSAGE_SELF)
+        self._cpu_usage = _usage.ru_utime + _usage.ru_stime
         self._current_path: Path | None = None
         self._playback_path: Path | None = None
         self._playback_status: str | None = None
@@ -521,12 +553,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         header.add_css_class("cinema-headerbar")
         self.set_titlebar(header)
         #: Kept as an attribute so the recording canvas can paint the title bar
-        #: (the window's top band); see :meth:`_recording_layer_specs`.
+        #: on the browse pages; the player page hides the header and paints its
+        #: own top chrome over the picture.
         self._headerbar = header
 
-        # Two-line title: clip name over "duration · resolution · codec · fps",
-        # which is how the mockup keeps the header informative without a line
-        # of chrome eating the picture.
+        # Browse-shell title.  Windowed playback keeps this header visible
+        # (clip name + window buttons), so the picture top bar hides its own
+        # title labels (compact) and only keeps back/episodes/more.
         title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         title_box.set_halign(Gtk.Align.CENTER)
         self._title_label = Gtk.Label()
@@ -539,56 +572,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
         title_box.append(self._title_label)
         title_box.append(self._header_subtitle_label)
         header.set_title_widget(title_box)
+        #: Kept for the windowed player page: the header bar stays visible
+        #: there, so its title widget must be restored when leaving the page.
+        self._browse_title_box = title_box
+        self._header_open_button = self._build_header_open_menu()
+        header.pack_start(self._header_open_button)
         self._header_subtitle_cache = ""
         self._hint_timeout = 0
-        self._back_button = Gtk.Button()
-        self._back_button.add_css_class("header-back")
-        back_glyph = Gtk.Label(label="\u2039")
-        back_glyph.add_css_class("header-back-glyph")
-        self._back_button.set_child(back_glyph)
-        self._back_button.connect("clicked", self._on_back_clicked)
-        header.pack_start(self._back_button)
-        self._open_button = Gtk.Button()
-        self._open_button.add_css_class("header-ghost")
-        self._open_button.connect("clicked", self._on_open_clicked)
-        # Icon + text like the mockup's pill; the board image ships
-        # document-open-symbolic even though it trims most of the theme.
-        open_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        open_icon = Gtk.Image.new_from_icon_name("document-open-symbolic")
-        open_icon.set_pixel_size(15)
-        self._open_label = Gtk.Label()
-        open_box.append(open_icon)
-        open_box.append(self._open_label)
-        self._open_button.set_child(open_box)
-        header.pack_start(self._open_button)
 
-        self._language_button = Gtk.Button()
-        self._language_button.add_css_class("header-action")
-        self._language_button.connect("clicked", self._on_language_clicked)
-        self._sidebar_button = Gtk.ToggleButton()
-        # A text glyph rather than an icon name: the board image ships a
-        # trimmed icon theme and a missing symbolic name renders as a blank
-        # button.
-        self._sidebar_button.set_label("☰")
-        self._sidebar_button.set_active(True)
-        self._sidebar_button.add_css_class("header-action")
-        self._sidebar_button.set_tooltip_text(self._t("toggle_sidebar"))
-        self._sidebar_button.connect("toggled", self._on_sidebar_toggled)
-        # The header keeps window-level actions only.  A|B lives with the
-        # beauty controls in the sidebar (see _build_sidebar); keeping it off
-        # the transport leaves room for "previous" on the 1280 px panel.
-        end_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        end_box.append(self._language_button)
-        end_box.append(self._sidebar_button)
-        header.pack_end(end_box)
+        # No language switch up here: the settings page owns the language
+        # choice (2026-11-27), and the player keeps its own entry in the
+        # "more" menu because the header is hidden there.
 
-        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
-        paned.add_css_class("cinema-paned")
-        paned.set_position(940)
-        paned.set_wide_handle(True)
-        paned.set_start_child(self._build_player_area())
-        paned.set_end_child(self._build_sidebar())
-        self._paned = paned
+        # Build the player page first: the browse shell's "open file" action
+        # uses the open button that lives in the player's more menu.
+        self._player_page = self._build_player_area()
 
         # ui-v5 shell: one stack, both halves built once, only visibility moves.
         # ``--record`` and ``--demo`` start on the player page (the recorder
@@ -602,12 +600,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
             on_open_file=lambda: self._on_open_clicked(self._open_button),
             on_changed=self._on_library_changed,
             on_drop_paths=self._on_library_dropped,
+            on_language=self._set_language,
+            on_decode=self._set_decode_mode,
         )
         #: Alias kept for the QC probes: the library page inside the shell.
         self._library = self._browse.library
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.NONE)
-        self._stack.add_named(paned, "player")
+        self._stack.add_named(self._player_page, "player")
         self._stack.add_named(self._browse, "browse")
         self._page = (
             "player"
@@ -659,41 +659,61 @@ class PlayerWindow(Gtk.ApplicationWindow):
     # -- layout ---------------------------------------------------------
 
     def _build_player_area(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.add_css_class("player-column")
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
-        box.set_margin_start(8)
-        box.set_margin_end(8)
-        self._player_box = box
-        self._player_margin = 8
+        """Build the ui-v5 player page (P4 picture-first, P5 windowed shell).
 
-        overlay = Gtk.Overlay()
-        overlay.set_hexpand(True)
-        overlay.set_vexpand(True)
-        overlay.add_css_class("video-surface")
+        A horizontal split: the picture *stage* (one overlay with the top bar,
+        telemetry/timeline/44 px transport, veils and the beauty drawer) plus
+        the docked 选集 column.  Windowed playback also keeps the real GTK
+        header bar, so the page is visibly a window; fullscreen hides the
+        header bar and collapses the column, leaving the P4 picture-first
+        layout.  ``--record`` keeps the P4 no-header/no-sidebar canvas.
+        """
+        stage = Gtk.Overlay()
+        stage.add_css_class("play-stage")
+        stage.set_hexpand(True)
+        stage.set_vexpand(True)
+        self._player_box = stage
+
+        video = Gtk.Overlay()
+        video.add_css_class("video-surface")
+        video.add_css_class("play-video-surface")
+        video.set_hexpand(True)
+        video.set_vexpand(True)
+        self._player_overlay = video
+        #: The recorder punches its transparent video hole at this widget; it
+        #: is exactly the 16:9 frame, not the letterbox around it.
+        self._video_surface = video
+
+        aspect = Gtk.AspectFrame(ratio=16.0 / 9.0, obey_child=False)
+        aspect.set_xalign(0.5)
+        aspect.set_yalign(0.5)
+        aspect.set_hexpand(True)
+        aspect.set_vexpand(True)
+        aspect.add_css_class("play-aspect")
+        aspect.set_child(video)
+        stage.set_child(aspect)
 
         self._picture = Gtk.Picture()
         self._picture.set_hexpand(True)
         self._picture.set_vexpand(True)
         self._picture.set_can_shrink(True)
         self._picture.set_content_fit(Gtk.ContentFit.CONTAIN)
-        overlay.set_child(self._picture)
+        video.set_child(self._picture)
 
         # Split captions sit above the frame but below the face brackets.
         self._compare_overlay = _CompareOverlay()
         self._compare_overlay.set_hexpand(True)
         self._compare_overlay.set_vexpand(True)
-        overlay.add_overlay(self._compare_overlay)
+        video.add_overlay(self._compare_overlay)
 
         self._face_overlay = _FaceOverlay()
         self._face_overlay.set_hexpand(True)
         self._face_overlay.set_vexpand(True)
-        overlay.add_overlay(self._face_overlay)
+        video.add_overlay(self._face_overlay)
 
         self._empty_state = self._build_empty_state()
-        overlay.add_overlay(self._empty_state)
-        self._build_playback_status(overlay)
+        video.add_overlay(self._empty_state)
+        self._build_playback_status(video)
 
         # Subtitles are drawn as a GTK layer, not by a GStreamer textoverlay:
         # the video path stays untouched (see subtitle.py for the reasoning).
@@ -708,20 +728,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._subtitle_label.set_margin_end(24)
         self._subtitle_label.set_can_target(False)
         self._subtitle_label.set_visible(False)
-        overlay.add_overlay(self._subtitle_label)
-        self._build_transport_dock(overlay)
-        self._build_immersive_chrome(overlay)
-        self._build_hint_toast(overlay)
-
-        box.append(overlay)
-        self._player_overlay = overlay
+        video.add_overlay(self._subtitle_label)
 
         # A touch panel produces no pointer motion, so on the board a tap is
         # the only way to summon the fullscreen HUD.  Tapping never hides it:
         # a tap that lands on a button must not make the bar disappear.
         tap = Gtk.GestureClick()
+        tap.set_button(Gdk.BUTTON_PRIMARY)
         tap.connect("pressed", self._on_surface_pressed)
-        overlay.add_controller(tap)
+        video.add_controller(tap)
 
         # Drop a file or folder anywhere on the picture; the empty state makes
         # that affordance explicit, but it keeps working during playback.
@@ -729,70 +744,97 @@ class PlayerWindow(Gtk.ApplicationWindow):
         drop.connect("drop", self._on_files_dropped)
         drop.connect("enter", self._on_drop_enter)
         drop.connect("leave", self._on_drop_leave)
-        overlay.add_controller(drop)
+        video.add_controller(drop)
 
-        self._info_bar = self._build_info_bar()
-        box.append(self._info_bar)
+        self._top_veil = Gtk.Box()
+        self._top_veil.add_css_class("play-veil-top")
+        self._top_veil.set_valign(Gtk.Align.START)
+        self._top_veil.set_halign(Gtk.Align.FILL)
+        self._top_veil.set_size_request(-1, 190)
+        self._top_veil.set_can_target(False)
+        stage.add_overlay(self._top_veil)
 
-        box.append(self._build_controls())
+        self._bottom_veil = Gtk.Box()
+        self._bottom_veil.add_css_class("play-veil-bottom")
+        self._bottom_veil.set_valign(Gtk.Align.END)
+        self._bottom_veil.set_halign(Gtk.Align.FILL)
+        self._bottom_veil.set_size_request(-1, 320)
+        self._bottom_veil.set_can_target(False)
+        stage.add_overlay(self._bottom_veil)
+
+        self._top_bar = PlayerTopBar(
+            back_tooltip=self._t("detail_back"),
+            episodes_label=self._t("detail_episodes"),
+            more_tooltip=self._t("play_more"),
+        )
+        self._back_button = self._top_bar.back_button
+        self._back_button.connect("clicked", self._on_back_clicked)
+        self._episodes_button = self._top_bar.episodes_button
+        self._episodes_label = self._top_bar.episodes_label
+        # The chip is icon-only: the words live in the panel tabs and in the
+        # tooltip, so the top bar does not spend width on them.  The dot keeps
+        # the beauty state visible while the panel is closed.
+        self._episodes_label.set_visible(False)
+        self._panel_dot = Gtk.Label(label="\u25cf")
+        self._panel_dot.add_css_class("play-chip-dot")
+        self._panel_dot.set_valign(Gtk.Align.CENTER)
+        self._panel_dot.set_visible(False)
+        chip = self._episodes_button.get_child()
+        if chip is not None:
+            chip.append(self._panel_dot)
+        self._episodes_button.set_tooltip_text(self._t("panel_tooltip"))
+        self._play_title_label = self._top_bar.title_label
+        self._play_subtitle_label = self._top_bar.subtitle_label
+        self._episodes_button.connect("clicked", self._on_episodes_clicked)
+        self._top_more_button = self._top_bar.more_button
+        self._more_popover = self._build_more_popover()
+        self._top_more_button.set_popover(self._more_popover)
+        stage.add_overlay(self._top_bar)
+
+        # The beauty page is built once and re-hosted: the panel tab while
+        # windowed, the overlay drawer in fullscreen/--record.
+        self._beauty_page = self._build_beauty_page()
+        self._build_transport_dock(stage)
+        self._build_beauty_drawer(stage)
+        self._build_immersive_chrome(stage)
+        self._build_hint_toast(stage)
+
+        # Windowed click-outside guard: closes the beauty drawer without
+        # letting the click reach the transport or the picture.
+        guard = Gtk.GestureClick()
+        guard.set_button(Gdk.BUTTON_PRIMARY)
+        guard.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        guard.connect("pressed", self._on_stage_pressed)
+        stage.add_controller(guard)
+
+        # The episodes sidebar is a real layout column (windowed only): the
+        # 16:9 picture shrinks to the remaining width and the transport
+        # reflows.  Fullscreen and --record collapse it.
+        split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        split.add_css_class("play-split")
+        split.append(stage)
+        self._player_split = split
+        self._episodes_revealer = self._build_episodes_sidebar()
+        split.append(self._episodes_revealer)
+
         self._sync_chrome_visibility()
-        return box
+        self._sync_subtitle_margin()
+        return split
 
     def _build_info_bar(self) -> Gtk.Widget:
-        """Labelled telemetry row: static left group, live NPU/beauty right.
-
-        The v3 mockup spells the field names out (分辨率/编码/解码/帧率) and
-        gives the two live values their own right-aligned group, so a number
-        that moves always means a live measurement.
-        """
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
-        bar.add_css_class("info-bar")
-        self._info_labels: dict[str, Gtk.Label] = {}
-        self._info_values: dict[str, Gtk.Label] = {}
-
-        def field(key: str, label_key: str) -> Gtk.Widget:
-            group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-            label = Gtk.Label(label=self._t(label_key))
-            label.add_css_class("info-label")
-            label.set_xalign(0.0)
-            value = Gtk.Label(label="—")
-            value.add_css_class("info-value")
-            value.set_xalign(0.0)
-            value.set_selectable(False)
-            self._info_labels[key] = label
-            self._info_values[key] = value
-            group.append(label)
-            group.append(value)
-            return group
-
-        for key, label_key in (
-            ("format", "info_resolution"),
-            ("codec", "info_codec"),
-            ("decode", "info_decode"),
-            ("fps", "info_fps"),
-        ):
-            bar.append(field(key, label_key))
-
-        spacer = Gtk.Box()
-        spacer.set_hexpand(True)
-        bar.append(spacer)
-
-        dot = Gtk.Label(label="●")
-        dot.add_css_class("info-dot")
-        dot.set_valign(Gtk.Align.CENTER)
-        self._info_dot = dot
-        bar.append(dot)
-
-        self._info_face = Gtk.Label(label="—")
-        self._info_face.add_css_class("info-live")
-        self._info_face.set_selectable(False)
-        bar.append(self._info_face)
-
-        self._info_beauty = Gtk.Label(label="—")
-        self._info_beauty.add_css_class("info-live")
-        self._info_beauty.set_selectable(False)
-        bar.append(self._info_beauty)
-
+        """One-line telemetry row inside the picture's bottom dock."""
+        bar = TelemetryBar()
+        self._info_bar = bar
+        self._info_values = {
+            "decode": bar.decode_value,
+            "codec": bar.codec_value,
+            "format": bar.resolution_value,
+            "fps": bar.fps_value,
+        }
+        self._info_face = bar.face_value
+        self._info_beauty = bar.beauty_value
+        self._info_dot = bar.decode_dot
+        self._info_cpu = bar.cpu_value
         bar.set_visible(self.config.debug.show_info_panel)
         return bar
 
@@ -926,37 +968,67 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._status_card.append(self._status_actions)
         overlay.add_overlay(self._status_card)
 
-    def _build_transport_dock(self, overlay: Gtk.Overlay) -> None:
-        """Empty floating dock, filled only while the window is fullscreen.
+    def _build_transport_dock(self, stage: Gtk.Overlay) -> None:
+        """Bottom overlay: telemetry, chapter timeline and the 44 px key row.
 
-        The dock is a :class:`Gtk.Revealer` so the fade is animated by the
-        toolkit rather than by a manual opacity timeout, and it starts hidden:
-        an overlay child that is visible with no children still takes part in
-        hit testing.  Only the transport moves in; the info row is replaced by
-        the always-on telemetry line in the top-left corner.
+        The same block is the windowed transport and the fullscreen dock; only
+        its revealer changes behaviour when the window goes fullscreen, so the
+        two layouts cannot drift apart.  ``--record`` captures this widget as
+        one layer, which keeps the picture hole free for the mixer.
         """
-        self._dock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        self._dock.add_css_class("transport-dock")
-        self._dock.set_margin_start(20)
-        self._dock.set_margin_end(20)
-        self._dock.set_margin_bottom(12)
+        dock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        dock.add_css_class("play-dock")
+        dock.set_margin_start(24)
+        dock.set_margin_end(24)
+        dock.set_margin_bottom(14)
+        self._dock = dock
+        # The transport block (recording layer + visibility switch) is the
+        # whole telemetry/rail/buttons stack, not just the button row.
+        self._controls_bar = dock
 
-        self._dock_revealer = Gtk.Revealer()
-        self._dock_revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
-        self._dock_revealer.set_transition_duration(220)
-        self._dock_revealer.set_halign(Gtk.Align.FILL)
-        self._dock_revealer.set_valign(Gtk.Align.END)
-        self._dock_revealer.set_child(self._dock)
-        self._dock_revealer.set_reveal_child(False)
-        self._dock_revealer.set_visible(False)
-        overlay.add_overlay(self._dock_revealer)
+        self._info_bar = self._build_info_bar()
+        dock.append(self._info_bar)
 
-    def _build_immersive_chrome(self, overlay: Gtk.Overlay) -> None:
+        seek_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        seek_row.add_css_class("play-seek-row")
+        self._elapsed_label = Gtk.Label(label="00:00")
+        self._elapsed_label.add_css_class("play-time")
+        self._elapsed_label.set_xalign(0.0)
+        seek_row.append(self._elapsed_label)
+
+        self._timeline = ChapterTimeline()
+        self._timeline.set_tooltip_text(self._t("seek"))
+        self._timeline.connect("value-changed", self._on_seek_changed)
+        #: Alias kept for the tick/seek code that used the v4 Gtk.Scale; the
+        #: custom rail implements the same 0–1000 set_value/get_value subset.
+        self._seek = self._timeline
+        seek_row.append(self._timeline)
+
+        self._total_label = Gtk.Label(label="00:00")
+        self._total_label.add_css_class("play-time")
+        self._total_label.set_xalign(1.0)
+        seek_row.append(self._total_label)
+        dock.append(seek_row)
+
+        dock.append(self._build_controls())
+
+        revealer = Gtk.Revealer()
+        revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+        revealer.set_transition_duration(200)
+        revealer.set_halign(Gtk.Align.FILL)
+        revealer.set_valign(Gtk.Align.END)
+        revealer.set_child(dock)
+        revealer.set_reveal_child(True)
+        revealer.set_visible(True)
+        self._dock_revealer = revealer
+        stage.add_overlay(revealer)
+
+    def _build_immersive_chrome(self, stage: Gtk.Overlay) -> None:
         """Always-on fullscreen telemetry and the bottom progress hairline.
 
-        Both survive the dock fade: the telemetry dims to 62 %, the 2 px
-        progress line stays at the bottom edge, so the viewer keeps a sense of
-        position after the controls disappear.
+        The top bar and the dock fade in immersive mode; these two stay so the
+        viewer keeps the clip identity and a sense of position.  In windowed
+        mode they are hidden because the dock already carries the same data.
         """
         telemetry = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         telemetry.set_halign(Gtk.Align.START)
@@ -982,22 +1054,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         telemetry.append(dot)
         telemetry.append(self._telemetry_live)
         self._telemetry_box = telemetry
-        overlay.add_overlay(telemetry)
+        stage.add_overlay(telemetry)
 
         self._fullscreen_progress = _ProgressLine()
         self._fullscreen_progress.set_halign(Gtk.Align.FILL)
         self._fullscreen_progress.set_valign(Gtk.Align.END)
         self._fullscreen_progress.set_hexpand(True)
         self._fullscreen_progress.set_visible(False)
-        overlay.add_overlay(self._fullscreen_progress)
+        stage.add_overlay(self._fullscreen_progress)
 
-    def _build_hint_toast(self, overlay: Gtk.Overlay) -> None:
-        """Transient status text over the picture instead of a fixed row.
-
-        The hint still reports decode fallbacks, resume notices and playlist
-        edges, but it no longer owns layout height: that row was the reason the
-        transport never reached the bottom edge of the window.
-        """
+    def _build_hint_toast(self, stage: Gtk.Overlay) -> None:
+        """Transient status text over the picture instead of a fixed row."""
         self._hint_label = Gtk.Label(label="")
         self._hint_label.set_justify(Gtk.Justification.CENTER)
         self._hint_label.set_max_width_chars(64)
@@ -1011,128 +1078,81 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._hint_revealer.set_child(self._hint_label)
         self._hint_revealer.set_halign(Gtk.Align.CENTER)
         self._hint_revealer.set_valign(Gtk.Align.START)
-        self._hint_revealer.set_margin_top(16)
+        # Clear the top bar; the old header row used to own this height.
+        self._hint_revealer.set_margin_top(84)
         self._hint_revealer.set_can_target(False)
         self._hint_revealer.set_visible(False)
-        overlay.add_overlay(self._hint_revealer)
+        stage.add_overlay(self._hint_revealer)
 
     def _build_controls(self) -> Gtk.Widget:
-        """Two-row transport: the timeline on top, 44 px keys underneath.
+        """44 px transport keys; the play key is the mockup's 52 px circle.
 
-        The v3 mockup splits the timecode into an elapsed label on the left and
-        a duration label on the right, and keeps every transport key at 44 px.
-        Grouping (navigation / stop / playback settings / immersive tools /
-        output) keeps the row legible at 1280 px.
+        One row in every mode.  The secondary controls (字幕/美颜) do not live
+        here while the panel is available: the panel carries 美颜 and the
+        picture top bar carries 字幕 (see ``_sync_secondary_placement``).
         """
-        bar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        bar.add_css_class("transport-bar")
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        row.add_css_class("play-controls")
+        row.set_size_request(-1, PLAY_BUTTON_SIZE + 2)
 
-        seek_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        seek_row.add_css_class("seek-row")
-        self._elapsed_label = Gtk.Label(label="00:00")
-        self._elapsed_label.add_css_class("time-display")
-        self._elapsed_label.set_xalign(0.0)
-        seek_row.append(self._elapsed_label)
+        def button(glyph: str | None = None, icon: str | None = None) -> Gtk.Button:
+            widget = Gtk.Button()
+            widget.add_css_class("play-control")
+            widget.set_valign(Gtk.Align.CENTER)
+            widget.set_size_request(CONTROL_HEIGHT, CONTROL_HEIGHT)
+            if icon is not None:
+                widget.set_child(Gtk.Image.new_from_icon_name(icon))
+            elif glyph is not None:
+                label = Gtk.Label(label=glyph)
+                label.add_css_class("play-control-glyph")
+                widget.set_child(label)
+            return widget
 
-        self._seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1000, 1)
-        self._seek.set_hexpand(True)
-        self._seek.set_draw_value(False)
-        self._seek.connect("value-changed", self._on_seek_changed)
-        seek_row.append(self._seek)
-
-        self._total_label = Gtk.Label(label="00:00")
-        self._total_label.add_css_class("time-display")
-        self._total_label.set_xalign(1.0)
-        seek_row.append(self._total_label)
-        bar.append(seek_row)
-
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        row.add_css_class("button-row")
-
-        def divider() -> Gtk.Separator:
-            line = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-            line.add_css_class("transport-divider")
-            return line
-
-        def add_icon(icon_name: str) -> Gtk.Button:
-            button = Gtk.Button.new_from_icon_name(icon_name)
-            button.add_css_class("transport-button")
-            # Gtk.Box children default to FILL and would stretch the 44 px key.
-            button.set_valign(Gtk.Align.CENTER)
-            return button
-
-        self._prev_button = add_icon("media-skip-backward-symbolic")
+        self._prev_button = button(icon="media-skip-backward-symbolic")
         self._prev_button.connect("clicked", self._on_previous_clicked)
         row.append(self._prev_button)
 
-        self._play_button = Gtk.Button.new_from_icon_name(
-            "media-playback-start-symbolic"
-        )
-        self._play_button.add_css_class("transport-button")
-        self._play_button.add_css_class("transport-primary")
+        self._back15_button = button(glyph="\u221215")
+        self._back15_button.add_css_class("play-skip")
+        self._back15_button.connect("clicked", self._on_seek_back_clicked)
+        row.append(self._back15_button)
+
+        self._play_button = Gtk.Button()
+        self._play_button.add_css_class("play-primary")
         self._play_button.set_valign(Gtk.Align.CENTER)
+        self._play_button.set_size_request(PLAY_BUTTON_SIZE, PLAY_BUTTON_SIZE)
+        self._play_button.set_icon_name("media-playback-start-symbolic")
         self._play_button.connect("clicked", self._on_play_clicked)
         row.append(self._play_button)
 
-        self._next_button = add_icon("media-skip-forward-symbolic")
+        self._forward15_button = button(glyph="+15")
+        self._forward15_button.add_css_class("play-skip")
+        self._forward15_button.connect("clicked", self._on_seek_forward_clicked)
+        row.append(self._forward15_button)
+
+        self._next_button = button(icon="media-skip-forward-symbolic")
         self._next_button.connect("clicked", self._on_next_clicked)
         row.append(self._next_button)
 
-        # Stop is deliberately not a fourth navigation key. It rewinds to 00:00
-        # and drops the resume point, so it sits behind a separator and is drawn
-        # as a low-weight ghost button.
-        row.append(divider())
-
-        self._stop_button = add_icon("media-playback-stop-symbolic")
-        self._stop_button.add_css_class("transport-ghost")
-        self._stop_button.set_tooltip_text(self._t("stop_playback"))
+        self._stop_button = button(icon="media-playback-stop-symbolic")
+        self._stop_button.add_css_class("play-ghost")
         self._stop_button.connect("clicked", self._on_stop_clicked)
         row.append(self._stop_button)
 
-        row.append(divider())
+        row.append(self._divider())
 
         self._speed = Gtk.DropDown.new_from_strings(list(SPEED_CHOICES))
         self._speed.set_selected(_closest_speed_index(self.config.player.speed))
-        self._speed.set_size_request(96, -1)
+        self._speed.add_css_class("play-speed")
+        self._speed.set_size_request(84, CONTROL_HEIGHT)
         self._speed.set_valign(Gtk.Align.CENTER)
         self._speed.connect("notify::selected", self._on_speed_changed)
         row.append(self._speed)
 
-        row.append(divider())
-
-        # The decode path belongs to playback, so it lives here rather than in
-        # the sidebar: it has to stay reachable while the video covers the
-        # window, and it is read at a glance on a demo table.
+        row.append(self._divider())
+        # Kept out of the sidebar: decoding is part of playback and must stay
+        # reachable in fullscreen, so the segmented control stays in the row.
         row.append(self._build_decode_segments())
-
-        spacer = Gtk.Box()
-        spacer.set_hexpand(True)
-        row.append(spacer)
-
-        # Beauty / compare pills only exist in the fullscreen dock.  They are
-        # hidden in the windowed row, where the sidebar owns those switches.
-        self._immersive_tools = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
-        )
-        self._immersive_tools.set_valign(Gtk.Align.CENTER)
-        self._immersive_tools.set_visible(False)
-        self._dock_beauty_button = Gtk.ToggleButton(label=self._t("beauty"))
-        self._dock_beauty_button.add_css_class("dock-pill")
-        self._dock_beauty_button.set_valign(Gtk.Align.CENTER)
-        self._dock_beauty_button.set_active(self.config.beauty.enabled)
-        self._dock_beauty_button.connect(
-            "toggled", self._on_dock_beauty_toggled
-        )
-        self._dock_compare_button = Gtk.ToggleButton(label=self._t("compare"))
-        self._dock_compare_button.add_css_class("dock-pill")
-        self._dock_compare_button.set_valign(Gtk.Align.CENTER)
-        self._dock_compare_button.set_active(self.config.beauty.compare_mode)
-        self._dock_compare_button.connect(
-            "toggled", self._on_dock_compare_toggled
-        )
-        self._immersive_tools.append(self._dock_beauty_button)
-        self._immersive_tools.append(self._dock_compare_button)
-        row.append(self._immersive_tools)
 
         initial_volume = int(round(self.config.player.volume))
         volume_icon = (
@@ -1147,34 +1167,510 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._volume_icon.add_css_class("volume-icon")
         row.append(self._volume_icon)
 
-        self._volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self._volume.set_size_request(88, -1)
+        self._volume = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0, 100, 1
+        )
+        self._volume.set_size_request(74, -1)
         self._volume.set_value(self.config.player.volume)
         self._volume.set_draw_value(False)
         self._volume.set_valign(Gtk.Align.CENTER)
         self._volume.connect("value-changed", self._on_volume_changed)
         row.append(self._volume)
 
-        self._volume_label = Gtk.Label()
-        self._volume_label.set_xalign(0.5)
-        self._volume_label.add_css_class("volume-value")
-        self._volume_label.set_text(f"{int(round(self.config.player.volume))}%")
-        row.append(self._volume_label)
+        self._transport_spacer = Gtk.Box()
+        self._transport_spacer.set_hexpand(True)
+        row.append(self._transport_spacer)
 
-        self._subtitle_button = Gtk.MenuButton(label="CC")
-        self._subtitle_button.add_css_class("transport-button")
+        self._subtitle_button = Gtk.MenuButton(label=self._t("play_subtitles"))
+        self._subtitle_button.add_css_class("play-control")
+        self._subtitle_button.add_css_class("play-text-control")
         self._subtitle_button.set_valign(Gtk.Align.CENTER)
         self._subtitle_button.set_tooltip_text(self._t("subtitles_tooltip"))
         self._subtitle_button.set_popover(self._build_subtitle_popover())
         row.append(self._subtitle_button)
 
-        self._fullscreen_button = add_icon("view-fullscreen-symbolic")
+        # Beauty / compare: the pill is the drawer entrance and carries the
+        # effect state in its label ("美颜 · 开 / 关"), like the v4 dock pill.
+        self._dock_beauty_button = Gtk.ToggleButton(label=self._t("beauty"))
+        self._dock_beauty_button.add_css_class("play-pill")
+        self._dock_beauty_button.set_valign(Gtk.Align.CENTER)
+        self._dock_beauty_button.set_active(self.config.beauty.enabled)
+        self._dock_beauty_button.set_visible(False)
+        self._dock_beauty_button.connect("clicked", self._on_beauty_pill_clicked)
+        row.append(self._dock_beauty_button)
+
+        self._immersive_tools = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=4
+        )
+        self._immersive_tools.set_valign(Gtk.Align.CENTER)
+        self._immersive_tools.set_visible(False)
+        self._dock_compare_button = Gtk.ToggleButton(label=self._t("compare"))
+        self._dock_compare_button.add_css_class("play-pill")
+        self._dock_compare_button.set_valign(Gtk.Align.CENTER)
+        self._dock_compare_button.set_active(self.config.beauty.compare_mode)
+        self._dock_compare_button.connect(
+            "toggled", self._on_dock_compare_toggled
+        )
+        self._immersive_tools.append(self._dock_compare_button)
+        row.append(self._immersive_tools)
+
+        self._fullscreen_button = button(icon="view-fullscreen-symbolic")
         self._fullscreen_button.connect("clicked", self._on_fullscreen_clicked)
         row.append(self._fullscreen_button)
 
-        bar.append(row)
-        self._controls_bar = bar
-        return bar
+        self._transport_row = row
+        return row
+
+    @staticmethod
+    def _divider() -> Gtk.Separator:
+        line = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        line.add_css_class("play-divider")
+        return line
+
+    def _build_episodes_sidebar(self) -> Gtk.Revealer:
+        """The right-hand playback panel (windowed playback only).
+
+        A real layout column: it takes 360 px and the 16:9 picture keeps its
+        ratio in the remaining width.  Two tabs share the column - the episode
+        list and the beauty controls; the overlay drawer is only used when the
+        column is unavailable (fullscreen/``--record``).  The revealer makes the
+        width change read as a slide rather than a jump.
+        """
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        panel.add_css_class("sidebar-panel")
+        panel.add_css_class("episodes-panel")
+        panel.set_size_request(360, -1)
+        panel.set_vexpand(True)
+        panel.set_valign(Gtk.Align.FILL)
+        self._episodes_panel = panel
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        head.add_css_class("drawer-head")
+        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        tabs.add_css_class("sidebar-tabs")
+        tabs.set_hexpand(True)
+        self._panel_tab_episodes = Gtk.ToggleButton(
+            label=self._t("detail_episodes")
+        )
+        self._panel_tab_beauty = Gtk.ToggleButton(label=self._t("beauty"))
+        # Radio behaviour: one tab is always active, so the panel never shows
+        # an empty page after clicking the active label.
+        self._panel_tab_beauty.set_group(self._panel_tab_episodes)
+        for button in (self._panel_tab_episodes, self._panel_tab_beauty):
+            button.set_hexpand(True)
+            button.set_focus_on_click(False)
+            button.connect("toggled", self._on_panel_tab_toggled)
+            tabs.append(button)
+        self._panel_tab_episodes.set_active(True)
+        self._episodes_close_button = Gtk.Button(label="\u2715")
+        self._episodes_close_button.add_css_class("drawer-close")
+        self._episodes_close_button.set_valign(Gtk.Align.CENTER)
+        self._episodes_close_button.set_tooltip_text(self._t("close"))
+        self._episodes_close_button.connect(
+            "clicked", lambda _button: self._set_episodes_open(False)
+        )
+        head.append(tabs)
+        head.append(self._episodes_close_button)
+        panel.append(head)
+
+        episodes = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        episodes.set_vexpand(True)
+        heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._playlist_title = Gtk.Label()
+        self._playlist_title.set_xalign(0.0)
+        self._playlist_title.add_css_class("section-heading")
+        self._playlist_title.add_css_class("popover-heading")
+        heading.append(self._playlist_title)
+        heading_spacer = Gtk.Box()
+        heading_spacer.set_hexpand(True)
+        heading.append(heading_spacer)
+        self._episodes_count_label = Gtk.Label(label="")
+        self._episodes_count_label.add_css_class("popover-meta")
+        heading.append(self._episodes_count_label)
+        episodes.append(heading)
+
+        self._playlist_list = Gtk.ListBox()
+        self._playlist_list.add_css_class("cinema-playlist")
+        self._playlist_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._playlist_list.set_activate_on_single_click(True)
+        self._playlist_list.connect("row-activated", self._on_row_activated)
+        self._playlist_scroll = Gtk.ScrolledWindow()
+        self._playlist_scroll.add_css_class("playlist-scroll")
+        self._playlist_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self._playlist_scroll.set_child(self._playlist_list)
+        self._playlist_scroll.set_vexpand(True)
+        episodes.append(self._playlist_scroll)
+        self._playlist_empty = Gtk.Label(label=self._t("playlist_empty"))
+        self._playlist_empty.add_css_class("empty-playlist")
+        self._playlist_empty.set_justify(Gtk.Justification.CENTER)
+        episodes.append(self._playlist_empty)
+
+        self._playlist_add_button = Gtk.Button(label=self._t("playlist_add"))
+        self._playlist_add_button.add_css_class("playlist-add")
+        self._playlist_add_button.connect("clicked", self._on_episodes_add)
+        episodes.append(self._playlist_add_button)
+
+        self._recents_title = Gtk.Label()
+        self._recents_title.set_xalign(0.0)
+        self._recents_title.add_css_class("popover-heading")
+        episodes.append(self._recents_title)
+
+        self._recents_list = Gtk.ListBox()
+        self._recents_list.add_css_class("cinema-playlist")
+        self._recents_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._recents_list.set_activate_on_single_click(True)
+        self._recents_list.connect("row-activated", self._on_recent_activated)
+        self._recents_scroll = Gtk.ScrolledWindow()
+        self._recents_scroll.add_css_class("playlist-scroll")
+        self._recents_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self._recents_scroll.set_child(self._recents_list)
+        episodes.append(self._recents_scroll)
+        self._recents_empty = Gtk.Label()
+        self._recents_empty.set_xalign(0.0)
+        self._recents_empty.add_css_class("recents-empty")
+        episodes.append(self._recents_empty)
+
+        self._panel_stack = Gtk.Stack()
+        self._panel_stack.set_vexpand(True)
+        self._panel_stack.set_hexpand(True)
+        self._panel_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._panel_stack.set_transition_duration(120)
+        self._panel_stack.add_named(episodes, "episodes")
+        self._panel_stack.add_named(self._beauty_page, "beauty")
+        panel.append(self._panel_stack)
+
+        revealer = Gtk.Revealer()
+        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        revealer.set_transition_duration(180)
+        revealer.set_halign(Gtk.Align.FILL)
+        revealer.set_valign(Gtk.Align.FILL)
+        # The panel's head expands, which would make the box give the whole
+        # column extra width; pin the expand flag off explicitly.
+        revealer.set_hexpand_set(True)
+        revealer.set_hexpand(False)
+        revealer.set_child(panel)
+        revealer.set_reveal_child(False)
+        revealer.set_visible(False)
+        self._sync_playlist()
+        return revealer
+
+    def _on_panel_tab_toggled(self, button: Gtk.ToggleButton) -> None:
+        """Switch the panel page; the tab buttons behave like radios."""
+        if self._updating_toggles:
+            return
+        name = "beauty" if button is self._panel_tab_beauty else "episodes"
+        other = (
+            self._panel_tab_episodes if name == "beauty" else self._panel_tab_beauty
+        )
+        if not button.get_active():
+            if other.get_active():
+                return
+            # Clicking the active tab must not leave the panel without a
+            # selected tab; the group allows a programmatic "none active".
+            self._updating_toggles = True
+            try:
+                button.set_active(True)
+            finally:
+                self._updating_toggles = False
+        elif other.get_active():
+            self._updating_toggles = True
+            try:
+                other.set_active(False)
+            finally:
+                self._updating_toggles = False
+        self._panel_tab = name
+        stack = getattr(self, "_panel_stack", None)
+        if stack is not None and stack.get_child_by_name(name) is not None:
+            stack.set_visible_child_name(name)
+
+    def _set_panel_tab(self, name: str) -> None:
+        """Select a panel tab (also used when the panel becomes available)."""
+        name = "beauty" if name == "beauty" else "episodes"
+        self._panel_tab = name
+        stack = getattr(self, "_panel_stack", None)
+        if stack is not None and stack.get_child_by_name(name) is not None:
+            stack.set_visible_child_name(name)
+        button = (
+            self._panel_tab_beauty if name == "beauty" else self._panel_tab_episodes
+        )
+        if not button.get_active():
+            self._updating_toggles = True
+            try:
+                button.set_active(True)
+            finally:
+                self._updating_toggles = False
+
+    def _on_episodes_clicked(self, button: Gtk.ToggleButton) -> None:
+        """The chip only mirrors state; the panel is the source of truth."""
+        self._updating_toggles = True
+        try:
+            button.set_active(self._episodes_open)
+        finally:
+            self._updating_toggles = False
+        self._set_episodes_open(not self._episodes_open)
+
+    def _set_episodes_open(self, opened: bool) -> None:
+        opened = bool(opened)
+        if opened == self._episodes_open:
+            self._sync_episodes_layout()
+            return
+        self._episodes_open = opened
+        # The panel and the overlay drawer share the beauty page, so they can
+        # never be open together (only one of them is available per mode).
+        if opened and self._drawer_open:
+            self._set_beauty_drawer_open(False)
+        self._sync_episodes_layout()
+        log_action("episodes_sidebar", open=opened)
+
+    def _sync_episodes_layout(self) -> None:
+        """Gate the docked panel and re-host the secondary controls.
+
+        Windowed playback has the panel, so 字幕 moves to the picture top bar
+        and 美颜 to the panel tab.  Fullscreen and ``--record`` collapse the
+        panel, so both return to the one transport row (and the drawer).
+        """
+        revealer = getattr(self, "_episodes_revealer", None)
+        if revealer is None:
+            return
+        available = (
+            self._page == "player"
+            and not self._immersive
+            and self._record_path is None
+        )
+        revealer.set_visible(available)
+        open_docked = bool(available and self._episodes_open)
+        revealer.set_reveal_child(open_docked)
+        self._sync_secondary_placement(available)
+        if hasattr(self, "_top_bar"):
+            self._top_bar.set_episodes_active(open_docked)
+        if hasattr(self, "_episodes_button"):
+            # A panel chip that can only change invisible state would be a
+            # dead control while the column is unavailable (e.g. --record).
+            self._episodes_button.set_visible(available)
+
+    def _sync_secondary_placement(self, available: bool) -> None:
+        """Move 字幕 and 美颜 to the hosts the current mode provides.
+
+        The widgets are moved, never duplicated, so the subtitle popover and
+        the beauty state survive every transition.  Windowed: 字幕 in the
+        picture top bar, 美颜 in the panel tab.  Otherwise: both in the one
+        transport row, with 美颜 keeping its overlay drawer.
+        """
+        page = getattr(self, "_beauty_page", None)
+        if page is None:
+            return
+        where = "panel" if available else "dock"
+        if where == self._secondary_placement:
+            return
+        if available and self._drawer_open:
+            self._set_beauty_drawer_open(False)
+        self._secondary_placement = where
+
+        self._subtitle_button.unparent()
+        if available:
+            self._top_bar.insert_child_after(
+                self._subtitle_button, self._top_bar.titles
+            )
+            self._subtitle_button.remove_css_class("play-control")
+            self._subtitle_button.remove_css_class("play-text-control")
+            self._subtitle_button.add_css_class("play-top-chip")
+        else:
+            self._transport_row.insert_child_after(
+                self._subtitle_button, self._transport_spacer
+            )
+            self._subtitle_button.remove_css_class("play-top-chip")
+            self._subtitle_button.add_css_class("play-control")
+            self._subtitle_button.add_css_class("play-text-control")
+        self._dock_beauty_button.set_visible(not available)
+
+        parent = page.get_parent()
+        if parent is self._panel_stack:
+            # Gtk.Stack keeps the page name until the child is removed
+            # explicitly; unparent alone leaves a duplicate for add_named.
+            self._panel_stack.remove(page)
+        elif parent is not None:
+            page.unparent()
+        if available:
+            existing = self._panel_stack.get_child_by_name("beauty")
+            if existing is not None:
+                self._panel_stack.remove(existing)
+            self._panel_stack.add_named(page, "beauty")
+            self._set_panel_tab(self._panel_tab)
+            page.remove_css_class("beauty-drawer")
+            page.set_margin_top(0)
+            page.set_margin_bottom(0)
+            page.set_margin_end(0)
+            page.set_size_request(-1, -1)
+            self._beauty_header.set_visible(False)
+            self._drawer_close_button.set_visible(False)
+            self._beauty_tab_rule.set_visible(False)
+        else:
+            self._drawer_revealer.set_child(page)
+            page.add_css_class("beauty-drawer")
+            page.set_margin_top(76)
+            page.set_margin_bottom(112)
+            page.set_margin_end(24)
+            page.set_size_request(352, -1)
+            self._beauty_header.set_visible(True)
+            self._drawer_close_button.set_visible(True)
+            self._beauty_tab_rule.set_visible(True)
+
+    def _on_episodes_add(self, _button: Gtk.Button) -> None:
+        self._on_open_clicked(self._open_button)
+
+    def _build_more_popover(self) -> Gtk.Popover:
+        """Window-level actions that used to sit in the header bar."""
+        popover = Gtk.Popover()
+        popover.add_css_class("play-popover")
+        popover.add_css_class("more-popover")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_size_request(300, -1)
+
+        self._open_button = self._menu_button(
+            self._t("open"), self._on_open_clicked, glyph="\u25b6"
+        )
+        self._open_label = self._open_button.get_child().get_last_child()
+        box.append(self._open_button)
+        self._open_folder_button = self._menu_button(
+            self._t("open_folder"), self._on_open_folder_clicked, glyph="\u25a3"
+        )
+        box.append(self._open_folder_button)
+
+        self._language_button = self._menu_button(
+            self._t("switch_language"),
+            self._on_language_clicked,
+            glyph="\u25ce",
+        )
+        box.append(self._language_button)
+
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        self._record_button = self._menu_button(
+            self._t("recording_toggle"), self._on_record_menu_clicked, glyph="\u25cf"
+        )
+        box.append(self._record_button)
+
+        self._close_button = self._menu_button(
+            self._t("close_window"), self._on_close_menu_clicked, glyph="\u2715"
+        )
+        box.append(self._close_button)
+
+        self._more_shortcuts_label = Gtk.Label()
+        self._more_shortcuts_label.add_css_class("menu-shortcuts")
+        self._more_shortcuts_label.set_xalign(0.0)
+        self._more_shortcuts_label.set_wrap(True)
+        box.append(self._more_shortcuts_label)
+
+        popover.set_child(box)
+        return popover
+
+    def _menu_button(self, text: str, handler, *, glyph: str = "") -> Gtk.Button:
+        button = Gtk.Button()
+        button.add_css_class("menu-row")
+        button.set_halign(Gtk.Align.FILL)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        glyph_label = Gtk.Label(label=glyph)
+        glyph_label.add_css_class("menu-row-glyph")
+        label = Gtk.Label(label=text)
+        label.set_xalign(0.0)
+        label.set_hexpand(True)
+        label.add_css_class("menu-row-label")
+        box.append(glyph_label)
+        box.append(label)
+        button.set_child(box)
+        button.label_widget = label
+        button.connect("clicked", handler)
+        return button
+
+    def _build_header_open_menu(self) -> Gtk.MenuButton:
+        """Browse header action: open a file or a folder from every page.
+
+        The empty states keep their own buttons; this is the persistent entry
+        that used to disappear as soon as the library had one clip.
+        """
+        button = Gtk.MenuButton()
+        button.add_css_class("header-open")
+        button.set_tooltip_text(self._t("open"))
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        glyph = Gtk.Label(label="\uff0b")
+        glyph.add_css_class("header-open-glyph")
+        self._header_open_label = Gtk.Label(label=self._t("open"))
+        self._header_open_label.add_css_class("header-open-label")
+        content.append(glyph)
+        content.append(self._header_open_label)
+        button.set_child(content)
+
+        popover = Gtk.Popover()
+        popover.add_css_class("play-popover")
+        popover.add_css_class("header-open-popover")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_size_request(240, -1)
+        self._header_open_file_row = self._menu_button(
+            self._t("open_video"), self._on_header_open_file, glyph="\u25b6"
+        )
+        box.append(self._header_open_file_row)
+        self._header_open_folder_row = self._menu_button(
+            self._t("open_folder"), self._on_header_open_folder, glyph="\u25a3"
+        )
+        box.append(self._header_open_folder_row)
+        popover.set_child(box)
+        self._header_open_popover = popover
+        button.set_popover(popover)
+        return button
+
+    def _on_header_open_file(self, button: Gtk.Button) -> None:
+        self._header_open_popover.popdown()
+        self._on_open_clicked(button)
+
+    def _on_header_open_folder(self, button: Gtk.Button) -> None:
+        self._header_open_popover.popdown()
+        self._on_open_folder_clicked(button)
+
+    def _on_record_menu_clicked(self, _button: Gtk.Button) -> None:
+        self._more_popover.popdown()
+        self._toggle_recording()
+
+    def _on_close_menu_clicked(self, _button: Gtk.Button) -> None:
+        self._more_popover.popdown()
+        self.close()
+
+    def _on_beauty_pill_clicked(self, button: Gtk.ToggleButton) -> None:
+        """The pill is the drawer entrance; its check state mirrors the effect.
+
+        A click changes the toggle before this handler runs; reset it so the
+        pill keeps reporting ``config.beauty.enabled`` rather than the drawer
+        state, then open/close the drawer.
+        """
+        self._updating_toggles = True
+        try:
+            button.set_active(self.config.beauty.enabled)
+        finally:
+            self._updating_toggles = False
+        self._toggle_beauty_drawer()
+
+    def _on_seek_back_clicked(self, _button: Gtk.Button) -> None:
+        if self.backend.has_media:
+            self.backend.seek_ns(
+                max(0, self.backend.position_ns() - 15 * GST_SECOND)
+            )
+
+    def _on_seek_forward_clicked(self, _button: Gtk.Button) -> None:
+        if self.backend.has_media:
+            self.backend.seek_ns(
+                self.backend.position_ns() + 15 * GST_SECOND
+            )
 
     def _build_decode_segments(self) -> Gtk.Widget:
         """Three segments rather than a switch: "auto" is a real third option."""
@@ -1202,172 +1698,66 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._sync_decode_buttons()
         return self._decode_row
 
-    def _build_sidebar(self) -> Gtk.Widget:
-        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        panel.add_css_class("sidebar-panel")
-        # The pane gives the sidebar 340 px; the 4 + 8 px margins live outside
-        # the panel's allocation, so asking for 340 clipped the right edge and
-        # cut the slider values.  328 + the margins is exactly the pane width.
-        panel.set_size_request(328, -1)
-        panel.set_margin_top(8)
-        panel.set_margin_bottom(8)
-        panel.set_margin_start(4)
-        panel.set_margin_end(8)
+    def _build_beauty_drawer(self, stage: Gtk.Overlay) -> None:
+        """Right-hand overlay shell for the beauty page.
 
-        # v4: the sidebar opens with a two-page tab strip.  Beauty no longer
-        # shares the column with the playlist, so neither page pushes the other
-        # out of view on the 1280x768 board panel.
-        panel.append(self._build_sidebar_tabs())
-        self._playlist_page = self._build_playlist_page()
-        self._beauty_page = self._build_beauty_page()
-        panel.append(self._playlist_page)
-        panel.append(self._beauty_page)
-        self._set_sidebar_tab(SIDEBAR_PAGES[0])
-        # The shipped config starts with beauty off, so the page has to open in
-        # its greyed "cascaded off" state rather than wait for the first click.
-        self._sync_beauty_page_state()
+        The page itself is built once by :meth:`_build_beauty_page` and is
+        re-hosted here only when the docked panel is unavailable (fullscreen
+        and ``--record``); the shell therefore starts without a child.
+        """
+        revealer = Gtk.Revealer()
+        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        revealer.set_transition_duration(180)
+        revealer.set_halign(Gtk.Align.END)
+        revealer.set_valign(Gtk.Align.FILL)
+        revealer.set_reveal_child(False)
+        revealer.set_visible(True)
+        self._drawer_revealer = revealer
+        self._drawer_panel = self._beauty_page
+        stage.add_overlay(revealer)
 
-        # Keep the controls reachable on the 1280x800 board panel: the sidebar
-        # itself scrolls, so expanding "More settings" never grows the window
-        # beyond the screen.
-        sidebar_scroll = Gtk.ScrolledWindow()
-        sidebar_scroll.add_css_class("sidebar-scroll")
-        sidebar_scroll.set_vexpand(True)
-        sidebar_scroll.set_hexpand(False)
-        sidebar_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sidebar_scroll.set_child(panel)
-        self._sidebar_scroll = sidebar_scroll
-        return sidebar_scroll
+    def _toggle_beauty_drawer(self) -> None:
+        self._set_beauty_drawer_open(not self._drawer_open)
 
-    def _build_sidebar_tabs(self) -> Gtk.Widget:
-        """Two page tabs, styled like the decode-mode segments."""
-        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
-        tabs.add_css_class("sidebar-tabs")
-        self._tab_playlist = Gtk.ToggleButton(label=self._t("playlist"))
-        self._tab_beauty = Gtk.ToggleButton(label=self._t("beauty"))
-        self._tab_beauty.set_group(self._tab_playlist)
-        for button, name in (
-            (self._tab_playlist, "playlist"),
-            (self._tab_beauty, "beauty"),
-        ):
-            button.set_hexpand(True)
-            # Set the initial state before connecting: a grouped toggle emits
-            # "toggled" for every set_active(), including the first one.
-            button.set_active(name == self._sidebar_tab)
-            button.connect("toggled", self._on_sidebar_tab_toggled, name)
-            tabs.append(button)
-        return tabs
-
-    def _build_playlist_page(self) -> Gtk.Widget:
-        """Recently played plus the current playlist: the default page."""
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        page.add_css_class("sidebar-page")
-        page.add_css_class("playlist-page")
-
-        # Recently played sits above the current playlist.  After a restart the
-        # playlist only holds what the launcher passed on the command line, so
-        # without this the sidebar is empty on every demo session.  Entries
-        # already in the playlist are filtered out in _sync_recents().
-        self._recents_title = Gtk.Label()
-        self._recents_title.set_xalign(0.0)
-        self._recents_title.add_css_class("section-heading")
-        page.append(self._recents_title)
-
-        self._recents_list = Gtk.ListBox()
-        self._recents_list.add_css_class("cinema-playlist")
-        self._recents_list.set_selection_mode(Gtk.SelectionMode.NONE)
-        self._recents_list.set_activate_on_single_click(True)
-        self._recents_list.connect("row-activated", self._on_recent_activated)
-        self._recents_scroll = Gtk.ScrolledWindow()
-        self._recents_scroll.add_css_class("playlist-scroll")
-        self._recents_scroll.set_vexpand(False)
-        # Three 44 px rows, like the v4 mockup; the outer sidebar scroll still
-        # reaches the rest of the history when there are more entries.
-        self._recents_scroll.set_size_request(-1, 132)
-        self._recents_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self._recents_scroll.set_child(self._recents_list)
-        page.append(self._recents_scroll)
-
-        self._recents_empty = Gtk.Label()
-        self._recents_empty.set_xalign(0.0)
-        self._recents_empty.add_css_class("recents-empty")
-        page.append(self._recents_empty)
-        self._sync_recents()
-
-        self._playlist_title = Gtk.Label()
-        self._playlist_title.set_xalign(0.0)
-        self._playlist_title.add_css_class("section-heading")
-        page.append(self._playlist_title)
-
-        self._playlist_list = Gtk.ListBox()
-        self._playlist_list.add_css_class("cinema-playlist")
-        self._playlist_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self._playlist_list.set_activate_on_single_click(True)
-        self._playlist_list.connect("row-activated", self._on_row_activated)
-        self._playlist_scroll = Gtk.ScrolledWindow()
-        self._playlist_scroll.add_css_class("playlist-scroll")
-        self._playlist_scroll.set_vexpand(True)
-        self._playlist_scroll.set_policy(
-            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
-        )
-        self._playlist_scroll.set_child(self._playlist_list)
-        page.append(self._playlist_scroll)
-        self._playlist_empty = Gtk.Label(label=self._t("playlist_empty"))
-        self._playlist_empty.add_css_class("empty-playlist")
-        self._playlist_empty.set_justify(Gtk.Justification.CENTER)
-        page.append(self._playlist_empty)
-
-        self._playlist_add_button = Gtk.Button(label=self._t("playlist_add"))
-        self._playlist_add_button.add_css_class("playlist-add")
-        self._playlist_add_button.connect("clicked", self._on_open_clicked)
-        page.append(self._playlist_add_button)
-        self._sync_playlist()
-
-        self._sidebar_shortcuts = Gtk.Label(label=self._t("sidebar_shortcuts"))
-        self._sidebar_shortcuts.add_css_class("sidebar-shortcuts")
-        self._sidebar_shortcuts.set_xalign(0.0)
-        self._sidebar_shortcuts.set_margin_top(4)
-        page.append(self._sidebar_shortcuts)
-        return page
-
-    def _on_sidebar_tab_toggled(
-        self, button: Gtk.ToggleButton, name: str
-    ) -> None:
-        # A radio group deactivates its previous member before activating the
-        # clicked one; only the activation names the page to show.
-        if self._updating_tabs or not button.get_active():
+    def _set_beauty_drawer_open(self, opened: bool) -> None:
+        opened = bool(opened)
+        if opened == self._drawer_open:
             return
-        self._set_sidebar_tab(name)
-
-    def _set_sidebar_tab(self, name: str) -> None:
-        """Show one sidebar page and keep both tab buttons in step."""
-        if name not in SIDEBAR_PAGES:
-            raise ValueError(f"unknown sidebar page: {name!r}")
-        self._sidebar_tab = name
-        self._updating_tabs = True
-        try:
-            self._tab_playlist.set_active(name == "playlist")
-            self._tab_beauty.set_active(name == "beauty")
-        finally:
-            self._updating_tabs = False
-        self._playlist_page.set_visible(name == "playlist")
-        self._beauty_page.set_visible(name == "beauty")
-        log_action("sidebar_tab", tab=name)
+        if opened and getattr(self, "_secondary_placement", "dock") != "dock":
+            # While windowed the page lives in the panel tab; there is no
+            # drawer to open (the pill is hidden in that mode).
+            return
+        self._drawer_open = opened
+        if opened:
+            # One right-hand column at a time; do not recurse through
+            # ``_set_episodes_open(False)`` (it only closes the drawer when
+            # *opening* the episodes column).
+            if self._episodes_open:
+                self._episodes_open = False
+                self._sync_episodes_layout()
+        self._drawer_revealer.set_reveal_child(opened)
+        log_action("beauty_drawer", open=opened)
 
     def _build_beauty_page(self) -> Gtk.Widget:
-        """v4 beauty page: master switch, strengths, settings, experimental.
+        """The beauty controls: master switch, strengths, settings.
 
-        The page owns the whole feature now.  Turning the master switch off
-        greys the body and cascades A|B and the face boxes off (see
-        :meth:`_set_beauty_enabled`), so no dependent control stays lit while
-        the effect is off.
+        Built once and re-hosted by :meth:`_sync_secondary_placement`: the
+        windowed panel tab or the fullscreen/``--record`` overlay drawer.  The
+        widget names stay ``_beauty_page``/``_beauty_body`` because the v4
+        cascade contract (grey the body, clear A|B and the boxes) is unchanged.
+        The drawer margins/classes are set by the placement code, so the page
+        itself has none.
         """
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        page.add_css_class("sidebar-page")
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.add_css_class("sidebar-panel")
         page.add_css_class("beauty-page")
+        page.set_vexpand(True)
+        page.set_valign(Gtk.Align.FILL)
+        self._beauty_page = page
 
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         head.add_css_class("beauty-head")
+        head.add_css_class("drawer-head")
         titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         titles.set_hexpand(True)
         self._beauty_header = Gtk.Label(label=self._t("beauty"))
@@ -1381,9 +1771,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._beauty_status_label = Gtk.Label()
         self._beauty_status_label.add_css_class("beauty-status")
         self._beauty_status_label.set_xalign(0.0)
+        self._beauty_status_label.set_wrap(True)
+        self._beauty_status_label.set_max_width_chars(34)
         status.append(self._beauty_status_dot)
         status.append(self._beauty_status_label)
         titles.append(status)
+        self._drawer_face_label = Gtk.Label()
+        self._drawer_face_label.add_css_class("beauty-drawer-face")
+        self._drawer_face_label.set_xalign(0.0)
+        self._drawer_face_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self._drawer_face_label.set_max_width_chars(30)
+        titles.append(self._drawer_face_label)
         head.append(titles)
 
         self._beauty_switch = Gtk.Switch()
@@ -1393,7 +1791,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._beauty_switch.set_active(self.config.beauty.enabled)
         self._beauty_switch.connect("notify::active", self._on_beauty_toggled)
         head.append(self._beauty_switch)
+
+        self._drawer_close_button = Gtk.Button(label="\u2715")
+        self._drawer_close_button.add_css_class("drawer-close")
+        self._drawer_close_button.set_valign(Gtk.Align.START)
+        self._drawer_close_button.set_tooltip_text(self._t("close"))
+        self._drawer_close_button.connect(
+            "clicked", lambda _button: self._set_beauty_drawer_open(False)
+        )
+        head.append(self._drawer_close_button)
         page.append(head)
+        self._beauty_tab_rule = DrawerTabRule()
+        page.append(self._beauty_tab_rule)
 
         # Shown only while the master switch is off: names what was cascaded
         # and warns that re-enabling beauty does not bring it back.
@@ -1403,9 +1812,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._beauty_cascade.set_wrap(True)
         page.append(self._beauty_cascade)
 
-        # Everything below the switch greys out together when beauty is off;
-        # the switch itself stays live so the page can be re-enabled.
+        # The drawer scrolls below its fixed title, so "More settings" can
+        # never push the panel past the 768 px board height.
+        scroll = Gtk.ScrolledWindow()
+        scroll.add_css_class("drawer-scroll")
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._drawer_scroll = scroll
+
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.set_margin_top(2)
+        body.set_margin_bottom(2)
         self._beauty_body = body
         body.append(self._build_beauty_strengths())
         body.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
@@ -1415,24 +1832,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         body.append(self._beauty_settings_heading)
         body.append(self._build_beauty_settings())
         body.append(self._build_beauty_more())
-        page.append(body)
 
         self._note_label = Gtk.Label()
         self._note_label.add_css_class("beauty-note")
         self._note_label.set_xalign(0.0)
         self._note_label.set_wrap(True)
-        page.append(self._note_label)
+        body.append(self._note_label)
 
         self._beauty_shortcuts = Gtk.Label()
         self._beauty_shortcuts.add_css_class("sidebar-shortcuts")
         self._beauty_shortcuts.set_xalign(0.0)
-        self._beauty_shortcuts.set_margin_top(4)
-        page.append(self._beauty_shortcuts)
+        self._beauty_shortcuts.set_wrap(True)
+        body.append(self._beauty_shortcuts)
 
-        # Wheel events over a Gtk.Scale adjust that scale by default.  On the
-        # board panel users expect the wheel to scroll the whole sidebar, so
-        # intercept vertical wheel events on every sidebar scale and move the
-        # sidebar adjustment instead.  The playlist keeps its own scroll.
+        scroll.set_child(body)
+        page.append(scroll)
+
+        # Wheel events over a Gtk.Scale adjust that scale by default.  In the
+        # drawer the wheel should scroll the panel instead (see PITFALLS).
         for scale in (
             self._smoothing,
             self._whitening,
@@ -1441,6 +1858,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._eye_enlarge,
         ):
             self._install_page_wheel_scroll(scale)
+        self._sync_beauty_page_state()
         return page
 
     def _build_beauty_strengths(self) -> Gtk.Widget:
@@ -1643,7 +2061,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._more_chevron.set_text("▾" if opened else "▸")
 
     def _install_page_wheel_scroll(self, scale: Gtk.Scale) -> None:
-        """Make the wheel over a sidebar scale scroll the sidebar page."""
+        """Make the wheel over a drawer scale scroll the drawer page."""
         controller = Gtk.EventControllerScroll.new(
             Gtk.EventControllerScrollFlags.VERTICAL
         )
@@ -1660,10 +2078,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
     ) -> bool:
         if dy == 0.0:
             return False
-        sidebar_scroll = getattr(self, "_sidebar_scroll", None)
-        if sidebar_scroll is None:
+        drawer_scroll = getattr(self, "_drawer_scroll", None)
+        if drawer_scroll is None:
             return False
-        adjustment = sidebar_scroll.get_vadjustment()
+        adjustment = drawer_scroll.get_vadjustment()
         if adjustment is None:
             return False
         upper = adjustment.get_upper()
@@ -1682,10 +2100,30 @@ class PlayerWindow(Gtk.ApplicationWindow):
         t = self._t
         self._update_title()
 
-        self._open_label.set_text(t("open"))
+        self._open_button.label_widget.set_text(t("open"))
         self._open_button.set_tooltip_text(t("open_tooltip"))
-        self._language_button.set_label(t("switch_language"))
+        self._open_folder_button.label_widget.set_text(t("open_folder"))
+        self._language_button.label_widget.set_text(t("switch_language"))
         self._language_button.set_tooltip_text(t("switch_language_tooltip"))
+        self._record_button.label_widget.set_text(t("recording_toggle"))
+        self._close_button.label_widget.set_text(t("close_window"))
+        self._more_shortcuts_label.set_text(t("player_shortcuts"))
+        self._back_button.set_tooltip_text(t("play_back"))
+        self._episodes_button.set_tooltip_text(t("panel_tooltip"))
+        self._top_more_button.set_tooltip_text(t("play_more"))
+        self._episodes_label_text = t("detail_episodes")
+        self._top_bar.set_episodes_label(self._episodes_label_text)
+        if hasattr(self, "_panel_tab_episodes"):
+            self._panel_tab_episodes.set_label(t("detail_episodes"))
+            self._panel_tab_beauty.set_label(t("beauty"))
+        self._drawer_close_button.set_tooltip_text(t("close"))
+        if hasattr(self, "_header_open_label"):
+            self._header_open_label.set_text(t("open"))
+            self._header_open_button.set_tooltip_text(t("open"))
+            self._header_open_file_row.label_widget.set_text(t("open_video"))
+            self._header_open_folder_row.label_widget.set_text(t("open_folder"))
+        if hasattr(self, "_episodes_close_button"):
+            self._episodes_close_button.set_tooltip_text(t("close"))
 
         self._empty_title.set_text(t("empty_title"))
         self._empty_subtitle.set_text(t("empty_subtitle"))
@@ -1702,16 +2140,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._playlist_title.set_text(t("playlist"))
         self._playlist_empty.set_text(t("playlist_empty"))
         self._playlist_add_button.set_label(t("playlist_add"))
-        self._sidebar_shortcuts.set_text(t("sidebar_shortcuts"))
         # Row captions (the time range) are translated too.
         self._sync_recents()
+        self._sync_playlist()
         self._decode_row.set_tooltip_text(t("decode_mode"))
         for mode, segment in self._decode_buttons.items():
             segment.set_label(t(f"decode_{mode}"))
-        self._tab_playlist.set_label(t("playlist"))
-        self._tab_beauty.set_label(t("beauty"))
         self._beauty_header.set_text(t("beauty"))
-        self._sidebar_button.set_tooltip_text(t("toggle_sidebar"))
         self._smoothing_label.set_text(t("smoothing"))
         self._whitening_label.set_text(t("whitening"))
         self._beauty_settings_heading.set_text(t("beauty_settings"))
@@ -1734,7 +2169,6 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._sync_beauty_toggles()
         self._sync_compare_toggles()
         self._sync_beauty_page_state()
-        self._back_button.set_tooltip_text(t("library_back"))
         self._browse.apply_language(self._t)
         self._sync_page_chrome()
 
@@ -1742,25 +2176,22 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._stop_button.set_tooltip_text(t("stop_playback"))
         self._prev_button.set_tooltip_text(t("previous"))
         self._next_button.set_tooltip_text(t("next"))
-        self._seek.set_tooltip_text(t("seek"))
-        self._volume.set_tooltip_text(t("volume"))
+        self._timeline.set_tooltip_text(t("seek"))
+        self._volume.set_tooltip_text(
+            f"{t('volume')} {int(round(self._volume.get_value()))}%"
+        )
         self._speed.set_tooltip_text(t("speed"))
         self._refresh_fullscreen_button()
+        self._subtitle_button.set_label(t("play_subtitles"))
         self._subtitle_button.set_tooltip_text(t("subtitles_tooltip"))
+        self._back15_button.set_tooltip_text(t("play_back15"))
+        self._forward15_button.set_tooltip_text(t("play_forward15"))
         self._subtitles_menu_label.set_text(t("show_subtitles"))
         self._open_subtitle_button.set_label(t("open_subtitle"))
         self._audio_label.set_text(t("audio_track"))
         self._refresh_subtitle_status()
         self._refresh_audio_tracks()
 
-        info_label_keys = {
-            "format": "info_resolution",
-            "codec": "info_codec",
-            "decode": "info_decode",
-            "fps": "info_fps",
-        }
-        for key, label in self._info_labels.items():
-            label.set_text(t(info_label_keys[key]))
         self._refresh_beauty_status()
         if self.backend.has_media:
             self._update_info_label()
@@ -1863,14 +2294,36 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return
         state = chrome_state(self.backend.has_media, self._playback_status)
         self._empty_state.set_visible(state.empty)
-        self._controls_bar.set_visible(state.transport)
+        # In windowed mode the dock is always up; in immersive mode its
+        # revealer is owned by the idle HUD.  A clip-less player hides it.
+        revealer = getattr(self, "_dock_revealer", None)
+        if revealer is not None:
+            revealer.set_visible(state.transport)
+            if not self._immersive:
+                revealer.set_reveal_child(state.transport)
         self._info_bar.set_visible(
-            state.info
-            and bool(self.config.debug.show_info_panel)
-            and not self._immersive
+            state.info and bool(self.config.debug.show_info_panel)
         )
         if hasattr(self, "_fullscreen_progress"):
             self._fullscreen_progress.set_visible(self._immersive and state.info)
+        self._sync_veils()
+
+    def _sync_veils(self) -> None:
+        """Windowed keeps both scrims; fullscreen dims only while the dock is up."""
+        if not hasattr(self, "_top_veil"):
+            return
+        if not self.backend.has_media:
+            self._top_veil.set_visible(False)
+            self._bottom_veil.set_visible(False)
+            return
+        if self._immersive:
+            self._top_veil.set_visible(False)
+            self._bottom_veil.set_visible(
+                self._dock_revealer.get_reveal_child()
+            )
+        else:
+            self._top_veil.set_visible(True)
+            self._bottom_veil.set_visible(True)
 
     def _sync_compare_overlay(self) -> None:
         """Feed the split captions from the live beauty config and frame size."""
@@ -1903,11 +2356,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def _sync_beauty_toggles(self) -> None:
-        """Mirror beauty state into the page switch and the dock pill.
+        """Mirror beauty state into the page switch, dock pill and panel chip.
 
         The pill carries the state in its label ("美颜 · 开 / 关"): the dock is
         the only entrance in fullscreen and a checked tint alone is easy to
-        miss on a 1280 px panel.
+        miss on a 1280 px panel.  While windowed the pill is hidden, so the
+        icon-only panel chip gets an amber dot for the same information.
         """
         if self._updating_toggles:
             return
@@ -1923,6 +2377,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._dock_beauty_button.set_label(
             self._t("beauty_pill_on" if enabled else "beauty_pill_off")
         )
+        dot = getattr(self, "_panel_dot", None)
+        if dot is not None:
+            dot.set_visible(enabled)
 
     def _sync_compare_toggles(self) -> None:
         """Mirror compare state into the A|B switch and the dock pill.
@@ -1949,7 +2406,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._dock_compare_button.set_label(self._t(state.dock_compare_label))
 
     def _sync_beauty_page_state(self) -> None:
-        """Grey the beauty page while its master switch is off (v4).
+        """Grey the beauty drawer body while its master switch is off (v4).
 
         The switch itself stays live; everything it owns (strengths, the
         settings card, the experimental expander) drops to 34 % and becomes
@@ -1975,7 +2432,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._refresh_beauty_status()
 
     def _refresh_beauty_status(self) -> None:
-        """Status line under the page title: GPU time while on, cascade while off."""
+        """Status line under the drawer title: GPU time plus the NPU face count."""
         beauty = self.config.beauty
         if not beauty.enabled:
             text = self._t("beauty_status_off")
@@ -1984,6 +2441,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
         else:
             text = self._t("beauty_status_on_pending")
         self._beauty_status_label.set_text(text)
+        if hasattr(self, "_drawer_face_label"):
+            self._drawer_face_label.set_text(self._drawer_face_text())
+
+    def _drawer_face_text(self) -> str:
+        """What the NPU currently reports, in the drawer's status line."""
+        if self._detection_error:
+            return self._t("drawer_face_error")
+        if not self._detection_needed():
+            return self._t("drawer_face_off")
+        if self._faces:
+            return self._t("drawer_face_count", count=len(self._faces))
+        return self._t("drawer_face_none")
 
     def _set_beauty_enabled(self, enabled: bool) -> None:
         """Apply beauty from either entrance and cascade its dependants.
@@ -2050,11 +2519,6 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._sync_beauty_page_state()
         self._sync_compare_toggles()
         log_action("compare", enabled=enabled)
-
-    def _on_dock_beauty_toggled(self, button: Gtk.ToggleButton) -> None:
-        if self._updating_toggles:
-            return
-        self._set_beauty_enabled(button.get_active())
 
     def _on_dock_compare_toggled(self, button: Gtk.ToggleButton) -> None:
         if self._updating_toggles:
@@ -2148,7 +2612,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._play_path(path)
 
     def _return_to_playlist(self) -> None:
+        self._cancel_surface_tap()
         log_action("return_to_playlist")
+        if hasattr(self, "_more_popover"):
+            self._more_popover.popdown()
+        self._set_beauty_drawer_open(False)
         if self._recorder is not None:
             self._stop_recording()
         # "Back to the playlist" is still leaving a clip mid-way, so the history
@@ -2157,6 +2625,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.backend.close()
         self._current_path = None
         self._playback_path = None
+        self._chapters = ()
+        self._chapter_duration_ns = 0
         self._playback_started = False
         self._fps = 0.0
         self._duration_ns = 0
@@ -2174,22 +2644,41 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._set_playback_status(None)
         self._sync_playlist()
 
-    def _on_sidebar_toggled(self, button: Gtk.ToggleButton) -> None:
-        """Collapse the sidebar so the video can take the full width."""
-        sidebar = self._paned.get_end_child()
-        if sidebar is not None:
-            sidebar.set_visible(button.get_active())
-        log_action("sidebar_toggle", visible=button.get_active())
-
     def _on_language_clicked(self, _button: Gtk.Button) -> None:
-        self._t.toggle()
+        self._set_language("en" if self._t.language == "zh" else "zh")
+
+    def _set_language(self, language: str) -> None:
+        """Switch the UI language from the player's more menu or settings.
+
+        The choice is persisted immediately; a read-only home directory must
+        not break the switch, so a failed save is ignored on purpose.
+        """
+        if language not in LANGUAGES or language == self._t.language:
+            return
+        self._t.language = language
         try:
-            save_language(self._t.language)
+            save_language(language)
         except OSError:
-            # A read-only home directory must not break the switch.
             pass
         self._apply_language()
-        log_action("language", lang=self._t.language)
+        log_action("language", lang=language)
+
+    def _set_decode_mode(self, mode: str) -> None:
+        """Set the decode strategy (transport segments or the settings page).
+
+        On the player page the current clip is reopened so the new path takes
+        effect; from the settings page there is nothing open, so the value is
+        staged and applies to the next file.
+        """
+        if mode not in DECODE_MODES or mode == self.config.player.decode_mode:
+            self._sync_decode_buttons()
+            return
+        self.config.player.decode_mode = mode
+        log_action("decode_mode", mode=mode)
+        if self._page == "player" and self.backend.has_media:
+            self._apply_decode_mode(mode)
+        self._sync_decode_buttons()
+        self._browse.settings.sync_decode_mode()
 
     # -- pages (ui-v5 browse shell) -------------------------------------
 
@@ -2199,8 +2688,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         Browsing means the clip is over, so returning to the shell persists the
         resume position and the history, closes the pipeline and clears the
         player chrome — the same work "back to playlist" always did.  The
-        browse shell remembers which of its pages (home / library / detail) the
-        player was opened from, so "back" lands there.
+        browse shell remembers which of its pages (home / library / recent /
+        detail) the player was opened from, so "back" lands there.
         """
         if page not in PAGE_NAMES:
             raise ValueError(f"unknown page: {page!r}")
@@ -2276,10 +2765,22 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._play_path(files[index], start_position_ns=start_position_ns)
 
     def _sync_page_chrome(self) -> None:
-        """Header follows the page: title, subtitle and window actions."""
+        """Header follows the page and the windowed/fullscreen distinction.
+
+        Windowed playback now keeps the real GTK header bar (clip title and
+        window buttons) while the picture top bar runs in *compact* mode;
+        fullscreen hides the header bar and restores the titles.  ``--record``
+        keeps the pre-existing no-header canvas so the captured layout does
+        not change.  The docked episodes column follows the same gating.
+        """
         browse = self._page == "browse"
+        windowed_player = (
+            not browse and not self._immersive and self._record_path is None
+        )
+        self._headerbar.set_visible(browse or windowed_player)
         self._back_button.set_visible(not browse)
-        self._sidebar_button.set_visible(not browse)
+        self._top_bar.set_visible(not browse and not self._immersive)
+        self._top_bar.set_compact(windowed_player)
         if browse:
             title, text = self._browse.headline()
             self._title_label.set_text(title)
@@ -2290,6 +2791,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         else:
             self._header_subtitle_cache = ""
             self._update_title()
+        self._sync_episodes_layout()
 
     # -- playback -------------------------------------------------------
 
@@ -2314,9 +2816,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         # On stage the operator drives the sliders live, so "More settings" is
         # open in demo mode even though it is collapsed by default.
         self._more_button.set_active(True)
-        # v4: the showcase starts on the beauty page; the playlist tab is one
-        # click away and --demo is the only mode that promotes it this way.
-        self._set_sidebar_tab("beauty")
+        # P4: the fullscreen showcase keeps the picture clean; the drawer is
+        # one tap away on the beauty pill (v4 also hid the sidebar in fullscreen).
+        self._set_beauty_drawer_open(False)
         self.backend.refresh_beauty()
         self._refresh_beauty_status()
         self._sync_compare_overlay()
@@ -2425,6 +2927,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         sets "正在启用人脸检测" just before this call and must not replace it
         with the resume confirmation.
         """
+        self._cancel_surface_tap()
         log_action("play_path", path=path)
         self._cancel_detection_reopen()
         # Persist the outgoing clip first: ``position_ns()`` is only meaningful
@@ -2433,6 +2936,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         resume_ns = self._resume_target_ns(path, start_position_ns)
         self._playback_path = path
         self._current_path = path
+        self._chapters = load_chapters(path)
+        self._chapter_duration_ns = 0
+        if hasattr(self, "_seek"):
+            self._seek.set_chapters(())
         self._update_title()
         self._apply_subtitle(find_sidecar(path))
         self._playback_started = False
@@ -2637,7 +3144,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         volume = int(round(scale.get_value()))
         self.config.player.volume = volume
         self.backend.set_volume(volume)
-        self._volume_label.set_text(f"{volume}%")
+        # The row has no room for a static "80%" label; the value follows the
+        # pointer/focus in the tooltip instead (the icon still names the band).
+        self._volume.set_tooltip_text(f"{self._t('volume')} {volume}%")
         icon = (
             "audio-volume-muted-symbolic"
             if volume == 0
@@ -2684,95 +3193,163 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._refresh_fullscreen_button()
 
     def _enter_immersive(self) -> None:
-        sidebar = self._paned.get_end_child()
-        if sidebar is not None:
-            sidebar.set_visible(False)
-        # Edge to edge: the 8 px window padding separates the video from the
-        # sidebar, which no longer exists in this mode.
-        self._player_box.set_margin_top(0)
-        self._player_box.set_margin_bottom(0)
-        self._player_box.set_margin_start(0)
-        self._player_box.set_margin_end(0)
-        self._info_bar_was_visible = self._info_bar.get_visible()
-        # Only the transport moves into the dock.  The info row is replaced by
-        # the always-on telemetry line in the top-left corner.
-        if self._controls_bar.get_parent() is not None:
-            self._controls_bar.unparent()
-        self._dock.append(self._controls_bar)
-        self._info_bar.set_visible(False)
-        self._controls_bar.add_css_class("docked")
+        """Fullscreen: picture only; top chrome leaves, the bottom dock fades.
+
+        The dock revealer is the same widget the windowed layout always shows,
+        so a video cannot look different in the two modes.  ``--record`` keeps
+        the windowed layout (the recorder composes from these allocations).
+        """
+        self._immersive = True
+        self._headerbar.set_visible(False)
+        self._top_bar.set_visible(False)
         self._immersive_tools.set_visible(True)
         self._player_overlay.add_css_class("immersive")
-        self._dock_revealer.set_visible(True)
-        self._dock_revealer.set_reveal_child(True)
-        self._telemetry_box.set_visible(self.backend.has_media)
+        self._dock_revealer.set_visible(self.backend.has_media)
+        self._dock_revealer.set_reveal_child(self.backend.has_media)
+        # The always-on corner line appears only after the dock fades, so the
+        # picture does not carry both telemetry rows at once.
+        self._telemetry_box.set_visible(False)
         self._telemetry_box.set_opacity(1.0)
         self._fullscreen_progress.set_visible(self.backend.has_media)
         self._sync_compare_overlay()
         self._sync_subtitle_margin()
+        self._sync_veils()
         self._dock_hover = False
         self._dock_deadline = time.monotonic() + DOCK_IDLE_SECONDS
+        self._sync_episodes_layout()
 
     def _leave_immersive(self) -> None:
-        if self._controls_bar.get_parent() is self._dock:
-            self._controls_bar.unparent()
-        self._dock_revealer.set_reveal_child(False)
-        self._dock_revealer.set_visible(False)
+        self._immersive = False
+        self._headerbar.set_visible(
+            self._page == "player" and self._record_path is None
+        )
+        self._top_bar.set_visible(self._page == "player")
         self._telemetry_box.set_visible(False)
         self._telemetry_box.set_opacity(1.0)
         self._fullscreen_progress.set_visible(False)
         self._immersive_tools.set_visible(False)
-        self._sync_subtitle_margin()
-        self._controls_bar.remove_css_class("docked")
         self._player_overlay.remove_css_class("immersive")
-        # Same order as _build_player_area: picture, info line, transport.
-        self._player_box.append(self._controls_bar)
-        margin = self._player_margin
-        self._player_box.set_margin_top(margin)
-        self._player_box.set_margin_bottom(margin)
-        self._player_box.set_margin_start(margin)
-        self._player_box.set_margin_end(margin)
-        sidebar = self._paned.get_end_child()
-        if sidebar is not None:
-            sidebar.set_visible(self._sidebar_button.get_active())
+        self._dock_hover = False
+        self._dock_deadline = 0.0
+        self._sync_subtitle_margin()
+        self._sync_veils()
         self._sync_chrome_visibility()
+        self._sync_episodes_layout()
 
     def _show_dock(self) -> None:
         if not self._immersive:
             return
         self._dock_deadline = time.monotonic() + DOCK_IDLE_SECONDS
-        self._telemetry_box.set_opacity(1.0)
+        self._telemetry_box.set_visible(False)
         if not self._dock_revealer.get_reveal_child():
             self._dock_revealer.set_reveal_child(True)
             self._sync_subtitle_margin()
+            self._sync_veils()
 
     def _maybe_hide_dock(self) -> None:
         """Fade the dock out once the pointer has been still for a while.
 
-        The telemetry and the bottom progress hairline deliberately stay: the
-        viewer keeps the clip identity and position after the controls go.
+        The telemetry line and the bottom progress hairline deliberately stay:
+        the viewer keeps the clip identity and position after the controls go.
+        A paused frame and an open beauty drawer both keep the dock up.
         """
         if not self._immersive or not self._dock_revealer.get_reveal_child():
             return
-        if self._dock_hover or not self.backend.is_playing:
-            # A paused frame is something to look at, so the timecode and the
-            # transport stay until playback resumes.
+        if self._dock_hover or not self.backend.is_playing or self._drawer_open:
             self._dock_deadline = time.monotonic() + DOCK_IDLE_SECONDS
             return
         if time.monotonic() >= self._dock_deadline:
             self._dock_revealer.set_reveal_child(False)
+            self._telemetry_box.set_visible(True)
             self._telemetry_box.set_opacity(TELEMETRY_IDLE_OPACITY)
             self._sync_subtitle_margin()
+            self._sync_veils()
 
     def _sync_subtitle_margin(self) -> None:
-        """Keep subtitles clear of the dock while it is on screen."""
-        lifted = self._immersive and self._dock_revealer.get_reveal_child()
+        """Keep subtitles clear of the dock while it is on screen.
+
+        In windowed mode the dock is always up; in fullscreen it is up until
+        the idle timer hides it.
+        """
+        lifted = (not self._immersive) or self._dock_revealer.get_reveal_child()
         self._subtitle_label.set_margin_bottom(
             DOCK_SUBTITLE_CLEARANCE if lifted else 24
         )
 
-    def _on_surface_pressed(self, *_args: object) -> None:
-        self._show_dock()
+    def _on_stage_pressed(
+        self, gesture: Gtk.GestureClick, _n_press: int, x: float, y: float
+    ) -> None:
+        """Click outside the beauty drawer closes it and swallows the press.
+
+        CAPTURE phase, because the press would otherwise also reach the video
+        tap gesture (pause) or the transport keys underneath.  Claiming the
+        sequence is what makes the outside click "only close the drawer"; the
+        board touch panel behaves like the mouse (verified on GTK 4.14).
+        """
+        if not self._drawer_open:
+            return
+        panel = getattr(self, "_drawer_panel", None)
+        stage = getattr(self, "_player_box", None)
+        if panel is not None and stage is not None:
+            ok, rect = panel.compute_bounds(stage)
+            if ok and (
+                rect.origin.x <= x <= rect.origin.x + rect.size.width
+                and rect.origin.y <= y <= rect.origin.y + rect.size.height
+            ):
+                return
+        self._set_beauty_drawer_open(False)
+        self._ignore_surface_tap_until = time.monotonic() + 0.35
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _on_surface_pressed(
+        self, _gesture: Gtk.GestureClick, _n_press: int, x: float, y: float
+    ) -> None:
+        """Single tap pauses, double tap toggles fullscreen (300 ms window).
+
+        The debounce exists because the second press of a double tap arrives
+        while the single-tap action is still pending; double-tap cancels it so
+        the viewer gets fullscreen without a visible play/pause flash.
+        """
+        if self._record_path is not None or not self.backend.has_media:
+            return
+        now = time.monotonic()
+        if now < self._ignore_surface_tap_until:
+            return
+        action = self._tap_tracker.classify(now, x, y)
+        self._cancel_surface_tap()
+        if action == DOUBLE:
+            self._on_fullscreen_clicked(None)
+            log_action("surface_tap", kind="fullscreen")
+            return
+        self._tap_path = self._current_path
+        self._tap_timeout_id = GLib.timeout_add(
+            DOUBLE_TAP_MS, self._commit_surface_tap
+        )
+
+    def _commit_surface_tap(self) -> bool:
+        self._tap_timeout_id = 0
+        if (
+            self._closed
+            or self._page != "player"
+            or self._record_path is not None
+            or not self.backend.has_media
+        ):
+            return False
+        if self._tap_path is not None and self._tap_path != self._current_path:
+            return False
+        if self._playback_status in ("error", "ended"):
+            return False
+        self._on_play_clicked(None)
+        if self._immersive:
+            self._show_dock()
+        log_action("surface_tap", kind="toggle")
+        return False
+
+    def _cancel_surface_tap(self) -> None:
+        if self._tap_timeout_id:
+            GLib.source_remove(self._tap_timeout_id)
+            self._tap_timeout_id = 0
+        self._tap_path = None
 
     def _on_pointer_motion(
         self, _controller: Gtk.EventControllerMotion, x: float, y: float
@@ -2810,6 +3387,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
 
     def _on_row_activated(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        # Keep the column open: switching episodes is a browse action, not a
+        # dismissal of the panel.
         log_action("playlist_row", index=row.get_index())
         self._start_index(row.get_index())
 
@@ -3083,16 +3662,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return False
 
     def _update_title(self) -> None:
-        """Keep the header's two lines and the window title in step."""
+        """Keep the browse header, the picture title and the window in step."""
         if getattr(self, "_page", "player") == "browse":
             return
         t = self._t
         if self._current_path is not None:
-            self.set_title(t("title_with_media", name=self._current_path.name))
-            self._title_label.set_text(self._current_path.name)
+            name = self._current_path.name
+            display = self._current_path.stem
+            self.set_title(t("title_with_media", name=name))
         else:
+            name = t("app_title")
+            display = name
             self.set_title(t("app_title"))
-            self._title_label.set_text(t("app_title"))
+        self._title_label.set_text(name)
+        if hasattr(self, "_play_title_label"):
+            self._play_title_label.set_text(display)
         self._refresh_subtitle()
 
     def _header_subtitle_text(self) -> str:
@@ -3115,18 +3699,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if getattr(self, "_page", "player") == "browse":
             return
         text = self._header_subtitle_text()
-        if text == self._header_subtitle_cache:
-            return
-        self._header_subtitle_cache = text
-        self._header_subtitle_label.set_text(text)
-        self._header_subtitle_label.set_visible(bool(text))
+        if text != self._header_subtitle_cache:
+            self._header_subtitle_cache = text
+            self._header_subtitle_label.set_text(text)
+            self._header_subtitle_label.set_visible(bool(text))
+        if hasattr(self, "_top_bar"):
+            self._top_bar.set_subtitle(text)
 
     def _update_play_icon(self, playing: bool) -> None:
         icon = "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
         self._play_button.set_icon_name(icon)
 
     def _update_info_label(self) -> None:
-        """Refresh the labelled info row and the fullscreen telemetry line."""
+        """Refresh the in-picture telemetry row and the fullscreen hairline copy."""
         t = self._t
         info = self.backend.video_info
         width = info.get("width", "—")
@@ -3141,10 +3726,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 fps_text = f"{float(fps_value):.1f}"
             except (TypeError, ValueError):
                 fps_text = str(fps_value)
-        # v4: the face clause reports what is on screen, not what the NPU is
-        # still running for the beauty mask.  With the boxes switch off (the
-        # cascade clears it with the effect) the row reads "人脸 关", matching
-        # the mockup; detection can stay armed behind the shader.
+        # The face clause reports what is on screen, not what the NPU is still
+        # running for the beauty mask.  With the boxes switch off (the cascade
+        # clears it with the effect) the row reads "人脸 关", matching the mockup.
         if not self._show_faces:
             face_text = t("info_face_off")
         elif self._detection_error:
@@ -3168,22 +3752,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         else:
             beauty_text = t("info_beauty_on", ms=self.backend.beauty_ms)
         format_text = f"{width}×{height}" if width != "—" else "—"
-        values = {
-            "format": format_text,
-            "codec": codec,
-            "decode": self._decode_chip_text(decoder),
-            "fps": fps_text,
-        }
-        for key, text in values.items():
-            self._info_values[key].set_text(text)
-        self._info_face.set_text(face_text)
-        self._info_beauty.set_text(beauty_text)
-        # v4 mockup: the live dot is extinguished with the effect (both the
-        # windowed row and the fullscreen telemetry share the info-dot class).
-        if self.config.beauty.enabled:
-            self._info_dot.remove_css_class("is-off")
-        else:
-            self._info_dot.add_css_class("is-off")
+        decode_text = self._decode_chip_text(decoder)
+        self._info_bar.set_values(
+            decode=decode_text,
+            codec=codec,
+            resolution=format_text,
+            fps=f"{fps_text} fps" if fps_text != "—" else "—",
+            face=face_text,
+            beauty=beauty_text,
+            cpu=t("telemetry_cpu", percent=self._cpu_percent),
+            hardware="mpp" in str(decoder),
+        )
         # "mppvideodec" would not fit the row; keep the element name in the
         # tooltip so a decode fallback is still diagnosable.
         self._info_values["decode"].set_tooltip_text(str(decoder))
@@ -3191,9 +3770,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         # The fullscreen line is the same telemetry without labels on the
         # static fields; NPU/beauty keep their labels because the numbers move.
         self._telemetry_main.set_text(
-            f"{format_text} · {codec} · {values['decode']} · {fps_text} fps"
+            f"{format_text} · {codec} · {decode_text} · {fps_text} fps"
         )
         self._telemetry_live.set_text(f"{face_text} · {beauty_text}")
+        if self.config.beauty.enabled:
+            self._telemetry_dot.remove_css_class("is-off")
+        else:
+            self._telemetry_dot.add_css_class("is-off")
+        self._refresh_beauty_status()
         self._refresh_subtitle()
 
     def _decode_chip_text(self, decoder: str) -> str:
@@ -3207,13 +3791,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _reset_info_chips(self) -> None:
         """Neutral state used before a file is open and after it is closed."""
-        for value in self._info_values.values():
-            value.set_text("—")
-            value.set_tooltip_text(None)
-        self._info_face.set_text("—")
-        self._info_beauty.set_text("—")
+        self._info_bar.set_values(
+            decode="—",
+            codec="—",
+            resolution="—",
+            fps="—",
+            face="—",
+            beauty="—",
+            cpu="—",
+            hardware=False,
+        )
+        self._info_values["decode"].set_tooltip_text(None)
         self._telemetry_main.set_text("—")
         self._telemetry_live.set_text("")
+        if hasattr(self, "_timeline"):
+            self._timeline.set_chapters(())
         self._set_timecode("00:00 / 00:00")
         self._set_progress_fraction(0.0)
 
@@ -3246,6 +3838,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if hasattr(self, "_playlist_scroll"):
             self._playlist_scroll.set_visible(bool(self.playlist))
             self._playlist_empty.set_visible(not self.playlist)
+        if hasattr(self, "_episodes_count_label"):
+            # The heading above already says 播放列表; the meta label is only
+            # the position, so no locale-specific prefix is duplicated.
+            self._episodes_count_label.set_text(
+                f"{self.playlist.index + 1}/{len(self.playlist)}"
+                if self.playlist
+                else ""
+            )
         # The playlist changed: an entry shown as "recent" a moment ago may
         # now be duplicated, so rebuild the history section too.
         self._sync_recents()
@@ -3253,6 +3853,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _tick(self) -> bool:
         self._maybe_hide_dock()
+        self._sample_cpu()
         if self.backend.has_media:
             measured = self.backend.measured_fps()
             if measured and abs(measured - self._fps) >= 0.5:
@@ -3262,6 +3863,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
             position = self.backend.position_ns()
             if duration > 0:
                 self._duration_ns = duration
+                if duration != self._chapter_duration_ns:
+                    self._chapter_duration_ns = duration
+                    self._seek.set_chapters(
+                        chapter_marks(self._chapters, duration)
+                    )
                 if not self._updating_seek:
                     self._updating_seek = True
                     self._seek.set_value(position / duration * 1000.0)
@@ -3288,6 +3894,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._record_path is not None:
             self._maybe_start_recording()
         return True
+
+    def _sample_cpu(self) -> None:
+        """Measure process CPU (all threads) over a one-second window."""
+        now = time.monotonic()
+        elapsed = now - self._cpu_sampled_at
+        if elapsed < 1.0:
+            return
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        total = usage.ru_utime + usage.ru_stime
+        self._cpu_percent = max(0.0, (total - self._cpu_usage) / elapsed * 100.0)
+        self._cpu_usage = total
+        self._cpu_sampled_at = now
 
     def _maybe_log_perf(self) -> None:
         """Print a one-line performance sample once per second (evidence runs).
@@ -3566,6 +4184,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 self._browse.back_from_detail()
                 self._sync_page_chrome()
                 return True
+            if name == "Escape" and self._browse.page in ("settings", "recent"):
+                self._browse.go_home()
+                self._sync_page_chrome()
+                return True
             return False
         if name == "space":
             self._on_play_clicked(None)
@@ -3578,6 +4200,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return True
         if name in ("f", "F"):
             self._on_fullscreen_clicked(None)
+            return True
+        if name == "Escape" and self._drawer_open:
+            self._set_beauty_drawer_open(False)
+            return True
+        if name == "Escape" and self._episodes_open and not self._immersive:
+            self._set_episodes_open(False)
             return True
         if name == "Escape" and self.is_fullscreen():
             self.unfullscreen()
@@ -3619,17 +4247,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _recording_layer_specs(self) -> list[tuple[str, Gtk.Widget]]:
         """Chrome painted into the recorder canvas, in paint order.
 
-        The canvas spans the whole window, so it has to include the header bar
-        too — otherwise the recording keeps an empty 59 px band at the top where
-        the title bar would be.  The list is a method (not inline in
-        :meth:`_maybe_start_recording`) so the order can be asserted without a
-        display.
+        ``--record`` keeps the P4 windowed canvas: header bar hidden, 选集
+        column collapsed, so the chrome is the picture-top bar, the bottom dock
+        and the beauty drawer.  All three are overlay children of the stage,
+        and capturing them as separate layers keeps the 16:9 video hole free
+        for the mixer.  The list is a method (not
+        inline in :meth:`_maybe_start_recording`) so the order can be asserted
+        without a display.
         """
         return [
-            ("header", self._headerbar),
-            ("sidebar", self._sidebar_scroll),
-            ("info", self._info_bar),
-            ("controls", self._controls_bar),
+            ("top", self._top_bar),
+            ("dock", self._dock),
+            ("drawer", self._beauty_page),
             ("hint", self._hint_label),
             ("playback-status", self._status_card),
         ]
@@ -3721,7 +4350,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         from ``window.cinema-window`` and put a different frame around the
         video.
         """
-        red, green, blue, _alpha = rgba("bg")
+        # The player page's visible backdrop is the stage's video black, not
+        # the window's graphite; the recorder must use the same colour so its
+        # letterbox bars match the live picture.
+        red, green, blue, _alpha = rgba("video")
         return (
             round(red * 255.0),
             round(green * 255.0),
@@ -3777,19 +4409,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if builder.size != (self.get_width(), self.get_height()):
             builder.refresh_background()
             self._update_record_geometry()
-        # Layer capture costs 2-10 ms per widget: the sidebar is big and rarely
-        # changes (3 s), the info line and controls only tick once a second.
+        # Layer capture costs 2-10 ms per widget.  The top bar is mostly static
+        # but the dock carries the timecode and the live telemetry, so it is
+        # refreshed once a second; the drawer only exists while it is open.
         # The first two seconds are different: the window may still be painting
         # its first frames, and a widget snapshot of an unpainted widget comes
         # back blank, so every layer is refreshed until the tree settled.
         if self._record_ticks <= 20:
             builder.refresh()
         else:
-            if self._record_ticks % 30 == 1:
-                builder.refresh(("sidebar",))
+            if self._record_ticks % 30 == 1 and self._drawer_open:
+                builder.refresh(("drawer",))
             if self._record_ticks % 10 == 1:
                 builder.refresh(
-                    ("header", "info", "controls", "hint", "playback-status")
+                    ("top", "dock", "hint", "playback-status")
                 )
         info = self.backend.video_info
         width = int(info.get("width") or 0)
@@ -3887,6 +4520,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._closed:
             return False
         self._closed = True
+        self._cancel_surface_tap()
         if os.environ.get("REC_DEBUG"):
             print("[rec] window closing", flush=True)
         self._stop_recording()

@@ -1,8 +1,9 @@
-"""Home and detail data for the ui-v5 browse shell (no GTK, no GStreamer).
+"""Home / recent / detail data for the ui-v5 browse shell (no GTK, no GStreamer).
 
-The two pages added after the library grid -- the home page (hero + "continue
-watching" + "recently added") and the detail page (backdrop + episodes + clip
-facts) -- are mostly arithmetic over data the project already has:
+The pages added after the library grid -- the home page (hero + "continue
+watching" + "recently added"), the recent page (watch history split into
+"continue watching" and "finished") and the detail page (backdrop + episodes +
+clip facts) -- are mostly arithmetic over data the project already has:
 :class:`video_player.library.LibraryItem` from the folder scan and
 :class:`video_player.recents.RecentItem` from the play history.  Keeping that
 arithmetic here means the widgets stay thin and the rules (which clip the hero
@@ -38,12 +39,14 @@ __all__ = [
     "DetailView",
     "HomeCard",
     "HomeView",
+    "RecentView",
     "bitrate_text",
     "detail_view",
     "episode_items",
     "hardware_decodable",
     "home_view",
     "progress_map",
+    "recent_view",
     "remaining_text",
 ]
 
@@ -75,12 +78,19 @@ _HW_CODECS = frozenset({"h264", "avc", "h265", "hevc", "hvc1", "hev1"})
 
 @dataclass(frozen=True)
 class HomeCard:
-    """One "continue watching" tile: a library item plus the history cursor."""
+    """One history-backed tile: a library item plus the history cursor.
+
+    Shared by the home "continue watching" row and the recent page; the former
+    caps the list at four cards, the latter groups them by watch state.
+    """
 
     item: LibraryItem
     progress: float = 0.0
     position_ns: int = 0
     duration_ns: int = 0
+    #: History timestamp (``RecentItem.updated_at``); the recent page sorts by
+    #: it.  Zero for the "recently added" fallback, which has no history.
+    updated_at: float = 0.0
 
     def __post_init__(self) -> None:
         # A history entry may be older than the probe; the duration from the
@@ -136,6 +146,36 @@ class HomeView:
     def hero_is_resume(self) -> bool:
         hero = self.hero
         return hero is not None and hero.resumable
+
+
+@dataclass(frozen=True)
+class RecentView:
+    """The recent page: history cards split by watch state, newest first."""
+
+    continue_cards: tuple[HomeCard, ...] = ()
+    finished_cards: tuple[HomeCard, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        """No history entry points at a file the library still scans."""
+        return not self.continue_cards and not self.finished_cards
+
+    @property
+    def total(self) -> int:
+        return len(self.continue_cards) + len(self.finished_cards)
+
+    @property
+    def resumable_count(self) -> int:
+        """Cards with a position worth a "continue" tap (excludes finished)."""
+        return sum(1 for card in self.continue_cards if card.resumable)
+
+    def groups(self) -> tuple[tuple[str, tuple[HomeCard, ...]], ...]:
+        """Non-empty ``(group key, cards)`` pairs in display order."""
+        groups = (
+            ("continue", self.continue_cards),
+            ("finished", self.finished_cards),
+        )
+        return tuple((key, cards) for key, cards in groups if cards)
 
 
 @dataclass(frozen=True)
@@ -246,6 +286,7 @@ def home_view(
                     progress=entry.progress,
                     position_ns=entry.position_ns,
                     duration_ns=entry.duration_ns,
+                    updated_at=entry.updated_at,
                 )
             )
             if len(cards) >= limit:
@@ -254,6 +295,46 @@ def home_view(
         sorted(ordered, key=lambda item: (-item.mtime, item.path.name.lower()))[:limit]
     )
     return HomeView(continue_cards=tuple(cards), added_items=added)
+
+
+def recent_view(
+    items: Sequence[LibraryItem],
+    recents: Sequence[RecentItem] = (),
+) -> RecentView:
+    """Build the recent page model, newest watch first.
+
+    Like the home page's "continue watching" row, only clips the library still
+    scans are listed: a file opened once through the file dialog has no card
+    (no poster, no folder siblings), so the page would promise a detail view it
+    cannot render.  The player's own "recently played" list still keeps those
+    entries.
+
+    A card is "finished" once the history position crosses
+    :data:`FINISHED_THRESHOLD`; everything else lands in "continue watching",
+    including a clip that was only opened.  Entries are de-duplicated by path
+    even though the store already keeps one entry per file.
+    """
+    by_path = {item.path: item for item in items}
+    continue_cards: list[HomeCard] = []
+    finished_cards: list[HomeCard] = []
+    seen: set[Path] = set()
+    for entry in sorted(recents, key=lambda item: -float(item.updated_at)):
+        item = by_path.get(entry.path)
+        if item is None or item.path in seen:
+            continue
+        seen.add(item.path)
+        card = HomeCard(
+            item=item,
+            progress=entry.progress,
+            position_ns=entry.position_ns,
+            duration_ns=entry.duration_ns,
+            updated_at=entry.updated_at,
+        )
+        if card.finished:
+            finished_cards.append(card)
+        else:
+            continue_cards.append(card)
+    return RecentView(tuple(continue_cards), tuple(finished_cards))
 
 
 def episode_items(

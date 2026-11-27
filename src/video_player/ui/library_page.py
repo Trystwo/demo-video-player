@@ -144,13 +144,12 @@ class LibraryPage(Gtk.Box):
     Args:
         config: player configuration (``library.directories`` seeds the scan).
         translator: current language; :meth:`apply_language` re-labels the page.
-        recents: history store used for the "recently watched" / "finished"
-            filters and the card progress bar; None disables both.
+        recents: history store used for the "finished" filter and the card
+            progress bar; None disables both.
         on_open: called with the item when a card is activated (the browse shell
             opens the detail page for it).
         on_open_file: opens the single-file dialog (shared with the header).
         on_changed: called after a scan or filter change (header + home page).
-        on_filter_change: called with the new filter key when a chip changes it.
     """
 
     def __init__(
@@ -162,7 +161,6 @@ class LibraryPage(Gtk.Box):
         on_open: Callable[[LibraryItem], None],
         on_open_file: Callable[[], None],
         on_changed: Callable[[], None] | None = None,
-        on_filter_change: Callable[[str], None] | None = None,
         on_poster: Callable[[Path, GdkPixbuf.Pixbuf | None], None] | None = None,
         on_metadata: Callable[[Path, VideoMetadata | None], None] | None = None,
     ) -> None:
@@ -174,7 +172,6 @@ class LibraryPage(Gtk.Box):
         self._on_open = on_open
         self._on_open_file = on_open_file
         self._on_changed = on_changed
-        self._on_filter_change = on_filter_change
         # NOTE: ``self._on_metadata`` would shadow the LibraryPage._on_metadata
         # method the workers call, so the hooks use their own names.
         self._poster_hook = on_poster
@@ -466,6 +463,11 @@ class LibraryPage(Gtk.Box):
             roots.append(path)
         return tuple(roots)
 
+    @property
+    def store_directories(self) -> tuple[Path, ...]:
+        """Folders the user picked (the settings page may remove these)."""
+        return self._store.directories
+
     def headline(self) -> tuple[str, str]:
         """``(stat, sub)`` for the window header on the browse page."""
         count = len(self._items)
@@ -495,6 +497,10 @@ class LibraryPage(Gtk.Box):
     def poster_for(self, path: Path) -> GdkPixbuf.Pixbuf | None:
         """Poster of *path* if the thumbnail worker already rendered it."""
         return self._pixbufs.get(path)
+
+    def item_for(self, path: Path) -> LibraryItem | None:
+        """The scanned item for *path* (the recent page reads it live)."""
+        return next((item for item in self._items if item.path == path), None)
 
     def choose_directory(self) -> None:
         """Folder picker, shared with the home page's empty state."""
@@ -577,20 +583,19 @@ class LibraryPage(Gtk.Box):
 
     # -- view state --------------------------------------------------------
 
-    def _recent_state(self) -> tuple[set[Path], set[Path]]:
-        recent: set[Path] = set()
+    def _finished_paths(self) -> set[Path]:
+        """History entries watched past the threshold ("已看完" chip)."""
         finished: set[Path] = set()
         if self._recents is None:
-            return recent, finished
+            return finished
         try:
             entries = self._recents.items(only_existing=True)
         except Exception:  # noqa: BLE001 - history must never break the grid
-            return recent, finished
+            return finished
         for entry in entries:
-            recent.add(entry.path)
             if entry.duration_ns > 0 and entry.progress >= FINISHED_THRESHOLD:
                 finished.add(entry.path)
-        return recent, finished
+        return finished
 
     def _recent_progress(self, path: Path) -> float:
         if self._recents is None:
@@ -605,17 +610,14 @@ class LibraryPage(Gtk.Box):
         return 0.0
 
     def _apply_view(self) -> None:
-        recent, finished = self._recent_state()
+        finished = self._finished_paths()
         visible = filter_items(
             self._items,
             self._filter,
-            recent_paths=recent,
             finished_paths=finished,
         )
         self._visible = sort_items(visible, self._sort)
-        counts = library_counts(
-            self._items, recent_paths=recent, finished_paths=finished
-        )
+        counts = library_counts(self._items, finished_paths=finished)
         for key, count_label in self._filter_counts.items():
             count_label.set_text(str(counts.get(key, 0)))
         self._rebuild_grid()
@@ -897,8 +899,12 @@ class LibraryPage(Gtk.Box):
         self._set_filter(key)
 
     def select_filter(self, key: str) -> None:
-        """Public entry for the browse shell's rail ("recent" shortcut)."""
+        """Public entry for the browse shell (back from detail on this page)."""
         self._set_filter(key)
+
+    def refresh_history(self) -> None:
+        """Re-read the watch history after the recent page cleared it."""
+        self._apply_view()
 
     def _set_filter(self, key: str) -> None:
         if key not in FILTERS or key == self._filter:
@@ -911,8 +917,6 @@ class LibraryPage(Gtk.Box):
             self._apply_view()
         finally:
             self._updating_nav = False
-        if self._on_filter_change is not None:
-            self._on_filter_change(self._filter)
 
     def _on_sort_clicked(self, _button: Gtk.Button, key: str) -> None:
         if key not in SORTS:
@@ -951,7 +955,15 @@ class LibraryPage(Gtk.Box):
         log_action("library_dir_added", path=path)
         self.refresh(retry_failed=True)
 
-    def _on_remove_dir(self, _button: Gtk.Button, root: Path) -> None:
+    def _on_remove_dir(self, _button: Gtk.Button | None, root: Path) -> None:
+        self.remove_directory(root)
+
+    def remove_directory(self, root: Path) -> None:
+        """Drop a user-picked folder and rescan (shared with the settings page).
+
+        Configured folders are not in the store, so removing them here is a
+        no-op: the deployment's ``configs/*.json`` stays authoritative.
+        """
         if not self._store.remove_directory(root):
             return
         self._store.save()

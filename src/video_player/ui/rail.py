@@ -1,4 +1,4 @@
-"""The 88 px left rail shared by every ui-v5 browse page.
+"""The 88 px left rail shared by every ui-v6 browse page.
 
 The rail lists the shell's sections -- home, library, recent, settings -- and
 owns the two bits of machine status the mockup keeps at its foot (hardware
@@ -6,6 +6,12 @@ decode readiness, scan clock).  It holds no page state: clicking an entry calls
 back into the browse shell, which decides which page and filter the entry maps
 to.  Icons are Cairo paths because the board image ships a trimmed icon theme
 where a missing symbolic name renders as a blank button.
+
+2026-11-27 (ui-v6 scheme C): the 42x42 "面" mark at the top was removed by the
+user's decision, together with its plate; the rail keeps padding-top 14 and the
+nav keeps margin-top 24, so the entries move up into the space the mark used to
+occupy.  The current entry is marked by scheme C's 2 px bone cursor instead of
+a filled amber plate.
 """
 
 from __future__ import annotations
@@ -47,7 +53,7 @@ class _RailIcon(Gtk.DrawingArea):
     def _draw(self, _area: Gtk.DrawingArea, cr: object, width: int, height: int) -> None:
         if width <= 0 or height <= 0:
             return
-        color = rgba("accent_hi", 0.98) if self._active else rgba("dim", 0.95)
+        color = rgba("play", 0.98) if self._active else rgba("dim", 0.95)
         cr.set_line_width(1.6)  # type: ignore[attr-defined]
         cr.set_line_cap(1)  # type: ignore[attr-defined]  # cairo.LINE_CAP_ROUND
         cr.set_line_join(1)  # type: ignore[attr-defined]
@@ -94,8 +100,31 @@ class _RailIcon(Gtk.DrawingArea):
         cr.restore()  # type: ignore[attr-defined]
 
 
+class _ActiveBar(Gtk.DrawingArea):
+    """Scheme C's 2 x 40 bone cursor at the left edge of the current entry.
+
+    GTK CSS has no ``::before``, so the mockup's inset bar is a child widget;
+    it is hidden unless the entry is current and takes no layout space.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_size_request(2, 40)
+        self.set_halign(Gtk.Align.START)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_draw_func(self._draw)
+        self.set_visible(False)
+
+    def _draw(self, _area: Gtk.DrawingArea, cr: object, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            return
+        cr.set_source_rgba(*rgba("play", 1.0))  # type: ignore[attr-defined]
+        rounded_path(cr, 0.0, 0.0, float(width), float(height), 1.0)
+        cr.fill()  # type: ignore[attr-defined]
+
+
 class _RailButton(Gtk.ToggleButton):
-    """Rail entry: icon over a one-word label."""
+    """Rail entry: icon over a one-word label, with the bone current cursor."""
 
     def __init__(self, kind: str) -> None:
         super().__init__()
@@ -110,10 +139,15 @@ class _RailButton(Gtk.ToggleButton):
         self.label.set_halign(Gtk.Align.CENTER)
         box.append(self.icon)
         box.append(self.label)
-        self.set_child(box)
+        self.bar = _ActiveBar()
+        overlay = Gtk.Overlay()
+        overlay.set_child(box)
+        overlay.add_overlay(self.bar)
+        self.set_child(overlay)
 
     def set_active_visual(self, active: bool) -> None:
         self.icon.set_active(active)
+        self.bar.set_visible(active)
 
 
 class Rail(Gtk.Box):
@@ -139,15 +173,10 @@ class Rail(Gtk.Box):
     # -- construction ------------------------------------------------------
 
     def _build(self) -> None:
-        mark_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        mark_box.set_halign(Gtk.Align.CENTER)
-        mark_box.set_margin_top(2)
-        self._mark = Gtk.Label()
-        self._mark.add_css_class("rail-mark")
-        self._mark.set_size_request(42, 42)
-        mark_box.append(self._mark)
-        self.append(mark_box)
-
+        # ui-v6: no mark plate here any more.  The nav keeps the rail's 14 px
+        # padding and its own 24 px margin, so it starts 38 px into the rail --
+        # 44 px higher than before (the removed mark box was 42 px plus a 2 px
+        # top margin; the design's "42 px" counts the plate only).
         nav = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         nav.set_halign(Gtk.Align.CENTER)
         nav.set_margin_top(24)
@@ -159,11 +188,7 @@ class Rail(Gtk.Box):
             button.set_margin_end(0)
             nav.append(button)
             self._buttons[kind] = button
-            if kind == "settings":
-                button.set_sensitive(False)
-                button.set_focus_on_click(False)
-            else:
-                button.connect("toggled", self._on_toggled, kind)
+            button.connect("toggled", self._on_toggled, kind)
         self._buttons["library"].set_group(self._buttons["recent"])
         self._buttons["home"].set_group(self._buttons["recent"])
         self.append(nav)
@@ -196,13 +221,12 @@ class Rail(Gtk.Box):
     def apply_language(self, translator: Translator) -> None:
         self._t = translator
         t = translator
-        self._mark.set_text(t("rail_mark"))
         for kind, button in self._buttons.items():
             button.label.set_text(t(f"nav_{kind}"))
         self._buttons["home"].set_tooltip_text(t("nav_home"))
         self._buttons["library"].set_tooltip_text(t("library_title"))
-        self._buttons["recent"].set_tooltip_text(t("library_filter_recent"))
-        self._buttons["settings"].set_tooltip_text(t("nav_stub_tooltip"))
+        self._buttons["recent"].set_tooltip_text(t("recent_title"))
+        self._buttons["settings"].set_tooltip_text(t("settings_tooltip"))
         self._status.set_text(t("rail_ready") if self._hw_ready else t("rail_sw_only"))
         if self._hw_ready:
             self._status_dot.remove_css_class("is-off")
@@ -238,7 +262,5 @@ class Rail(Gtk.Box):
 
     def _on_toggled(self, button: _RailButton, kind: str) -> None:
         if self._updating or not button.get_active():
-            return
-        if kind == "settings":
             return
         self._on_nav(kind)

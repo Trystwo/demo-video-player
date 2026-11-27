@@ -594,3 +594,409 @@ VP9 软解；真实 `PlayerWindow`，探针 `.cache/qc/ui-v5-p3/probe.py`）：
   丢帧、mixer 用重复帧补满 30 fps；YUV 输入还会让 EOS 卡在 mixer 视频入口，muxer 收不到 EOS
   就没有 moov。**保留现状的 `yuvj420p / pc / gbr` 标签**：严格按标签转换的播放器/转码链可能
   偏色，`docs/PITFALLS.md` §3 已记录，v1.2.0 发布说明标注为已知风险。
+
+## 2026-11-27 ui-v5 P4 播放页：本机实现
+
+> 2026-11-27 09:19 已按用户当次授权上板并验收，结果见下一节
+> 「2026-11-27 ui-v5 P4 板端部署与验收」；本节保留本机阶段的读数作对照。
+
+P4 的本机阶段只做 UI + 本机截图/探针，当时不部署、不 commit、不发布。
+下面记录本机 GTK 4.14.5 / GStreamer 1.24.2 的真实窗口读数，供板端对照；**不要当成
+板端 1280×768 的验收结果**。
+
+- **探针**：`.cache/qc/ui-v5-p4/probe.py`，Xvfb `:13` 1280×800，真实 `PlayerWindow` +
+  真实 VP9 软解后端（`display_bypass` 的 `fakesink sync=true`，无外窗）；
+  106 项交互断言全过（32.2 s）。本机无 `gtk4paintablesink`/GL/NPU，截图帧是探针注入的
+  同一素材真实帧，Beauty on/GPU ms 只在截图阶段按板端读数展示；详见 `RESULTS.md`。
+- **布局**：窗口 1280×768；16:9 画面 **1280×720 @ (0,24)**；顶栏 47 px；底部 dock 96 px；
+  播放键 52 px；控制键 44 px；时间轴命中带 20 px；美颜抽屉内容盒 318×546（含 padding
+  约 350×578），内部滚动 upper 499 / page 411。
+- **章节刻度**：真实 sidecar（15/30/45 s / 60 s）→ 25/50/75%；GStreamer 的 `qtdemux`
+  在当前栈不实现 `TocSetter`，所以没有 sidecar 就没有刻度，不按百分比编造。
+- **全屏**：窗口态和全屏态复用同一个 dock；全屏 idle 后 dock 淡出、左上遥测 62%、
+  底边 2 px 进度线常驻、两个 scrim 随 HUD 隐现；暂停/抽屉打开时 dock 不隐藏。
+- **录制画布**：图层 `top` 1236×47@(22,20)、`dock` 1232×96@(24,658)，视频 hole
+  `Rect(0,24,1280,720)`，底色 `@video` 纯黑；`CanvasBuilder` 合成图
+  `.cache/qc/ui-v5-p4/recording-composed.png` 可读。已知限制：半透明 scrim 不参与
+  录制画布的 alpha（PITFALLS §3），实际 30 s 录制 MP4 未在本机跑（无 GL）。
+- **未验证**：板端 GTK 4.18 CSS/字体/触摸、真实 GPU 美颜、真实 30 s 录制、实际 WM 下
+  1280×768 内容高度、`--demo` 全屏联动、真实 compositor 下的 popover 摆位。
+- **随包**：`src/` 改动后 `board-install.sh` 已重建为 **70 文件 / 359,320 B / base64
+  357,532 B**，`--check` 通过；本机阶段未部署到板端。2026-11-27 09:19 上板后，
+  payload 里 P4 的 5 个文件与板端部署哈希一致（其余文件本轮未逐项复核），
+  但仍**没有在板端重跑离线安装**（见下一节）。
+
+## 2026-11-27 ui-v5 P4 板端部署与验收（已完成）
+
+用户当次授权后的上板结果。板端 GTK 4.18.6 / PyGObject 3.50.0 / Python 3.13.5 / GStreamer 1.26.2，
+GNOME Wayland，DSI 1280×800；部署目录 `/home/tris/video-player-demo`。
+
+### 部署
+
+- **5 个文件**：`i18n.py`、`ui/style.py`、`ui/window.py` 替换，`ui/chapters.py`、`ui/player_chrome.py` 新增；
+  暂存 `/home/tris/ui-v5-p4-stage-20261127-0919/`，备份
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261127-0919-ui-v5-p4/`。
+- 上传后 `sha256sum -c` 5/5、`py_compile` 通过；目标目录内 `.<file>.p4-tmp` 拷贝后 `mv` 原子替换，
+  替换后哈希与暂存一致、无 tmp 残留。部署前停 P3 实例，期间无第二个 GL 应用。
+- 新哈希：`i18n 0866415…`、`style bc583a5…`、`window 387cfad…`、`chapters 3400b32…`、
+  `player_chrome 8cf260a…`（完整值见 `.cache/qc/ui-v5-p4-board/RESULTS.md`）。
+
+### 自检
+
+- `PYTHONPATH=src python3 -m video_player --check --require-board` → **17 ok / 0 warn / 0 fail / 0 skip**。
+- `style.CSS` **34,598 B**、GTK 4.18.6 `load_from_data` **0 parsing errors**、Wayland 上 provider 注册成功。
+- 已知非致命日志仍是 `MESA ZINK vkCreateInstance failed` 与 `Gtk-CRITICAL … GDBus NoReply`。
+
+### 验收（真实 VPU 硬解 + 真实 GPU 美颜）
+
+探针 `.cache/qc/ui-v5-p4-board/board_accept_p4.py`：真实 `PlayerWindow` + `playbin`
+（`mppvideodec` → `gtk4paintablesink`），**一个 mode 一个进程、每进程最多一次整窗快照**
+（STATE §36.5 的快照限制），8 个 mode 串行，**116 项断言全过、0 failed**：
+
+| mode | 断言 | 关键读数 |
+|---|---|---|
+| play | 33/33 | 窗口 1280×768；视频 `(0,24,1280,720)`；顶栏 46；dock 96；播放键 52；控制键 44；时间轴 20；`硬解 / H.264 / 1920×1080 / 30.0 fps`；fps 30.0；时长 30.00 s；章节 25/50/75；录制图层/底色/16:9 洞 |
+| episodes | 9/9 | 6 行、`播放列表 1/6`、切集生效；内容测量 498 px |
+| more | 9/9 | 5 个菜单项 + 快捷键提示；内容测量 438 px |
+| language | 7/7 | `Episodes` / `Playlist 1/6` / `Beauty · off` 往返 |
+| drawer | 15/15 | 面板 318×546、滚动 484/427、A|B 门禁、Escape 关闭 |
+| fullscreen | 27/27 | 真全屏 **1280×800**、视频 `(0,40,1280,720)`；idle 后 dock 淡出、遥测 62%、进度线常驻；退出回 768 |
+| browse | 4/4 | 返回 browse、headerbar 恢复 |
+| beauty | 12/12 | 抽屉开美颜：GPU 2.2–3.0 ms/帧、NPU 2 张脸、fps 30.8、关掉后恢复 |
+
+- **稳定性**：8 个进程 + 1 次 30 s 录制的全过程 uptime 18:43 → 18:58 连续，**没有重启/失联**。
+- **截图**（1280×768；全屏 1280×800）：play / play-en / drawer / fullscreen-dock /
+  fullscreen-idle / browse / beauty 共 7 张，哈希见 RESULTS.md §4。
+- **30 s 录制**：`p4-record-30s.mp4`，33,409,173 B，H.264 1280×768@30、902 帧 / 30.07 s，
+  色彩标签仍是 `yuvj420p / pc / gbr`（已知风险，不属本轮待办）；顶栏/遥测/带刻度时间轴/控制条合成正常。
+- **实例**：验收后恢复为普通启动，PID 1525425（PPID 1）、RSS ≈ 175 MiB、语言沿用已保存的 en。
+
+### P4 上板后才暴露的限制
+
+1. **popover 不进整窗快照**：`选集` / `更多` 在 Wayland 上是独立 subsurface（`GdkWaylandPopup`），
+   窗口快照不含它；探针在无 seat 焦点的 ssh 会话里拿到的 popup surface 恒为 **1×1**。
+   本轮只断言内容与行为（6 行、计数、切集、菜单项、内容测量 498/438 px），**没有 popover 截图**，
+   真实点击（有焦点）下的摆位/尺寸**未验证**。
+2. 触摸点按仍未实机验证；H.265/VP9/AV1、4K、网络流未在 P4 播放页复测。
+3. `board-install.sh` 已重建为 **70 文件**（含 P4 5 文件，`--check` 通过），**本轮未在板端重跑离线安装**。
+4. 回滚步骤与部署备份路径见 `.cache/qc/ui-v5-p4-board/RESULTS.md` §7。
+
+## 2026-11-27 ui-v5 设置页：本机实现
+
+> 2026-11-27 10:02 已按用户当次授权部署到板端并验收，结果见下一节；本节保留本机阶段读数。
+
+左导航第四项「设置」自 P1–P3 起一直是置灰占位（`rail.py` `set_sensitive(False)`、不接信号，
+悬停提示「设置页未出稿」）。2026-11-27 产品决定补一个**最小设置页**，范围：界面语言、
+解码方式、扫描目录、关于。**本轮只在本机完成，板端未部署、未改动。**
+
+- **代码**：新增 `src/video_player/settings.py`（纯数据，无 GTK）与
+  `src/video_player/ui/settings_page.py`（四张 `.card-box` 卡片）；改 `ui/rail.py`（设置恢复可点）、
+  `ui/browse.py`（`BROWSE_PAGES` 加 `settings`、路由/高亮/标题/刷新/重译）、
+  `ui/library_page.py`（公开 `store_directories` 与 `remove_directory()`）、
+  `ui/window.py`（`_set_language()` / `_set_decode_mode()` 回调，`Esc` 从设置回首页）、
+  `i18n.py`（23 个键）、`ui/style.py`（设置页 CSS）。
+- **数据流**：语言与解码走回调回 `PlayerWindow`（语言落 XDG config；解码只改
+  `player.decode_mode`，不跨启动持久化）；目录列表由 `config.library.directories` +
+  `LibraryStore.directories` 合并去重；关于卡只读（版本/平台/内核/GTK/GStreamer/解码后端/
+  状态文件/缓存目录）。
+- **本机验证**（GTK 4.14.5 / Xvfb :11 / 真实 `PlayerWindow`、空片库）：真窗口 **1280×768**，
+  探针 **33/0** —— rail 可点且高亮、header 标题/副题、四张卡、语言中英往返并落盘、
+  解码段与播放页控制条双向同步、目录增删（临时目录 + × 按钮）、关于 8 行、`Esc` 回首页。
+  截图 `.cache/qc/ui-v5-settings/out/ui-v5-settings-01-zh.png` / `-02-en.png`（1280×768）。
+- **测试**：`pytest` **561 passed / 15 skipped**（`test_settings_model.py` 8 项纯数据、
+  `test_settings_page.py` 13 项结构与单选行为）；`compileall` 通过；`style.CSS`
+  **35,892 B / 0 parsing errors**（GTK 4.14.5）；`board-install.sh` 重建为 **72 文件**
+  （新增两个模块），`--check` 通过。
+- **未验证 / 风险**：板端 GTK 4.18 的字体度量与触摸点按；真实 VPU 下「关于」的解码后端读数；
+  目录对话框的真实选择（自动化不点系统弹窗）；解码方式不持久化是设计取舍，不是缺陷。
+- **回滚**：本轮没有动板端，也**没有 commit**；发布树未更新。
+
+## 2026-11-27 ui-v5 设置页：板端部署与验收（已完成）
+
+用户当次授权「板端部署」后的结果。板端 GTK 4.18.6 / GStreamer 1.26.2 / GNOME Wayland，
+部署目录 `/home/tris/video-player-demo`。
+
+### 部署
+
+- **8 个文件**（2 新增 + 6 修改）：`src/video_player/settings.py`、
+  `src/video_player/ui/settings_page.py`、`ui/rail.py`、`ui/browse.py`、`ui/library_page.py`、
+  `ui/window.py`、`i18n.py`、`ui/style.py`。
+- 暂存 `/home/tris/ui-v5-settings-stage-20261127-1002/`；备份
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261127-1002-ui-v5-settings/`
+  （`old.sha256` 6 项 + 2 项 `MISSING`、`deployed.sha256` 8 项 + 旧文件）。
+- 上传后 `sha256sum -c` 8/8、`py_compile` 通过；`.<file>.settings-tmp` 拷贝后 `mv` 原子替换，
+  无 tmp 残留。旧板端 rail 仍是 P3 版本（`93e2b7f…`），本轮一并更新。
+- 新哈希：`settings 6ce9858…`、`settings_page 4278a4b…`、`rail dc041c4…`、`browse 0cda3ed…`、
+  `library_page 10c1f08…`、`window bd0f4fd…`、`i18n 1c6748b…`、`style e9c823b…`。
+
+### 自检
+
+- `PYTHONPATH=src python3 -m video_player --check --require-board` → **17 ok / 0 warn / 0 fail**。
+- `style.CSS` **35,892 B**、GTK 4.18.6 `load_from_data` **0 parsing errors**、Wayland provider 成功。
+- `board-install.sh` 已重建为 **72 文件 / 365,426 B base64**（含设置页两个模块，`--check` 通过），
+  本轮部署走 tar over ssh，未用离线包重装。
+
+### 验收（真实窗口，浏览壳，无 VPU 路径）
+
+探针 `/home/tris/ui-v5-settings-accept/board_accept_settings.py`（内部）：真实 `PlayerWindow`、
+空片库、一个进程一次串行；**35 项断言全过、0 failed**：
+
+- 导航：rail「设置」可点且高亮、页面切换、header `设置 / 界面 · 播放 · 片库 · 关于`、四张卡可见。
+- 布局：窗口 **1280×768**、内容区 **1192×711**（88 px rail + 58 px headerbar）；卡片高
+  语言 64 / 解码 90 / 目录 118 / 关于 235；语言分段容器 **120×36**、每个按钮自然宽 **60**。
+- 语言：切英文后 header=`Settings`、分段与关于标签全部变英文、写入 XDG config；再切回中文。
+- 解码：设置页切「软解」→ `config.player.decode_mode=sw` 且播放页控制条三段同步；切回 auto。
+- 目录：初始 0 行；加入临时目录后出现 1 行且带 × 按钮；移除后回到 0 行。
+- 关于（真实板端读数）：`0.1.0` / `Linux aarch64` / `6.1.118-rt36` / `4.18.6` /
+  `GStreamer 1.26.2` / **`VPU 硬解可用`** / 状态文件 / 缓存目录。
+- `Esc` 回到首页。
+- 截图：`settings-01-zh-1280x768.png`（sha256 `8d3dd8d7…c84ab891`）、
+  `settings-02-en-1280x768.png`（`47fa317b…6ae6e4ec7`），均为 1280×768。
+- **回归**：部署后重跑 P4 播放页 `play` mode → **33/0**（视频 `(0,24,1280,720)`、`硬解/H.264/
+  1920×1080/30.0 fps`、章节 25/50/75）；uptime 19:23 → 19:27 连续、无重启。
+- **实例**：验收后恢复常驻，PID **1564280**（PPID 1，RSS ≈177 MiB，语言沿用 en，
+  `library_scan folders=1 items=4`）。
+
+### 未验证 / 风险
+
+- 触摸点按（rail/分段/按钮）仍是真实控件信号 + 截图，没有手指点按验收。
+- 目录对话框（`Gtk.FileDialog`）未在板端点选；「选择文件夹」只验证了控件存在与委托路径。
+- 解码方式不跨启动持久化（设计取舍，见 ARCHITECTURE §2.12）。
+- 未 commit / 未发布；publish 树仍是 v1.2.0 + P4 未提交。
+
+## 2026-11-27 ui-v5 最近观看页：板端部署与验收（已完成）
+
+用户问「library 和 recently 分为两个标签是不是多余了」→ 三方向（删入口 / 续播模式 / 独立页）
+效果图（`mockups/ui-v5-directions/`）→ 用户选「独立续播页（方向 C）」并当次授权「部署」。
+板端 GTK 4.18.6 / GStreamer 1.26.2 / GNOME Wayland，目录 `/home/tris/video-player-demo`。
+
+### 部署
+
+- **11 个文件**（10 修改 + 1 新增）：`browse.py`、`library.py`、`i18n.py`、`ui/browse.py`、
+  `ui/chrome.py`、`ui/home_page.py`、`ui/library_page.py`、`ui/rail.py`、`ui/recent_page.py`（新）、
+  `ui/style.py`、`ui/window.py`。
+- 暂存 `/home/tris/ui-v5-recent-stage-20261127-1055/`；整树备份
+  `/home/tris/video-player-demo.bak-recent-20261127-1055`（3.4 MB）；旧/新哈希
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261127-1055-recent/`
+  （`old.sha256` 10 项 + 1 项 MISSING、`deployed.sha256` 11 项）。
+- `sha256sum -c` **11/11**、`py_compile` 通过、`.<file>.recent-tmp` + `mv` 原子替换、0 tmp 残留；
+  部署后 `src/video_player` 38 个文件与工作区 **0 差异**。
+
+### 自检
+
+- `PYTHONPATH=src python3 -m video_player --check --require-board` → **17 ok / 0 warn / 0 fail / 0 skip**。
+- `style.CSS` **36,593 B**、GTK 4.18.6 `load_from_data` **0 parsing errors**。
+- `board-install.sh` 已在本地重建为 **73 文件 / 373,098 B base64**（`--check` 通过）；
+  本轮部署仍走 tar over ssh，未用离线包重装。
+
+### 验收（真实窗口，浏览壳 + 一次真硬解起播）
+
+探针 `/home/tris/ui-v5-recent-accept/board_accept_recent.py`（内部）：真实 `PlayerWindow`、
+`/home/tris/demo-movies` 4 部真实影片、临时 XDG state 里 seed 3 条历史（2 继续 / 1 已看完），
+**33 项断言全过、0 failed**：
+
+- 导航：起始 home；**rail「最近」按钮的真实 `toggled` 信号**切到最近页且高亮；rail 回首页。
+- 布局：窗口 **1280×768**、页面 **1140×689**、卡片 **273×170**（本地 GTK 4.14 为 177 高）、
+  3 张卡两组、无需滚动。
+- 内容：`继续观看 2 · 已看完 1`、`3 项`、组标题「继续观看 / 已看完」；英文下
+  `Continue 2 · Finished 1` / `Continue watching` / `Finished`。
+- 片库：chip 只剩「全部 / 已看完」。
+- 清除：记录清空后进空态、`清除记录` 置灰、片库「已看完」计数归零。
+- 起播：点「继续观看」卡片 → 播放页，playlist 恰好是该组顺序，**真实 `mppvideodec`** 起播
+  （`mpp_info` / `h264d_api` 日志，`backend.has_media=True`）；`Esc` 回**最近页**。
+- 截图：`recent-01-zh-1280x768.png`（sha256 `fbbe73a6…`）、`recent-02-empty-1280x768.png`
+  （`86d078ff…`），均 1280×768。
+- **回归**：`/home/tris/ui-v5-p4-accept/board_accept_p4.py --mode play` → **33/0 / 7.3 s**。
+- **实例**：验收前停旧 PID 1564280；验收后按原 env 重启，**PID 1633296**（PPID 1、RSS ≈178 MB），
+  日志仍只有既有的 MESA ZINK / GDBus NoReply 两行。证据：`.cache/qc/ui-v5-recent-board/`（内部）。
+
+### 未验证 / 风险
+
+- 触摸点按（rail / 卡片 / 清除）仍是真实信号 + 截图，没有手指点按验收。
+- 「清除记录」确认对话框（`Gtk.AlertDialog`）未人工点选；探针直接清空 store 后再刷新。
+- 最近页只列扫描目录里的文件（与首页一致）；库外单文件仍在播放页「最近播放」。
+- 未 commit / 未发布；publish 树仍是 v1.2.0 + P4 未提交。
+
+## 2026-11-27 删除 headerbar 语言按钮：板端部署与验收（已完成）
+
+用户：「上面的中文/英文按钮切换删除了吧，放到设置里面就可以了」，随后授权「部署一下」。
+gtk 4.18.6 / GStreamer 1.26.2 / GNOME Wayland。
+
+### 部署与自检
+
+- 单文件：`src/video_player/ui/window.py`（删除 `_header_language_button` 的创建/`pack_end`/
+  `_apply_language` 文案与 tooltip），`sha256 892a5367…`。
+- 备份 `/home/tris/video-player-demo.bak-header-20261127-1119`；旧/新哈希
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261127-1119-header/`；
+  `sha256sum -c` 1/1、`py_compile` 通过、无 tmp 残留。
+- `--check --require-board` **17 ok / 0 warn / 0 fail**；CSS 36,593 B / **0 parse errors**。
+
+### 验收（真实窗口）
+
+探针 `/home/tris/ui-v5-header-accept/board_accept_header.py`（内部）：真实 `PlayerWindow`、
+`/home/tris/demo-movies` 4 部影片、**18/0**：
+
+- titlebar 只剩标题 + 副题（`视频播放器 / 4 项 · 1 个目录`）与窗口按钮：
+  无 `English` / `中文` 标签，`header-action` 按钮数 **0**。
+- 窗口 1280×768、titlebar 高 46。
+- 设置页：rail 进入、语言卡与两段可见；切英文 → `window._t.language=en`、header 标题 `Settings`；
+  切回中文 → header `设置`；`Esc` 回首页。
+- 截图 `header-01-zh-1280x768.png`（1280×768）。
+- **回归**：P4 播放页 `--mode play` **33/0 / 7.0 s**。
+- **实例**：验收后重启常驻，PID **1663326**（PPID 1、RSS ≈178 MB，`window_open` + `library_scan items=4`）。
+- 证据本机 `.cache/qc/ui-v5-header-board/`（脚本 + 截图 + metrics.json）。
+
+### 未验证 / 风险
+
+- 触摸点按仍是真实信号 + 截图，没有手指点按验收。
+- 播放页「更多」菜单里的语言项**保留**（播放时 header 隐藏）；若要求「语言只在设置里」可再删。
+- 未 commit / 未发布。
+
+## 2026-11-27 P5 板端部署与验收：窗口化标题栏 + 挤压式选集栏 + 画面手势
+
+用户当次授权「部署到板端」后完成；**未 commit / 未发布**。部署 4 文件（3 改 + 1 新增），
+验收后恢复常驻实例。完整证据在 `.cache/qc/fix58-board/RESULTS.md`（内部）。
+
+### 部署
+
+- 目标 `tris@10.66.24.110:/home/tris/video-player-demo`；暂存
+  `/home/tris/ui-v5-p5-stage-20261127-1444/`；备份
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261127-1444-p5/`。
+- `ui/window.py` `320ba329…`、`ui/player_chrome.py` `48be37a4…`、`ui/style.py` `3661f0b2…`、
+  `ui/taps.py` `6c9748be…`（新增）；`i18n.py` 未改。原子替换、无 tmp 残留、`py_compile` 4/4。
+- 部署前停掉旧实例（PID 1883288），部署期间无第二个 GL 应用。
+
+### 自检
+
+- `PYTHONPATH=src python3 -m video_player --check --require-board` → **17 ok / 0 warn /
+  0 fail / 0 skip**。
+- GTK 4.18.6：`style.CSS` **38,332 B**、`load_from_data` **0 parsing errors**，Wayland provider
+  注册成功；已知非致命日志仍是 ZINK vkCreateInstance / GDBus NoReply 两行。
+
+### 验收（真实 VPU 硬解 + 真实 GTK sink）
+
+探针 `/home/tris/ui-v5-p5-accept/board_accept_p5.py`，媒体
+`/home/tris/ui-v5-p4-accept/library/*.mp4`（1080p30 H.264，30 s），一 mode 一进程、
+每进程最多一次整窗快照、mode 间 sleep 4 s：
+
+| mode | 结果 | 关键读数 |
+|---|---|---|
+| layout | **15/0** | 窗口 1280；headerbar 可见；顶栏 compact；选集 360；视频 **920×517**（16:9）；控制条两行；row1 **830** / row2 **177** ≤ dock **872**；选集 ✕；播放列表有行；header「＋ 打开」；**硬解 `mppvideodec`**；截图 1280×768 |
+| fullscreen | **8/0** | 真全屏 **1280×800**；headerbar 隐藏；选集收起；控制条单行；视频 **1280×720**；退出恢复；截图 1280×800 |
+| interact | **9/0** | 单击暂停；双击全屏；美颜开 → 选集关；点抽屉外关闭并 claim；`Esc` 先关选集；chip 重开；browse 保留「＋ 打开」 |
+
+- 截图：`docs/evidence/ui-v5-player-1280x768.png`（P5 窗口态）、
+  `docs/evidence/ui-v5-player-fullscreen-1280x800.png`（P5 全屏）。
+- 常驻实例：普通启动，**PID 2002290（PPID 1，RSS ≈ 192 MB）**，语言沿用 en，
+  无媒体落 browse home；`library_scan folders=3 items=14`。
+
+### 上板过程暴露的坑（已写入 PITFALLS §5）
+
+GUI/GL 探针反复启停后板端 SSH 会短暂 `banner exchange` 超时（等 1–3 分钟恢复）；
+探针直连 `PlayerWindow` 必须手动注册 `style.CSS`；GTK 4.18/PyGObject 3.50 用
+`GdkPixbuf.Pixbuf.new_from_file`；探针结束用 `os._exit(0)` 避免 mpp/GL 析构卡住；
+不要并发两个 GL runner。
+
+### 仍未验证
+
+真实手指触摸双击/点外部、30 s `--record` 成片、H.265/VP9/AV1/4K；离线安装包未在板端重跑。
+
+## 2026-11-27 P6 窗口态单行控制条 + 选集/美颜面板：板端部署与验收
+
+用户 17:57 选定方案 A，18:33 当次授权「部署到板子上」。P5/v6 在选集栏打开时把
+「字幕 / 美颜 / 全屏」拆到第二行（row1 830 / row2 177 ≤ dock 872），P6 改成固定单行，
+并把次级入口放回各自容器。**未 commit / 未发布 / 未重跑离线安装**。
+
+### 改动
+
+- 右侧 360 px 面板头部换成「选集 / 美颜」两标签（`.sidebar-tabs` + `Gtk.Stack`，单选、
+  记住上次标签）；选集页 = 播放列表 / 计数 / + 添加文件 / 最近播放，美颜页 = 原
+  `_build_beauty_page()` 整页。
+- 美颜页只构建一次，按模式换宿主：窗口态进面板标签（去卡片类、margin 归零、隐藏页头标题/
+  第二个 ✕/下划线）；全屏与 `--record` 回 overlay 抽屉（352 px、margins 76/112/24）。
+- 窗口态字幕按钮移到画面顶栏（沿用原 popover），全屏/`--record` 回到底部行；
+  `--record` 保持 P4 画布（字幕在底部行）。
+- 底部固定一行：删 `_controls_row2` / `_set_transport_compact` / `.play-controls-stack`；
+  音量百分比 label 删除（值进 tooltip）；面板 chip 图标化（☰ + tooltip + 美颜琥珀点），
+  面板不可用时隐藏。
+
+### 本机验证（GTK 4.14.5 / X11 / fakesink 注入画面）
+
+命令与证据（内部缓存）：
+
+```
+DISPLAY=:12 PYTHONPATH=src python3 .cache/qc/fix59/check.py windowed zh
+DISPLAY=:13 PYTHONPATH=src python3 .cache/qc/fix59/check.py fullscreen zh
+DISPLAY=:12 PYTHONPATH=src python3 .cache/qc/fix59/check.py record zh
+PYTHONPATH="$HOME/.local/lib/python3.10/site-packages" python3 -m pytest tests -q
+```
+
+| 场景 | 结果 | 关键读数 |
+|---|---|---|
+| windowed | **24/0** | stage 920；dock 872；row **838** ≤ 872（中英同宽）；字幕在画面顶栏；美颜页在面板 stack；面板 chip 仅图标 + tooltip；两标签切换；关面板不重排（838 vs 838） |
+| fullscreen | **11/0** | dock 1232；row **1080 中 / 1194 英**（含「对比 · 需美颜」）≤ 1232；字幕/美颜 pill 回到底部行；美颜页回抽屉；退出全屏后回面板 |
+| record | **11/0** | stage 1280；dock 1232；row **972**；headerbar 隐藏、顶栏完整；面板 chip 隐藏；字幕在底部行、美颜页在抽屉 |
+| pytest | **606 passed / 15 skipped** | 新增 `test_player_panel.py` 7 项、`test_player_drawer.py` +1；`test_player_episodes.py` 改为面板/归位断言；`test_theme.py` 改为只要求美颜头的 40 px 下划线 |
+| 离线安装包 | 74 文件 / **386,104 B**（base64 384,316 B） | `scripts/build_board_install.py` 重建，payload 与工作树一致 |
+
+截图（本机，内部）：`mockups/fix59/01-windowed-episodes.png`、`02-windowed-beauty.png`、
+`03-windowed-closed.png`、`04-fullscreen.png`、`05-record.png`（1280×768 / 1280×800）。
+
+### 板端部署（2026-11-27 18:33–18:38）
+
+- 目标 `tris@10.66.24.110:/home/tris/video-player-demo`（linaro-alip / aarch64 /
+  Python 3.13.5 / GTK 4.18.6 / GStreamer 1.26.2）。暂存
+  `/home/tris/ui-v6-p6-stage-20261127-1832/`；备份
+  `/home/tris/.cache/video-player-demo/deploy-backups/20261127-1832-p6/`
+  （`old.sha256` + 3 个旧文件）。
+- 停旧实例 **PID 2219404**（v6），3 文件 `install -m 644` + `mv` 原子替换，无 `.p6-tmp`
+  残留，`py_compile` **3/3**。
+
+| 文件 | 旧 sha256 | 新 sha256 |
+|---|---|---|
+| `ui/window.py` | `e3a342ffa73b8ccb91eb0d37fa7a800cc277318ae56d822f25483bdf936bae57` | `401ad1f79981e21384d6a92b0989785cb4b60bf31b99b6a4cb8b64cb25b08da9` |
+| `ui/style.py` | `9e205910de33d5e691f99a56c49c5fae67307b3f4cfaa148fb853136bced4b28` | `5fce8be6660829cfc1d3038e4cd87dbae1a370c2ea398c6d012110aff2f76d2c` |
+| `i18n.py` | `1087b1133b19f9c894b81902d3d9eb312a6ee3a2b8ca16aff747aa5946a0aad7` | `814a9c1aa67cbbcf0e27d3142739586228cf3d31136bb380a9718c2d3b4f7a40` |
+
+- 自检：`--check --require-board` **17 ok / 0 warn / 0 fail / 0 skip**；GTK 4.18.6 CSS
+  0 parsing errors。已知非致命日志不变（ZINK / GDBus NoReply），另有启动时的
+  `mpp: unable to create enc vp8 for soc rk3576 unsupported`（后端探测编码器，非本轮引入）。
+
+### 板端验收（真实 VPU 硬解 + 真实 GTK sink）
+
+探针 `/home/tris/ui-v6-p6-accept/board_accept_p6.py`，媒体
+`/home/tris/ui-v5-p4-accept/library/*.mp4`（1080p30 H.264，50 s）；一 mode 一进程、
+每进程最多一次整窗快照、mode 间 sleep 4 s；日志 `out/{layout,beauty,fullscreen,record}.log`。
+
+| mode | 结果 | 关键读数 |
+|---|---|---|
+| layout | **21/0** | 窗口 1280×768；headerbar 可见；顶栏 compact；面板 360；视频 **920×517**（16:9）；dock **872**；row **838 ≤ 872**；顶栏 **314 ≤ 876**；字幕在画面顶栏；美颜页在面板 stack；面板 chip 仅图标；**硬解 `mppvideodec`**；截图 1280×768 |
+| beauty | **23/0** | 面板 stack 切到 `beauty`；美颜页仍 docked（无 drawer 类）；其余窗口态断言同 layout；截图 1280×768 |
+| fullscreen | **12/0** | 真全屏 **1280×800**；headerbar/顶栏隐藏；面板收起；视频 **1280×720**；dock **1232**；row **1066 ≤ 1232**；字幕/美颜 pill 回到底部行；美颜页回抽屉；截图 1280×800 |
+| record | **11/0** | stage 1280；dock 1232；row **967 ≤ 1232**；headerbar 隐藏、顶栏完整；面板 chip 隐藏；字幕在底部行、美颜页在抽屉；截图 1280×768 |
+
+- 截图（发布用）：`docs/evidence/ui-v5-player-1280x768.png`
+  （sha256 `e6134752…b92d3`）、`docs/evidence/ui-v5-player-fullscreen-1280x800.png`
+  （sha256 `f5ca9c9d…30df`），都是 P6 板端实拍。其余两张（beauty / record）在内部
+  `.cache/qc/fix59-board/out/`。
+- 常驻实例：`PYTHONPATH=src` + Wayland/GL 环境，`setsid -f nohup python3 -m video_player`；
+  **PID 2278277**（PPID 1，RSS ≈ 194 MB，tris），`actions.log`：
+  `run_window media=0` → `window_open language=zh` → `library_scan folders=2 items=13`。
+  启动日志只有 ZINK / GDBus 两行已知非致命信息。
+  **坑**：漏 `PYTHONPATH=src` 会直接 `No module named video_player`（本轮第一次重启踩到）。
+
+### 回滚
+
+```sh
+cd /home/tris/video-player-demo
+cp -a /home/tris/.cache/video-player-demo/deploy-backups/20261127-1832-p6/{window.py,style.py} src/video_player/ui/
+cp -a /home/tris/.cache/video-player-demo/deploy-backups/20261127-1832-p6/i18n.py src/video_player/
+# 重启实例
+```
+
+### 仍未验证 / 风险
+
+- 真实手指触摸标签 / ✕ / chip、30 s `--record` 成片、H.265/VP9/AV1/4K 未复测。
+- 窗口态 `--record` 运行时切换（非启动 `--record`）仍沿用旧的门控调用点，未在本轮扩展；
+  P5 的触摸与 popover 限制不变。
+- 离线安装器未在板端重跑（本机 payload 已重建）。

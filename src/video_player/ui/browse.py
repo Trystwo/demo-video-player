@@ -1,10 +1,11 @@
-"""The ui-v5 browse shell: left rail + home / library / detail pages.
+"""The ui-v5 browse shell: left rail + home / library / recent / detail pages.
 
 The window's outer :class:`Gtk.Stack` swaps between this shell and the player.
-Inside the shell a second stack swaps three browse pages, all built once:
+Inside the shell a second stack swaps four browse pages, all built once:
 
 * **home** -- hero + continue watching + recently added,
 * **library** -- the scanned-file grid with filters and sorting,
+* **recent** -- the watch history, grouped into continue watching / finished,
 * **detail** -- backdrop, episodes and clip facts for one file.
 
 The shell owns the navigation state (which page is current, where a detail page
@@ -40,12 +41,16 @@ from .detail_page import DetailPage  # noqa: E402
 from .home_page import HomePage  # noqa: E402
 from .library_page import LibraryPage  # noqa: E402
 from .rail import Rail  # noqa: E402
+from .recent_page import RecentPage  # noqa: E402
+from .settings_page import SettingsPage  # noqa: E402
 
 __all__ = ["BACKDROP_WIDTH", "BROWSE_PAGES", "BackdropCache", "BrowseShell"]
 
 #: Browse pages, in rail order.  ``detail`` has no rail entry of its own: it
-#: keeps the rail item of the section it was opened from.
-BROWSE_PAGES = ("home", "library", "detail")
+#: keeps the rail item of the section it was opened from.  ``recent`` became a
+#: real page on 2026-11-27 (it used to be the library's "最近观看" filter);
+#: ``settings`` is the rail's fourth entry.
+BROWSE_PAGES = ("home", "library", "recent", "detail", "settings")
 
 #: Hero and detail plates are 1140 px wide inside the 26 px page padding; the
 #: poster is generated at that width so the backdrop is not an upscaled card
@@ -175,6 +180,8 @@ class BrowseShell(Gtk.Box):
         on_open_file: Callable[[], None],
         on_changed: Callable[[], None] | None = None,
         on_drop_paths: Callable[[Sequence[Path]], None] | None = None,
+        on_language: Callable[[str], None] | None = None,
+        on_decode: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         self.add_css_class("browse-shell")
@@ -200,9 +207,17 @@ class BrowseShell(Gtk.Box):
             on_open=self.show_detail,
             on_open_file=on_open_file,
             on_changed=self._on_library_changed,
-            on_filter_change=self._on_filter_changed,
             on_poster=self._on_poster,
             on_metadata=self._on_metadata,
+        )
+        self.recent = RecentPage(
+            translator=translator,
+            library=self.library,
+            recents=recents,
+            on_play=on_play,
+            on_detail=self.show_detail,
+            on_open_library=self._show_library,
+            on_cleared=self._on_history_cleared,
         )
         self.home = HomePage(
             translator=translator,
@@ -211,6 +226,7 @@ class BrowseShell(Gtk.Box):
             on_play=on_play,
             on_detail=self.show_detail,
             on_open_library=self._show_library,
+            on_open_recent=self._show_recent,
             on_choose_directory=self.library.choose_directory,
             on_open_file=on_open_file,
             on_rescan=self.library.rescan,
@@ -225,11 +241,21 @@ class BrowseShell(Gtk.Box):
             on_select=self.show_detail,
             request_backdrop=self._backdrops.request,
         )
+        self.settings = SettingsPage(
+            translator=translator,
+            config=config,
+            library=self.library,
+            hw_ready=self._hw_ready,
+            on_language=on_language,
+            on_decode=on_decode,
+        )
         self._stack = Gtk.Stack()
         self._stack.set_transition_type(Gtk.StackTransitionType.NONE)
         self._stack.add_named(self.home, "home")
         self._stack.add_named(self.library, "library")
+        self._stack.add_named(self.recent, "recent")
         self._stack.add_named(self.detail, "detail")
+        self._stack.add_named(self.settings, "settings")
         self._stack.set_visible_child_name(self._page)
         self.append(self.rail)
         self.append(self._stack)
@@ -256,6 +282,10 @@ class BrowseShell(Gtk.Box):
         self.rail.set_clock(self.library.scan_clock)
         if self._page == "home":
             self.home.refresh()
+        elif self._page == "recent":
+            self.recent.refresh()
+        elif self._page == "settings":
+            self.settings.refresh()
 
     def mark_player_origin(self) -> None:
         """Remember where "back" from the player should land."""
@@ -285,23 +315,32 @@ class BrowseShell(Gtk.Box):
         self.library.select_filter(filter_key)
         self._sync_rail()
 
+    def _show_recent(self) -> None:
+        """Home's "continue watching" row opens the full history."""
+        self._show("recent")
+        self.recent.refresh()
+
     def show_detail(self, item: LibraryItem) -> None:
         """Open the detail page for *item*, remembering the section it came from.
 
         Called for a card and again when a same-folder row switches the clip;
         in the second case the origin must stay whatever it already was.
         """
-        if self._page in ("home", "library"):
+        if self._page in ("home", "library", "recent"):
             self._detail_origin = self._page
         self.detail.show(item)
         self._show("detail")
         log_action("detail_open", path=str(item.path), origin=self._detail_origin)
 
     def back_from_detail(self) -> None:
-        target = "library" if self._detail_origin == "library" else "home"
+        target = self._detail_origin
+        if target not in ("home", "library", "recent"):
+            target = "home"
         self._show(target)
         if target == "home":
             self.home.refresh()
+        elif target == "recent":
+            self.recent.refresh()
         else:
             self.library.select_filter(self.library.filter_key)
 
@@ -312,17 +351,27 @@ class BrowseShell(Gtk.Box):
         elif kind == "library":
             self._show_library("all")
         elif kind == "recent":
-            self._show_library("recent")
+            self._show("recent")
+            self.recent.refresh()
+        elif kind == "settings":
+            self._show("settings")
+            self.settings.refresh()
+
+    def go_home(self) -> None:
+        """Escape from a page without a back arrow (settings / recent)."""
+        self._on_nav("home")
 
     def _sync_rail(self) -> None:
-        if self._page == "home":
-            self.rail.set_active("home")
-        elif self._page == "detail":
-            self.rail.set_active("home" if self._detail_origin == "home" else "library")
-        else:
-            self.rail.set_active(
-                "recent" if self.library.filter_key == "recent" else "library"
-            )
+        # The rail reflects the page, never a filter: a chip switch must not
+        # move the navigation selection (that coupling used to make "最近" the
+        # active item while the page still called itself 片库).
+        if self._page == "detail":
+            origin = self._detail_origin
+            if origin not in ("home", "library", "recent"):
+                origin = "home"
+            self.rail.set_active(origin)
+        elif self._page in ("home", "library", "recent", "settings"):
+            self.rail.set_active(self._page)
 
     # -- data --------------------------------------------------------------
 
@@ -337,26 +386,36 @@ class BrowseShell(Gtk.Box):
         self.rail.set_clock(self.library.scan_clock)
         if self._page == "home":
             self.home.refresh()
+        elif self._page == "recent":
+            self.recent.refresh()
         elif self._page == "detail":
             self.detail.refresh()
+        elif self._page == "settings":
+            self.settings.refresh()
 
     def _on_library_changed(self) -> None:
         self.rail.set_clock(self.library.scan_clock)
         self.home.refresh()
+        self.recent.refresh()
         if self._page == "detail":
             self.detail.refresh()
+        elif self._page == "settings":
+            self.settings.refresh()
         if self._on_changed is not None:
             self._on_changed()
 
-    def _on_filter_changed(self, filter_key: str) -> None:
-        self._sync_rail()
+    def _on_history_cleared(self) -> None:
+        """The recent page cleared the history: drop the progress bars too."""
+        self.library.refresh_history()
 
     def _on_poster(self, path: Path, pixbuf: GdkPixbuf.Pixbuf | None) -> None:
         self.home.on_poster(path, pixbuf)
+        self.recent.on_poster(path, pixbuf)
         self.detail.on_poster(path, pixbuf)
 
     def _on_metadata(self, path: Path, metadata: VideoMetadata | None) -> None:
         self.home.on_metadata(path, metadata)
+        self.recent.on_metadata(path, metadata)
         self.detail.on_metadata(path, metadata)
 
     # -- drag and drop -----------------------------------------------------
@@ -388,6 +447,15 @@ class BrowseShell(Gtk.Box):
     def headline(self) -> tuple[str, str]:
         """``(title, subtitle)`` for the window header on the browse page."""
         stat, sub = self.library.headline()
+        if self._page == "settings":
+            return self._t("nav_settings"), self._t("settings_headline")
+        if self._page == "recent":
+            continue_count, finished_count = self.recent.summary()
+            return self._t("app_title"), self._t(
+                "recent_headline",
+                continue_count=continue_count,
+                finished_count=finished_count,
+            )
         if self._page == "detail":
             view = self.detail.view
             item = self.detail.item
@@ -416,4 +484,6 @@ class BrowseShell(Gtk.Box):
         self.rail.apply_language(translator)
         self.library.apply_language(translator)
         self.home.apply_language(translator)
+        self.recent.apply_language(translator)
         self.detail.apply_language(translator)
+        self.settings.apply_language(translator)

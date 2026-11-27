@@ -38,7 +38,6 @@ METHODS = (
     "_on_show_faces_toggled",
     "_on_beauty_toggled",
     "_on_compare_toggled",
-    "_on_dock_beauty_toggled",
     "_on_dock_compare_toggled",
     "_toggle_compare",
 )
@@ -202,7 +201,6 @@ class Harness:
         self._beauty_switch = FakeSwitch(enabled)
         self._beauty_switch.on_changed = self._beauty_signal
         self._dock_beauty_button = FakeToggle(enabled)
-        self._dock_beauty_button.on_changed = self._dock_beauty_signal
         self._compare_switch = FakeSwitch(compare)
         self._compare_switch.on_changed = self._compare_signal
         self._dock_compare_button = FakeToggle(compare)
@@ -222,9 +220,6 @@ class Harness:
     # real one rather than a copy in the harness.
     def _beauty_signal(self, switch: FakeSwitch) -> None:
         self._on_beauty_toggled(switch, None)
-
-    def _dock_beauty_signal(self, button: FakeToggle) -> None:
-        self._on_dock_beauty_toggled(button)
 
     def _compare_signal(self, switch: FakeSwitch) -> None:
         self._on_compare_toggled(switch, None)

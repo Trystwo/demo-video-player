@@ -1,7 +1,7 @@
 """Cairo-painted surfaces shared by the browse pages.
 
 GTK4 does not clip a child's content to a CSS border radius, and every poster in
-ui-v5 rounds its corners and layers a scrim, a duration pill and a progress
+ui-v6 rounds its corners and layers a scrim, a duration plate and a progress
 hairline over a cropped video frame.  Drawing them here keeps three things
 consistent:
 
@@ -78,19 +78,33 @@ def draw_pill(
     font: str = "Sans 8.5",
     text_color: tuple[float, float, float, float] | None = None,
     box_color: tuple[float, float, float, float] | None = None,
+    radius: float = 5.0,
+    pad_x: float = 6.0,
+    pad_y: float = 2.0,
+    border_color: tuple[float, float, float, float] | None = None,
 ) -> None:
-    """Draw a small rounded label whose bottom-right corner is (right, bottom)."""
+    """Draw a small rounded label whose bottom-right corner is (right, bottom).
+
+    Scheme C's duration plate is a flat, almost transparent dark chip with a
+    3 px radius and monospace digits (``mockups/ui-v6/skin-c.css``); the same
+    primitive also draws the "finished" badge and the missing-file note.
+    """
     layout = pango_layout(cr, text, font)
     text_w, text_h = layout.get_pixel_size()
-    pad_x, pad_y = 6.0, 2.0
     box_w = float(text_w) + pad_x * 2
     box_h = float(text_h) + pad_y * 2
     box_x = right - box_w
     box_y = bottom - box_h
-    rounded_path(cr, box_x, box_y, box_w, box_h, 5.0)
-    cr.set_source_rgba(*(box_color or rgba("video", 0.72)))  # type: ignore[attr-defined]
-    cr.fill()  # type: ignore[attr-defined]
-    cr.set_source_rgba(*(text_color or rgba("play", 0.95)))  # type: ignore[attr-defined]
+    rounded_path(cr, box_x, box_y, box_w, box_h, radius)
+    cr.set_source_rgba(*(box_color or rgba("scrim", 0.42)))  # type: ignore[attr-defined]
+    cr.fill_preserve()  # type: ignore[attr-defined]
+    if border_color is not None:
+        cr.set_line_width(1.0)  # type: ignore[attr-defined]
+        cr.set_source_rgba(*border_color)  # type: ignore[attr-defined]
+        cr.stroke()  # type: ignore[attr-defined]
+    else:
+        cr.new_path()  # type: ignore[attr-defined]
+    cr.set_source_rgba(*(text_color or rgba("play", 1.0)))  # type: ignore[attr-defined]
     cr.move_to(box_x + pad_x, box_y + pad_y)  # type: ignore[attr-defined]
     PangoCairo.show_layout(cr, layout)  # type: ignore[arg-type]
 
@@ -141,12 +155,13 @@ def _fill_rect(cr: object, x: float, y: float, width: float, height: float, patt
 
 
 class Poster(Gtk.DrawingArea):
-    """Rounded poster with a duration pill, a badge and a progress hairline."""
+    """Rounded poster with a duration chip, a badge and a progress hairline."""
 
     #: Card thumbnails are 16:9 slices of the frame; 132 px is the height the
     #: library grid settled on so three rows fit a 1280x768 window.
     HEIGHT = 132
-    RADIUS = 10.0
+    #: Scheme C posters are cut squarer than ui-v5's 10 px.
+    RADIUS = 8.0
 
     def __init__(
         self,
@@ -217,31 +232,44 @@ class Poster(Gtk.DrawingArea):
             self._paint_progress(cr, w, h)
         cr.restore()  # type: ignore[attr-defined]
         rounded_path(cr, 0.5, 0.5, w - 1.0, h - 1.0, self.RADIUS)
-        cr.set_line_width(1.5 if self._current else 1.0)  # type: ignore[attr-defined]
+        cr.set_line_width(1.0)  # type: ignore[attr-defined]
         if self._current:
-            cr.set_source_rgba(*rgba("accent", 0.95))  # type: ignore[attr-defined]
+            cr.set_source_rgba(*rgba("play", 0.95))  # type: ignore[attr-defined]
         else:
-            cr.set_source_rgba(*rgba("line", 0.9))  # type: ignore[attr-defined]
+            cr.set_source_rgba(*rgba("thumb_line", 1.0))  # type: ignore[attr-defined]
         cr.stroke()  # type: ignore[attr-defined]
         if self._duration and self._show_duration and not self._missing:
-            draw_pill(cr, self._duration, right=w - 8.0, bottom=h - 8.0)
+            draw_pill(
+                cr,
+                self._duration,
+                right=w - 8.0,
+                bottom=h - 8.0,
+                font="DejaVu Sans Mono 8",
+                text_color=rgba("play", 0.98),
+                box_color=rgba("scrim", 0.42),
+                radius=3.0,
+                pad_x=4.0,
+                pad_y=2.5,
+            )
         if self._badge:
             self._paint_badge(cr)
         if self._missing:
             draw_pill(cr, self._missing_text or "!", right=w - 8.0, bottom=h - 8.0)
 
     def _paint_badge(self, cr: object) -> None:
-        layout = pango_layout(cr, self._badge, "Sans 8.5")
+        layout = pango_layout(cr, self._badge, "Sans 7.5")
         text_w, text_h = layout.get_pixel_size()
-        pad_x, pad_y = 6.0, 2.0
+        pad_x, pad_y = 5.0, 2.5
         box_w = float(text_w) + pad_x * 2
         box_h = float(text_h) + pad_y * 2
-        rounded_path(cr, 8.0, 8.0, box_w, box_h, 5.0)
-        cr.set_source_rgba(*rgba("video", 0.72))  # type: ignore[attr-defined]
-        cr.fill()  # type: ignore[attr-defined]
-        cr.set_source_rgba(
-            *(rgba("accent_hi", 0.98) if self._badge_accent else rgba("fg_2", 0.92))
-        )  # type: ignore[attr-defined]
+        rounded_path(cr, 8.0, 8.0, box_w, box_h, 4.0)
+        cr.set_source_rgba(*rgba("scrim", 0.55))  # type: ignore[attr-defined]
+        cr.fill_preserve()  # type: ignore[attr-defined]
+        cr.set_line_width(1.0)  # type: ignore[attr-defined]
+        cr.set_source_rgba(*rgba("play", 0.16))  # type: ignore[attr-defined]
+        cr.stroke()  # type: ignore[attr-defined]
+        colour = rgba("accent_hi", 0.98) if self._badge_accent else rgba("fg", 0.96)
+        cr.set_source_rgba(*colour)  # type: ignore[attr-defined]
         cr.move_to(8.0 + pad_x, 8.0 + pad_y)  # type: ignore[attr-defined]
         PangoCairo.show_layout(cr, layout)  # type: ignore[arg-type]
 
@@ -266,18 +294,28 @@ class Poster(Gtk.DrawingArea):
 
     @staticmethod
     def _paint_scrim(cr: object, w: float, h: float) -> None:
-        cr.set_source_rgba(*rgba("video", 0.14))  # type: ignore[attr-defined]
-        cr.rectangle(0.0, h - 46.0, w, 46.0)  # type: ignore[attr-defined]
-        cr.fill()  # type: ignore[attr-defined]
-        cr.set_source_rgba(*rgba("video", 0.26))  # type: ignore[attr-defined]
-        cr.rectangle(0.0, h - 22.0, w, 22.0)  # type: ignore[attr-defined]
-        cr.fill()  # type: ignore[attr-defined]
+        """Scheme C: one 50 px gradient, no hard bands.
+
+        ``linear-gradient(0deg, rgba(4,6,7,.56), rgba(4,6,7,.14) 44%,
+        rgba(4,6,7,0))`` over the bottom 50 px of the frame.
+        """
+        top = max(0.0, h - 50.0)
+        gradient = _linear(
+            0.0,
+            top,
+            0.0,
+            h,
+            (
+                (0.0, rgba("scrim", 0.0)),
+                (0.56, rgba("scrim", 0.14)),
+                (1.0, rgba("scrim", 0.56)),
+            ),
+        )
+        _fill_rect(cr, 0.0, top, w, h - top, gradient)
 
     def _paint_progress(self, cr: object, w: float, h: float) -> None:
-        bar_h = 3.0
-        cr.set_source_rgba(*rgba("play", 0.22))  # type: ignore[attr-defined]
-        cr.rectangle(0.0, h - bar_h, w, bar_h)  # type: ignore[attr-defined]
-        cr.fill()  # type: ignore[attr-defined]
+        """Scheme C's 2 px amber data line, no idle trough."""
+        bar_h = 2.0
         cr.set_source_rgba(*rgba("accent", 0.95))  # type: ignore[attr-defined]
         cr.rectangle(0.0, h - bar_h, w * self._progress, bar_h)  # type: ignore[attr-defined]
         cr.fill()  # type: ignore[attr-defined]
@@ -330,8 +368,8 @@ class GhostFrame(Gtk.DrawingArea):
         cr.fill()  # type: ignore[attr-defined]
 
 
-#: Home hero and detail backdrop share the mockup's 16 px corner radius.
-BACKDROP_RADIUS = 16.0
+#: Home hero and detail backdrop share scheme C's 10 px corner radius.
+BACKDROP_RADIUS = 10.0
 
 
 class BackdropArt(Gtk.DrawingArea):
@@ -410,7 +448,8 @@ class BackdropArt(Gtk.DrawingArea):
 
     @staticmethod
     def _paint_hero_scrims(cr: object, w: float, h: float) -> None:
-        # Left scrim carries the title block; the bottom one anchors the CTA row.
+        # Scheme C hero veil: a long left-to-right falloff plus a soft bottom
+        # anchor, both from the page's near-black plate colour.
         _fill_rect(
             cr,
             0.0,
@@ -423,11 +462,12 @@ class BackdropArt(Gtk.DrawingArea):
                 w,
                 0.0,
                 (
-                    (0.0, rgba("bg_deep", 0.90)),
-                    (0.24, rgba("bg_deep", 0.72)),
-                    (0.44, rgba("bg_deep", 0.30)),
-                    (0.64, rgba("bg_deep", 0.02)),
-                    (1.0, rgba("bg_deep", 0.18)),
+                    (0.0, rgba("bg_deep", 0.97)),
+                    (0.36, rgba("bg_deep", 0.92)),
+                    (0.56, rgba("bg_deep", 0.62)),
+                    (0.74, rgba("bg_deep", 0.18)),
+                    (0.88, rgba("bg_deep", 0.0)),
+                    (1.0, rgba("bg_deep", 0.0)),
                 ),
             ),
         )
@@ -443,9 +483,9 @@ class BackdropArt(Gtk.DrawingArea):
                 0.0,
                 0.0,
                 (
-                    (0.0, rgba("bg_deep", 0.92)),
-                    (0.34, rgba("bg_deep", 0.38)),
-                    (0.62, rgba("bg_deep", 0.0)),
+                    (0.0, rgba("bg_deep", 0.68)),
+                    (0.38, rgba("bg_deep", 0.10)),
+                    (0.64, rgba("bg_deep", 0.0)),
                 ),
             ),
         )

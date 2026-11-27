@@ -158,19 +158,18 @@ def _item(name: str, *, duration_ns: int = 0, mtime: float = 0.0) -> LibraryItem
     return LibraryItem(path=Path("/lib") / name, size=1, mtime=mtime, metadata=metadata)
 
 
-def test_filter_keys_cover_the_three_chips() -> None:
-    assert FILTERS == ("all", "recent", "finished")
+def test_filter_keys_cover_the_chips() -> None:
+    # "最近观看" is the browse shell's own page now, not a library chip.
+    assert FILTERS == ("all", "finished")
     assert set(SORTS) == {"name", "duration", "added"}
 
 
-def test_filter_items_selects_recent_and_finished() -> None:
+def test_filter_items_selects_finished() -> None:
     items = [_item("a.mp4"), _item("b.mp4"), _item("c.mp4")]
-    recent = {items[0].path, items[2].path}
     finished = {items[2].path}
     assert filter_items(items, "all") == items
-    assert filter_items(items, "recent", recent_paths=recent) == [items[0], items[2]]
     assert filter_items(items, "finished", finished_paths=finished) == [items[2]]
-    assert filter_items(items, "recent") == []
+    assert filter_items(items, "finished") == []
 
 
 def test_filter_rejects_unknown_keys() -> None:
@@ -182,10 +181,8 @@ def test_filter_rejects_unknown_keys() -> None:
 
 def test_counts_follow_the_filters() -> None:
     items = [_item("a.mp4"), _item("b.mp4")]
-    counts = library_counts(
-        items, recent_paths={items[0].path}, finished_paths={items[1].path}
-    )
-    assert counts == {"all": 2, "recent": 1, "finished": 1}
+    counts = library_counts(items, finished_paths={items[1].path})
+    assert counts == {"all": 2, "finished": 1}
 
 
 def test_sort_by_name_is_case_insensitive() -> None:

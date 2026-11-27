@@ -80,7 +80,7 @@ class _EpisodeCard(Gtk.Button):
         self._t = translator
         self.set_tooltip_text(str(episode.item.path))
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.poster = Poster(height=EP_THUMB_HEIGHT, radius=10.0)
+        self.poster = Poster(height=EP_THUMB_HEIGHT, radius=8.0)
         box.append(self.poster)
         fig = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         fig.set_margin_top(7)

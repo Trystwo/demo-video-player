@@ -44,6 +44,7 @@ P1_P2_P3_MODULES = (
     "src/video_player/ui/library_page.py",
     "src/video_player/ui/paint.py",
     "src/video_player/ui/rail.py",
+    "src/video_player/ui/recent_page.py",
     "src/video_player/ui/style.py",
 )
 

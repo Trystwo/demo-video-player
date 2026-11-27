@@ -56,7 +56,7 @@ PAGE_PAD_BOTTOM = 6
 
 
 class _Rule(Gtk.DrawingArea):
-    """The 18x1 amber rule in front of the hero kicker."""
+    """The 18x1 hairline in front of the hero kicker (scheme C: bone, not amber)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -66,7 +66,7 @@ class _Rule(Gtk.DrawingArea):
 
     def _draw(self, _area: Gtk.DrawingArea, cr: object, width: int, height: int) -> None:
         cr.set_line_width(1.0)  # type: ignore[attr-defined]
-        cr.set_source_rgba(*rgba("accent", 0.55))  # type: ignore[attr-defined]
+        cr.set_source_rgba(*rgba("fg", 0.38))  # type: ignore[attr-defined]
         cr.move_to(0.0, 0.5)  # type: ignore[attr-defined]
         cr.line_to(float(max(1, width)), 0.5)  # type: ignore[attr-defined]
         cr.stroke()  # type: ignore[attr-defined]
@@ -97,6 +97,7 @@ class HomePage(Gtk.Box):
         on_play: Callable[[Sequence[Path], int], None],
         on_detail: Callable[[LibraryItem], None],
         on_open_library: Callable[[str], None],
+        on_open_recent: Callable[[], None],
         on_choose_directory: Callable[[], None],
         on_open_file: Callable[[], None],
         on_rescan: Callable[[], None],
@@ -110,6 +111,7 @@ class HomePage(Gtk.Box):
         self._on_play = on_play
         self._on_detail = on_detail
         self._on_open_library = on_open_library
+        self._on_open_recent = on_open_recent
         self._on_choose_directory = on_choose_directory
         self._on_open_file = on_open_file
         self._on_rescan = on_rescan
@@ -137,8 +139,8 @@ class HomePage(Gtk.Box):
         content.add_css_class("home-content")
         content.set_vexpand(True)
         content.append(self._build_hero())
-        for filter_key in ("recent", "all"):
-            row = self._build_row(filter_key)
+        for kind in ("continue", "added"):
+            row = self._build_row(kind)
             self._row_widgets.append(row)
             spacer = Gtk.Box()
             spacer.set_size_request(-1, HERO_GAP)
@@ -180,7 +182,7 @@ class HomePage(Gtk.Box):
         body.set_valign(Gtk.Align.END)
         body.set_margin_start(26)
         body.set_margin_end(26)
-        body.set_margin_bottom(20)
+        body.set_margin_bottom(17)
         body.set_size_request(560, -1)
         self._hero_body = body
 
@@ -284,7 +286,7 @@ class HomePage(Gtk.Box):
         page.append(main)
         return page
 
-    def _build_row(self, filter_key: str) -> _Row:
+    def _build_row(self, kind: str) -> _Row:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         box.add_css_class("home-row")
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -299,7 +301,11 @@ class HomePage(Gtk.Box):
         more.set_halign(Gtk.Align.END)
         more_label = Gtk.Label()
         more.set_child(more_label)
-        more.connect("clicked", lambda _b: self._on_open_library(filter_key))
+        if kind == "continue":
+            # The recent page is the full history; this row is its preview.
+            more.connect("clicked", lambda _b: self._on_open_recent())
+        else:
+            more.connect("clicked", lambda _b: self._on_open_library("all"))
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         head.append(title)

@@ -233,6 +233,42 @@ def format_clock(epoch: float) -> str:
     return time.strftime("%H:%M", time.localtime(epoch))
 
 
+def format_watch_time(
+    updated_at: float,
+    *,
+    t: Callable[..., str],
+    now: float | None = None,
+) -> str:
+    """Relative watch time for a history entry (``今天 19:04``, ``昨天 21:40``).
+
+    The recent page sorts by watch time, so the card meta has to say *when*
+    without a second timestamp column.  Same-day entries read as a clock time,
+    yesterday as a word, older entries as a date; a timestamp at or below zero
+    (a history entry written before ``updated_at`` existed) reads as unknown.
+    """
+    if updated_at <= 0:
+        return ""
+    reference = time.time() if now is None else float(now)
+    moment = time.localtime(updated_at)
+    clock = time.strftime("%H:%M", moment)
+    if abs(reference - updated_at) < 60.0:
+        return t("recent_time_just")
+    today = time.localtime(reference)
+    if time.strftime("%Y-%m-%d", moment) == time.strftime("%Y-%m-%d", today):
+        return t("recent_time_today", time=clock)
+    yesterday = time.localtime(reference - 86400.0)
+    if time.strftime("%Y-%m-%d", moment) == time.strftime("%Y-%m-%d", yesterday):
+        return t("recent_time_yesterday", time=clock)
+    if moment.tm_year == today.tm_year:
+        return t("recent_time_date", month=moment.tm_mon, day=moment.tm_mday)
+    return t(
+        "recent_time_date_year",
+        year=moment.tm_year,
+        month=moment.tm_mon,
+        day=moment.tm_mday,
+    )
+
+
 def format_resolution(width: int, height: int, fps: float = 0.0) -> str:
     """Card shorthand: ``1080p30`` for standard heights, ``1280×720`` otherwise."""
     if width <= 0 or height <= 0:

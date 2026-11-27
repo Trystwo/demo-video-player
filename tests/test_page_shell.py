@@ -7,7 +7,7 @@ the page the player was opened from, entering the player remembers that page
 and suspends the browsing workers, a card's list becomes the playlist, and the
 header follows whichever browse page is on screen.  These tests lift the page
 methods out of ``window.py`` and drive them through stand-ins, like
-``test_sidebar_pages`` does for the sidebar tabs.
+``test_player_drawer`` does for the beauty drawer.
 """
 
 from __future__ import annotations
@@ -140,6 +140,9 @@ class FakeBrowse:
         self.back_from_detail_calls += 1
         self.page = "home"
 
+    def go_home(self) -> None:
+        self.page = "home"
+
 
 class FakeGLib:
     SOURCE_REMOVE = 0
@@ -150,6 +153,24 @@ class FakeGLib:
     def idle_add(self, callback: Any, *args: Any) -> int:
         self.idle.append((callback, args))
         return len(self.idle)
+
+
+class FakeTopBar(FakeLabel):
+    """The picture top bar now carries compact + episodes-toggle state."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.compact = False
+        self.episodes_active = False
+
+    def set_compact(self, compact: bool) -> None:
+        self.compact = bool(compact)
+
+    def is_compact(self) -> bool:
+        return self.compact
+
+    def set_episodes_active(self, active: bool) -> None:
+        self.episodes_active = bool(active)
 
 
 class Harness:
@@ -179,7 +200,13 @@ class Harness:
         self._stack = FakeStack()
         self._browse = FakeBrowse()
         self._back_button = FakeLabel()
-        self._sidebar_button = FakeLabel()
+        self._headerbar = FakeLabel()
+        self._top_bar = FakeTopBar()
+        self._record_path = None
+        self._immersive = False
+        self._drawer_open = False
+        self._episodes_open = True
+        self._sync_episodes_layout = lambda: None
         self._title_label = FakeLabel()
         self._header_subtitle_label = FakeLabel()
         self._header_subtitle_cache = ""
@@ -192,6 +219,10 @@ class Harness:
         self.returned = 0
         self.titles_updated = 0
         self.set_window_title = ""
+
+    def _set_episodes_open(self, opened: bool) -> None:
+        self._episodes_open = bool(opened)
+        self._sync_episodes_layout()
 
     # -- stubs -------------------------------------------------------------
 
@@ -278,7 +309,8 @@ def test_entering_browse_stops_playback_and_lets_the_shell_restore_its_page() ->
     # The browse shell is the one that owns the probe workers now.
     assert h._browse.suspended == 0
     assert h._back_button.get_visible() is False
-    assert h._sidebar_button.get_visible() is False
+    assert h._headerbar.get_visible() is True
+    assert h._top_bar.get_visible() is False
     assert h._title_label.get_text() == "视频播放器"
     assert h._header_subtitle_label.get_text() == "12 项 · 1 个目录"
     assert h.set_window_title == "视频播放器"
@@ -306,7 +338,10 @@ def test_entering_player_remembers_the_origin_and_suspends_the_shell() -> None:
     assert h._stack.visible_page == "player"
     assert h._browse.marked == 1
     assert h._back_button.get_visible() is True
-    assert h._sidebar_button.get_visible() is True
+    # Windowed playback keeps a real title bar; the picture bar is compact.
+    assert h._headerbar.get_visible() is True
+    assert h._top_bar.get_visible() is True
+    assert h._top_bar.is_compact() is True
     assert h.titles_updated == 1
     assert h._browse.suspended == 1
     # The player page does not rescan: the shell is not visible.
@@ -365,6 +400,8 @@ def test_chrome_browse_branch_uses_the_shell_headline() -> None:
     assert h._title_label.get_text() == "视频播放器"
     assert h._header_subtitle_label.get_text() == "12 项 · 1 个目录"
     assert h._back_button.get_visible() is False
+    assert h._headerbar.get_visible() is True
+    assert h._top_bar.get_visible() is False
 
 
 def test_chrome_detail_branch_shows_the_clip_title() -> None:
@@ -382,7 +419,18 @@ def test_chrome_player_branch_calls_update_title() -> None:
     h._sync_page_chrome()
     assert h.titles_updated == 1
     assert h._back_button.get_visible() is True
-    assert h._sidebar_button.get_visible() is True
+    assert h._headerbar.get_visible() is True
+    assert h._top_bar.get_visible() is True
+    assert h._top_bar.is_compact() is True
+
+
+def test_player_page_keeps_the_header_hidden_while_recording() -> None:
+    h = Harness(page="player")
+    h._record_path = Path("/tmp/out.mp4")
+    h._sync_page_chrome()
+    assert h._headerbar.get_visible() is False
+    assert h._top_bar.get_visible() is True
+    assert h._top_bar.is_compact() is False
 
 
 def test_library_changes_only_refresh_the_header_on_the_browse_page() -> None:
@@ -418,9 +466,22 @@ def test_escape_on_the_detail_page_walks_back_instead_of_leaving_browse() -> Non
     assert not h._on_key_pressed(None, gdk.KEY_Escape, 0, gdk.ModifierType(0))
 
 
-def test_escape_on_the_player_page_returns_to_browse() -> None:
+def test_escape_on_the_recent_page_goes_home() -> None:
+    # The recent page has no back arrow of its own; Escape is the way out.
+    gdk = _gdk()
+    h = Harness(page="browse")
+    h._browse.page = "recent"
+    assert h._on_key_pressed(None, gdk.KEY_Escape, 0, gdk.ModifierType(0))
+    assert h._browse.page == "home"
+
+
+def test_escape_closes_the_episodes_column_before_leaving_the_player() -> None:
     gdk = _gdk()
     h = Harness(page="player")
+    assert h._on_key_pressed(None, gdk.KEY_Escape, 0, gdk.ModifierType(0))
+    # First Escape only dismisses the docked column; the clip keeps playing.
+    assert h._episodes_open is False
+    assert h.page() == "player"
     assert h._on_key_pressed(None, gdk.KEY_Escape, 0, gdk.ModifierType(0))
     assert h.page() == "browse"
     assert h._browse.activated == 1

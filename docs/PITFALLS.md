@@ -74,6 +74,22 @@
 | `Gtk.Button` 上调 `set_text()` 直接 `AttributeError` | `Gtk.Button` 只有 `set_label()`（文本按钮），`set_text` 是 `Gtk.Entry/Label` 的 | 按钮统一 `set_label()`；探针里 `button.emit("clicked")`/`get_label()` 而不是 `get_text()` |
 | 用 `import cairo` 画渐变时报「模块有但没安装」或 `Context` 类型不匹配 | 本项目用 PyGObject 自带的 pycairo（`import cairo` 可用）；GTK4 的 draw_func 传进来的就是 `cairo.Context` | `paint.py` 里 `import cairo` 后 `cairo.LinearGradient`/`RadialGradient` + `add_color_stop_rgba(*rgba("bg", 0.5))`；token 仍是唯一颜色来源。本机 cairo 1.25.1 |
 | 按新页面重排后，空格键在片库页弹出「打开文件」对话框 | `_on_key_pressed` 的快捷键没按页面分流，browse 页也会执行播放器动作 | `_on_key_pressed` 开头：`if self._page == "browse"` 时只处理 `Esc`（详情页回上一级），其余一律 `return False` |
+| P4 播放页隐藏 GTK headerbar 后，画面要 16:9 居中，但直接用 `Gtk.Picture` 会被窗口高度/侧栏拉伸 | 播放页不再是「header + Paned + 信息行 + 控制条」；窗口高度 768 时 16:9 是 1280×720，上下各 24 px | 播放页根用 `Gtk.Overlay(play-stage)`，主 child 放 `Gtk.AspectFrame(ratio=16/9, obey_child=False, xalign/yalign=0.5)`，top bar/dock/drawer 都是 stage 的 overlay 子节点；`_sync_page_chrome()` 只在 browse 显示 `_headerbar`，播放页把顶栏、章节、选集放进画面 |
+| 用 `Gtk.WidgetPaintable.new(window)` 在无 WM 的 Xvfb 里截出 1290×778，有 10 px 右侧/底部黑边；popover 截图完全看不见 | GTK 窗口的 CSD 阴影算在 surface 里，widget 快照包含它；`Gtk.Popover` 是**独立 native surface**，不在窗口的 widget 树快照里；Xvfb 没有 WM，popover 也不会被限制在 1280 px 屏幕内 | QC 探针把默认窗口设成 1290×778 再用 ffmpeg `crop=1280:768:0:0,format=rgb24`；popover 单独 `Gtk.WidgetPaintable` 快照，按 `xwininfo` 的绝对坐标减主窗口坐标，用 ffmpeg overlay 合成；无 WM 时用 `set_offset(-58,0)` 把 popover 推回屏内（产品在真实 compositor 上依赖正常 monitor clamp，不要把这个偏移写进 UI） |
+| 章节刻度做成固定百分比，演示/截图「很好看」但数据是编的 | GStreamer 当前栈的 `qtdemux` 没有实现 `Gst.TocSetter`，`GstPbutils.Discoverer.get_toc()` 返回 None；演示素材也没有章节 | 只从视频旁的 `<clip>.chapters.json`（或裸列表）读真实章节，`chapter_marks()` 只投影 0<f<1；没有 sidecar 就不画刻度。QC 素材在 `.cache/qc/ui-v5-p4/media/` 带 sidecar，本机截图刻度 25/50/75% 是真实数据 |
+| 板端整窗快照拍不到「选集 / 更多」popover，截图里只有播放页 | Wayland 下 GTK popover 是独立 `GdkWaylandPopup` subsurface，`Gtk.WidgetPaintable.new(window)` 只渲染窗口自己的 widget 树；探针从 ssh 启动、窗口没有 seat 焦点，compositor 不给 popup configure，surface 实测恒为 **1×1**（内容 `measure()` 仍是 498 / 438 px） | 板端只断言 popover 的内容与行为（行数、计数、切集、菜单项、自然宽度），不假装有截图；要视觉证据需真实点击（有焦点）或换 X11 后端另想办法。见 `.cache/qc/ui-v5-p4-board/RESULTS.md` §6 |
+| 同一进程里连续 `capture_snapshot()` 偶尔返回 False，`time.sleep()` 重试全部失败 | `render_texture()` 在 GSK 正在重排/动画（revealer、hint toast）时返回 None；阻塞式重试把主循环停住，永远等不到新帧 | 重试必须回到主循环（`GLib.timeout_add`），让两帧之间真正渲染；板端探针把「快照」做成可重试动作后成功率 100%（部分截图第 2–3 次成功） |
+| 顶栏圆钮/胶囊实测 46 px，不是 CSS 写的 44 px | GTK 4.18 把 `border: 1px` 加在 `min-height: 44px` 之外（内容盒 44 + 上下边框 2）；控制条按钮没有边框，仍是 44 | 验收写「≥44 px 触控目标」而不是等值断言；要精确 44 需把边框算进自绘或把 `min-height` 收到 42（未改，46 px 不影响触控） |
+| 左导航「设置」看着是坏的：灰、点不动、悬停也没提示 | 视觉稿没出设置页，P1–P3 把它做成故意置灰的占位：`set_sensitive(False)` + 不接 `toggled`；GTK 对不敏感控件通常也不弹 tooltip，所以「设置页未出稿」的提示实际看不到 | 要做真页面时别只删 `set_sensitive`：`BROWSE_PAGES`、`_sync_rail()`、`headline()`、`refresh()`、`apply_language()` 要同时加 settings 分支，否则点进去 rail 高亮停在上一个页面、header 标题还是片库的；`Esc` 也要给出口（回首页），因为这一页没有返回箭头。2026-11-27 的实现见 ARCHITECTURE §2.12 |
+| `window.fullscreen()` 之后立刻断言 `is_fullscreen()` / 尺寸，全部失败 | Wayland 全屏异步：surface 要等 compositor 回 configure；`_sync_immersive()` 在点击时执行，此刻还没进全屏 | 板端探针点完等约 1.2 s 再断言（实测 surface 1280×800、视频 `(0,40,1280,720)`）；产品代码按 `notify::fullscreened` 再同步，不受影响 |
+
+| 窗口态的 headerbar 怎么摆都不对：把整条画面顶栏当 `set_title_widget()` 会被居中 | `Gtk.HeaderBar` 的 title widget 始终居中，`hexpand` 也改不了；另外手动 `unparent()` 后再次 `set_title_widget(同一个 widget)` 是 no-op，标题会直接消失 | P5 选择不搬控件：窗口态只显示 headerbar + `PlayerTopBar.set_compact()`（隐藏标题 label、保留 titles box 占位）。非要搬时保存 browse 标题 box 引用，且复用前先 `set_title_widget(None)` |
+| 把同一个美颜页在面板标签和全屏抽屉之间复用，切模式后 GTK 报 `duplicate child name in GtkStack: beauty`，面板标签页也不再显示 | `Gtk.Widget.unparent()` 之后 `Gtk.Stack` 仍保留该页的名字，再 `add_named` 同名就警告 | reparent 前显式 `stack.remove(page)`（`get_parent()` 是 stack 时）或先用 `get_child_by_name()` 清掉旧条目，再 `add_named`；同时同步 `.beauty-drawer` 类、margin、页头/✕ 可见性，并先 `_set_beauty_drawer_open(False)` 再搬页面 |
+| 右侧 360 px 选集栏被 `Gtk.Box` 分到 825 px，视频只剩 465 px | `Gtk.Box` 用 `gtk_widget_compute_expand()` 判断子控件是否可扩展，而栏目里的标题 label `hexpand=True` 会把整个 revealer 算成可扩展 | 对 revealer 调 `set_hexpand_set(True)` + `set_hexpand(False)`，把扩展权交回视频 stage；实测 920/360 恢复 |
+| 点视频不暂停 / 双击进不了全屏，或单击延迟后才响应 | 触摸与鼠标的 `Gtk.GestureClick.n_press` 由 GTK 和服务器双击时间决定，不能当产品契约；单击必须在 300 ms 内等第二击 | 用 `ui/taps.py::TapTracker` 自己分组（300 ms / 48 px），单击用 `GLib.timeout_add` 防抖，双击取消该定时器；切集/切页/关窗时 `_cancel_surface_tap()` |
+| 点抽屉外面，抽屉关了但视频同时暂停（或控制条被误触） | 只监听 `pressed` 而不 claim，同一个事件还会送到下层 widget | stage 上装 CAPTURE 阶段 `Gtk.GestureClick`：面板内 `return`，面板外 `_set_beauty_drawer_open(False)` 后 `set_state(CLAIMED)`；实测 GTK 4.14 能阻止按钮 `clicked`，4.18/Wayland 待板端确认 |
+| 一条 1280 宽的控制条塞进 920 px 视频区时溢出/被裁 | 控制条按 1280 设计，920 宽放不下（全控件自然宽 **1012 中 / 1063 英**） | P5 曾切两行；P6 起固定**单行**：窗口态字幕移到画面顶栏、美颜搬进面板标签，底部只留 transport + 倍速 + 解码 + 音量 + 全屏（实测 **838 ≤ 872**，中英同宽），音量百分比改 tooltip。以后再加控件前先量 row 自然宽，不要再靠第二行兜底 |
+| 自动化 QC 里第一次点击“没反应”或 1.5 s 后才到 | 无焦点/刚完成 360 px 重排时，GNOME 会把首个点击用于聚焦或延迟转发；整窗截图（scrot/ffmpeg）也会阻塞主循环 | 交互探针先点一次 header 取焦点、再测手势；截图与交互分开跑；每个场景一个进程，避免上一个场景的事件迟到影响下一个 |
 
 ## 3. 录制（`--record` 与演示素材采集）
 
@@ -83,6 +99,7 @@
 | 成片色彩标签是 `yuvj420p / pc / gbr`（sRGB），不是 4:2:0 H.264 常见的 `yuv420p / tv / bt709` | 录制画布是 RGBA（sRGB、全范围），直接喂 `mpph264enc`，编码器把画布的 VUI 原样写进 H.264。画面内容本身没有错，错的是容器里的色彩描述 | 2026-11-27 决定**保持现状**：抽帧目视未见偏色，但严格按标签转换的播放器/转码链可能偏色。README 与发布说明已把它列为已知风险；要修必须从编码输入或编码器 caps 入手，不能只改容器标签 |
 | 想把色彩标签改成 `yuv420p / tv / bt709`：CPU `videoconvert` 与 GL `glcolorconvert` 两版都试了，标签对了，成片内容却只剩 **5.5 / 6.9 唯一帧/秒**，CPU 版 5/5 丢 moov | 静态 `gst-launch` 测不出（I420 编码 217 fps、CPU 转码 102 fps）；问题只在「动态挂载录制分支 + 并发硬解 + `glvideomixer`」组合下出现：YUV 路径产生背压，视频 queue 丢帧、mixer 重复补帧，成片仍 30 fps 但一半以上是重复帧。YUV 输入还会让 EOS 卡在 mixer 视频入口（`rec-video-caps`），appsrc 队列排不空 → muxer 收不到 EOS、无 moov（`[rec] stopped eos=False`）；GL 版靠直接给 mixer `sink_2` 发 EOS 才收尾，但也只是收尾、不解决卡顿 | 已回退，保持 RGBA → `mpph264enc`（现状）。不要在录制分支插 `videoconvert` / `glcolorconvert` 到 I420/NV12；要改色彩 VUI 得换思路（编码器 caps / 后处理），并且必须在板端做 30 s 录制对比 ROI 重复率 + 唯一帧 + moov 再定 |
 | 录出的视频里有大量冻结/重复帧（实测 12–41%） | 应用内合成路径 `glvideomixer` 在板端只有 **~21 fps**，而录制队列是 leaky，合成器来不及就用上一帧补满 30 fps | 演示素材用 **纯视频录制** `Recorder(video_only=True)`（tee → queue → capsfilter(GL RGBA) → gldownload → `mpph264enc` → `mp4mux`，`leaky=0`），实测 ≈29 fps、重复帧 1.79%；UI/字幕后期叠 |
+| P4 播放页录制里看不到上下 scrim（画面顶部/底部没有压暗渐变），但文字仍可读；如果以后把按钮改成更透的样式可能读不清 | `CanvasBuilder._paste_layer()` 只把快照的 RGB 混合进画布、**不累加 alpha**；视频 hole 的 alpha 本来就是 0，所以半透明 scrim/按钮底不会遮住 mixer 的视频 pad，只有文字/图标这类不透明像素留下 | 当前接受：控件主体仍是高对比的圆钮/胶囊，QC 合成图（`.cache/qc/ui-v5-p4/recording-composed.png`）可读。以后若要求录制保持完整 scrim，需要改 `capture.py` 的 alpha 合成/在 mixer 侧单独叠一层，或把 UI 底改成不透明；不要在 UI 里用不透明 panel 硬压视觉 |
 | 纯视频录制把手机竖拍素材录成上下颠倒 | 源文件的 **Display Matrix 会以 `image-orientation` tag 传给 `mp4mux` 写进输出**；若代码再翻转一次像素，播放器按矩阵又转一次 | 纯视频录制**不要对像素做旋转**，让矩阵随文件沿用；用 `ffprobe -show_entries stream_side_data=rotation` 验证 |
 | 录制文件时长短于 wall 时间 | 采集吞吐 ≈29 fps（H.265 1080p），略低于实时 | 按内容时长校准（`ffprobe` 实测），`--seconds` 留 20–30% 余量 |
 | `--start-at` 指定位置后录到 0 帧 | H.265 seek 后偶发不推帧 | 重跑该段，或从片头开始录再剪 |
@@ -119,6 +136,14 @@
 | `.venv` 下 3 个测试失败 | numpy 1.26 与测试断言的历史差异（beauty mask 羽化、NV12 跨步转换、YuNet NMS 数量），M3 前代码同样失败（M5 收尾复测 211 passed / 3 failed，仍为同样 3 个） | 非回归；以系统 python（无 numpy）结果为准 |
 | 板端 `pytest` 不存在 | 板端未装 pytest | 板端用脚本/应用实测验证；单测在本机跑 |
 | i18n 表里中英文写成同一串，`test_language_catalog_has_both_columns_and_no_empty_strings` 失败 | 该测试要求每个 key 的 zh ≠ en（防止「没翻译」）；纯格式串（容器/编码清单）也中招 | 纯格式串给中文加「容器 / 编码」前缀；数量文案拆 `_one` 与复数两个 key（`library_stat` / `library_stat_one`），否则英文会写「1 folders」 |
+| 本机 P4 探针截图里的画面帧、Beauty on / GPU 1.6 ms 与真实能力不符 | 开发机没有 `gtk4paintablesink`，`autovideosink` 会开独立窗口遮住应用；也没有 GL/NPU/numpy，真实美颜跑不起来 | 探针用 `record=` 的 `display_bypass` 走 **fakesink sync=true**（无外窗、实时），截图前把同一素材抽出的真实帧 `Gdk.Texture` 注入 `Gtk.Picture`；美颜可用性/GPU ms 只在截图阶段按板端读数展示（`_visual_beauty_on`），`RESULTS.md` 明确标注。交互断言不依赖这些假值；真实 GPU/触摸/录制 MP4 仍以板端为准 |
+| 板端 QC 探针跑完多个 mode 后“顺手再抓一张”，容易把板子拖到失联 | 每次整窗快照都会建额外 GL texture；并行 GL 应用 + 频繁整窗快照是 STATE §36.5 记录的 PANFROST ENOMEM 触发条件 | 一个 mode 一个一次性进程、每进程最多一次快照、mode 之间 sleep 2 s、全程只留一个 GL 应用；本轮 8 个 mode + 1 次 30 s 录制，uptime 18:43→18:58 连续 |
+| QC 里用 `get_width()` 量带 CSS padding 的按钮，得到 26 而不是屏幕上的 60 | GTK4 的 `get_width()` 给的是内容盒宽度，CSS `padding` / `border` 不算在内；按钮实际点击区域更大 | 量控件尺寸优先量父容器，或用 `widget.measure(Gtk.Orientation.HORIZONTAL, -1)` 取自然宽；验收表里别把这种小数字当控件尺寸（设置页分段实测容器 120×36、按钮自然宽 60） |
+
+| 板端 GUI 探针跑完后 SSH 连续 `banner exchange` 超时 | 不是应用崩溃：短时间内反复启停 GUI/GL 应用后，板端 sshd 有一段时间无法正常完成 banner 交换（等待 1–3 分钟自行恢复）；同时误并发两个 GL runner 会明显加重 | 一个 mode 一进程、串行 + sleep；用 `setsid nohup` 把 sweep 放后台、日志落盘，SSH 只负责启动和取结果；不要用循环猛敲 SSH（会叠加 pre-auth 连接）；探针结束一律 `os._exit(0)`，避免 mppvideodec/GL 析构卡住进程 |
+| 板端探针截图已生成，但脚本在 `Gdk.pixbuf_new_from_file` 处崩 | GTK 4.18 / PyGObject 3.50 里该 API 已不在 `Gdk` 命名空间 | 用 `GdkPixbuf.Pixbuf.new_from_file()`；或者只校验文件头/大小，别在探针里依赖废弃 API |
+| 板端截图是浅色主题、控件尺寸全不对 | 质检脚本直接 `PlayerWindow(...)`，绕过了 `run_window()`，没有把 `style.CSS` 注册到 display | 探针在创建窗口前手动 `Gtk.CssProvider` + `add_provider_for_display`；否则 44 px 控件、双行控制条、面板配色都不成立 |
+| 板端探针 JSON/日志为空、进程却还在 | 把 `python3 ... | tail` 放在 SSH 前台，连接被 GUI 拖垮后管道输出丢失；`timeout` 只杀 python，mpp/GL 线程可能残留 | 日志重定向到板端文件再取；外层 `timeout`；结束后 `pkill -f board_accept_...` 清残留；一次只跑一个 GUI 应用 |
 
 ## 6. 文档 / 发布（内部）
 
